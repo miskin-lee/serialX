@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1088" height="320" viewBox="0 0 1088 320" role="img" aria-labelledby="title desc">
+  <title id="title">serialX</title>
+  <desc id="desc">The serialX application icon and wordmark.</desc>
+
+  <defs>
+    <clipPath id="tx-wave-clip">
+      <path d="M172 210H380L516 382 430 468Z"/>
+    </clipPath>
+    <clipPath id="rx-top-clip">
+      <path d="M846 206 646 258 532 414Q516 434 530 458L574 514 642 424Z"/>
+    </clipPath>
+    <clipPath id="rx-bottom-clip">
+      <path d="M178 818 378 766 492 610Q508 590 494 566L450 510 382 600Z"/>
+    </clipPath>
+  </defs>
+
+  <g transform="translate(16 16) scale(.28125)">
+    <rect x="32" y="32" width="960" height="960" rx="218" fill="#17191F"/>
+
+    <g fill="#35B873">
+      <path d="M846 206 646 258 532 414Q516 434 530 458L574 514 642 424Z"/>
+      <path d="M178 818 378 766 492 610Q508 590 494 566L450 510 382 600Z"/>
+    </g>
+    <path d="M846 206 646 258 604 318 770 276Z" fill="#73DEA2" clip-path="url(#rx-top-clip)"/>
+    <path d="M178 818 378 766 420 706 254 748Z" fill="#73DEA2" clip-path="url(#rx-bottom-clip)"/>
+
+    <g fill="#4D75FF">
+      <path d="M172 210H380L516 382 430 468Z"/>
+      <path d="M852 814H644L508 642 594 556Z"/>
+    </g>
+    <g fill="#7695FF">
+      <path d="M172 210H380L420 260H222Z"/>
+      <path d="M852 814H644L604 764H802Z"/>
+    </g>
+
+    <g clip-path="url(#tx-wave-clip)" transform="rotate(45 360 360)" fill="none" stroke-linecap="square" stroke-linejoin="miter">
+      <path d="M250 374H294V338H338V374H382V338H426V374H474" stroke="#F4F3EF" stroke-width="22"/>
+      <path d="M338 374H382" stroke="#FF754C" stroke-width="24"/>
+    </g>
+    <g transform="rotate(180 512 512)">
+      <g clip-path="url(#tx-wave-clip)" transform="rotate(45 360 360)" fill="none" stroke-linecap="square" stroke-linejoin="miter">
+        <path d="M250 374H294V338H338V374H382V338H426V374H474" stroke="#F4F3EF" stroke-width="22"/>
+        <path d="M338 374H382" stroke="#FF754C" stroke-width="24"/>
+      </g>
+    </g>
+  </g>
+
+  <text x="338" y="218" fill="#4D75FF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="168" font-weight="750" letter-spacing="-8">serialX</text>
+</svg>

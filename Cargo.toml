@@ -1,0 +1,15 @@
+[package]
+name = "serialx"
+version = "0.1.0"
+edition = "2024"
+description = "A polished serial port workspace built with GPUI"
+license = "GPL-3.0-only"
+
+[dependencies]
+gpui-kit = "0.6"
+serialport = "4.8"
+smol = "2"
+
+[profile.release]
+lto = "thin"
+strip = true

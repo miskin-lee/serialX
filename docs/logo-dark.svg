@@ -45,5 +45,5 @@
     </g>
   </g>
 
-  <text x="338" y="218" fill="#F4F3EF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="168" font-weight="750" letter-spacing="-8">serialX</text>
+  <text x="338" y="218" fill="#F4F3EF" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif" font-size="168" font-weight="750" letter-spacing="-8"><tspan fill="#FF754C">s</tspan>erial<tspan fill="#35B873">X</tspan></text>
 </svg>

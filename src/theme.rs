@@ -43,8 +43,8 @@ impl InterfaceTheme {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
-            Self::Light => "One Light",
-            Self::Dark => "One Dark",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
         }
     }
 
@@ -65,18 +65,18 @@ impl InterfaceTheme {
     pub(crate) fn palette(self) -> WorkbenchPalette {
         match self {
             Self::Light => WorkbenchPalette {
-                title_bar: 0xdcdcdd,
-                tab_bar: 0xebebec,
-                editor: 0xfafafa,
-                panel: 0xebebec,
-                status_bar: 0xdcdcdd,
-                border: 0xc9c9ca,
-                foreground: 0x242529,
-                strong_foreground: 0x242529,
-                muted: 0x58585a,
-                input: 0xfafafa,
-                input_border: 0xc9c9ca,
-                hover: 0xdfdfe0,
+                title_bar: 0xf2f2f3,
+                tab_bar: 0xf2f2f3,
+                editor: 0xffffff,
+                panel: 0xfafafa,
+                status_bar: 0xf2f2f3,
+                border: 0xdcdcdd,
+                foreground: 0x2f3037,
+                strong_foreground: 0x18191d,
+                muted: 0x6b6d76,
+                input: 0xffffff,
+                input_border: 0xdcdcdd,
+                hover: 0xebebec,
                 accent: 0x5c78e2,
                 accent_hover: 0x4d69d5,
                 accent_active: 0x3f5fc9,
@@ -84,29 +84,29 @@ impl InterfaceTheme {
                 success: 0x669f59,
                 warning: 0xa48819,
                 danger: 0xd36151,
-                badge: 0xb4b4bb,
+                badge: 0xc4c4c9,
             },
             Self::Dark => WorkbenchPalette {
-                title_bar: 0x3b414d,
-                tab_bar: 0x2f343e,
-                editor: 0x282c33,
-                panel: 0x2f343e,
-                status_bar: 0x3b414d,
-                border: 0x464b57,
-                foreground: 0xacb2be,
-                strong_foreground: 0xdce0e5,
-                muted: 0xa9afbc,
-                input: 0x2e343e,
-                input_border: 0x464b57,
-                hover: 0x363c46,
+                title_bar: 0x14171c,
+                tab_bar: 0x14171c,
+                editor: 0x0d1017,
+                panel: 0x11141a,
+                status_bar: 0x14171c,
+                border: 0x232732,
+                foreground: 0xaeb4c0,
+                strong_foreground: 0xe6e9ef,
+                muted: 0x7f8695,
+                input: 0x14171c,
+                input_border: 0x232732,
+                hover: 0x1c202a,
                 accent: 0x74ade8,
                 accent_hover: 0x85c1ff,
                 accent_active: 0x47679e,
-                selection: 0x454a56,
+                selection: 0x2b3140,
                 success: 0xa1c181,
                 warning: 0xdec184,
                 danger: 0xd07277,
-                badge: 0x838994,
+                badge: 0x454b58,
             },
         }
     }
@@ -230,15 +230,22 @@ mod tests {
     use super::InterfaceTheme;
 
     #[test]
-    fn uses_zed_one_workbench_colors() {
-        let dark = InterfaceTheme::Dark.palette();
-        assert_eq!(dark.editor, 0x282c33);
-        assert_eq!(dark.tab_bar, 0x2f343e);
-        assert_eq!(dark.accent, 0x74ade8);
-
+    fn light_theme_is_pure_white_with_zed_accents() {
         let light = InterfaceTheme::Light.palette();
-        assert_eq!(light.editor, 0xfafafa);
-        assert_eq!(light.tab_bar, 0xebebec);
+        assert_eq!(light.editor, 0xffffff);
+        assert_eq!(light.tab_bar, 0xf2f2f3);
+        assert_eq!(light.border, 0xdcdcdd);
         assert_eq!(light.accent, 0x5c78e2);
+        assert_eq!(InterfaceTheme::Light.name(), "Light");
+    }
+
+    #[test]
+    fn dark_theme_is_near_black_with_zed_accents() {
+        let dark = InterfaceTheme::Dark.palette();
+        assert_eq!(dark.editor, 0x0d1017);
+        assert_eq!(dark.tab_bar, 0x14171c);
+        assert_eq!(dark.border, 0x232732);
+        assert_eq!(dark.accent, 0x74ade8);
+        assert_eq!(InterfaceTheme::Dark.name(), "Dark");
     }
 }

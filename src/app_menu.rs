@@ -41,8 +41,8 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
             MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
             MenuItem::separator(),
-            MenuItem::action("Theme: One Light", UseLightTheme),
-            MenuItem::action("Theme: One Dark", UseDarkTheme),
+            MenuItem::action("Theme: Light", UseLightTheme),
+            MenuItem::action("Theme: Dark", UseDarkTheme),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Check for Updates…", CheckForUpdates),

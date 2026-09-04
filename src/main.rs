@@ -3,39 +3,41 @@
 mod app_icon;
 mod app_menu;
 mod configuration;
+mod icons;
 mod presets;
 mod serial;
 mod sidebar;
 mod theme;
 mod updater;
+mod workbench;
 
 use std::{
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
 
-use app_icon::{application_icon_image, apply_application_icon};
-use app_menu::{NewSerialTab, bind_window_actions, configure_application_menus};
-use gpui_kit::assets::Assets;
+use app_icon::apply_application_icon;
+use app_menu::{ToggleSidePanel, bind_window_actions, configure_application_menus};
 use gpui_kit::component::{
     Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{InputEvent, InputState},
-    kbd::Kbd,
     menu::AppMenuBar,
     notification::Notification,
-    scroll::ScrollableElement,
     tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use icons::{Glyph, WorkbenchAssets};
 use presets::PresetStore;
 use serial::*;
 use smol::Timer;
-use theme::{InterfaceTheme, apply_interface_theme};
+use theme::{
+    CAPTION, InterfaceTheme, LABEL, Typography, apply_interface_theme, resolve_fonts, tint,
+};
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
@@ -60,6 +62,11 @@ pub struct SerialWorkspace {
     update_rx: Receiver<UpdateEvent>,
     manual_update_check: bool,
     menu_bar: Entity<AppMenuBar>,
+    /// Panel layout. Kept in memory rather than in `PresetStore`, because a
+    /// collapsed panel describes this sitting, not this workspace.
+    side_panel_collapsed: bool,
+    sessions_collapsed: bool,
+    commands_collapsed: bool,
 }
 
 impl SerialWorkspace {
@@ -78,6 +85,9 @@ impl SerialWorkspace {
             update_rx,
             manual_update_check: false,
             menu_bar,
+            side_panel_collapsed: false,
+            sessions_collapsed: false,
+            commands_collapsed: false,
         };
 
         cx.spawn_in(window, async move |this, cx| {
@@ -114,6 +124,16 @@ impl SerialWorkspace {
         self.interface_theme = theme;
         apply_interface_theme(theme, window, cx);
         cx.notify();
+    }
+
+    /// Flips between the two workbenches, for the title bar switch.
+    fn toggle_interface_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = if self.interface_theme.is_dark() {
+            InterfaceTheme::Light
+        } else {
+            InterfaceTheme::Dark
+        };
+        self.set_interface_theme(next, window, cx);
     }
 
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
@@ -325,6 +345,17 @@ impl SerialWorkspace {
     fn toggle_hex(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.hex_mode = !tab.hex_mode;
+            cx.notify();
+        }
+    }
+
+    /// Selects a payload mode outright, for the segmented ASCII / HEX switch
+    /// where each half names the mode it turns on rather than flipping it.
+    fn set_hex_mode(&mut self, hex_mode: bool, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && tab.hex_mode != hex_mode
+        {
+            tab.hex_mode = hex_mode;
             cx.notify();
         }
     }
@@ -543,213 +574,48 @@ impl SerialWorkspace {
         });
     }
 
-    fn format_line_payload(hex_mode: bool, line: &TerminalLine) -> String {
-        if let Some(note) = &line.note {
-            return note.clone();
-        }
-        if hex_mode {
-            line.payload
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            String::from_utf8_lossy(&line.payload)
-                .trim_end_matches(['\r', '\n'])
-                .to_string()
-        }
+    /// Opens the built-in demo device, so the workbench can be explored with no
+    /// hardware attached.
+    fn open_loopback_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let loopback = discover_ports()
+            .into_iter()
+            .find(|port| port.is_demo)
+            .map(|port| port.name)
+            .unwrap_or_else(|| "Loopback".into());
+        self.create_configured_tab(loopback, SerialConfiguration::default(), window, cx);
     }
 
-    fn render_active_tab(&mut self, tab: SerialTabSnapshot, _cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.interface_theme.palette();
-        let selected = tab.ports[tab.selected_port.min(tab.ports.len().saturating_sub(1))].clone();
-        let status_label = if tab.connecting {
-            "Connecting…"
-        } else if tab.connected {
-            "Connected"
-        } else {
-            "Disconnected"
-        };
-        let connection_color = if tab.connected {
-            palette.success
-        } else if tab.connecting {
-            palette.warning
-        } else {
-            palette.muted
-        };
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .bg(rgb(palette.editor))
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .h(px(35.))
-                    .flex_none()
-                    .px_3()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.editor))
-                    .child(
-                        h_flex()
-                            .h_full()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .border_b_1()
-                                    .border_color(rgb(palette.accent))
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(palette.strong_foreground))
-                                    .child("TERMINAL"),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .text_color(rgb(connection_color))
-                                    .text_xs()
-                                    .child(div().size_2().rounded_full().bg(rgb(connection_color)))
-                                    .child(status_label),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(rgb(palette.muted))
-                            .child(if tab.hex_mode { "HEX" } else { "ASCII" })
-                            .when(tab.paused, |row| row.child("· Paused"))
-                            .when(!tab.auto_scroll, |row| row.child("· Manual Scroll")),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .py_2()
-                    .children(tab.terminal_lines.iter().enumerate().map(|(index, line)| {
-                        let badge = match line.kind {
-                            LineKind::Rx => "RX",
-                            LineKind::Tx => "TX",
-                            LineKind::System => "SYS",
-                        };
-                        let badge_color = match line.kind {
-                            LineKind::Rx => palette.success,
-                            LineKind::Tx => palette.accent,
-                            LineKind::System => palette.muted,
-                        };
-                        h_flex()
-                            .id(("terminal-line", index))
-                            .items_start()
-                            .min_h(px(24.))
-                            .px_3()
-                            .py_1()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(30.))
-                                    .flex_none()
-                                    .text_color(rgb(badge_color))
-                                    .text_size(px(10.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(badge),
-                            )
-                            .when(tab.timestamps, |row| {
-                                row.child(
-                                    div()
-                                        .w(px(76.))
-                                        .flex_none()
-                                        .font_family("SF Mono")
-                                        .text_size(px(10.))
-                                        .text_color(rgb(palette.muted))
-                                        .child(line.time.clone()),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .font_family("SF Mono")
-                                    .text_size(px(12.))
-                                    .text_color(if line.kind == LineKind::System {
-                                        rgb(palette.muted)
-                                    } else {
-                                        rgb(palette.foreground)
-                                    })
-                                    .child(Self::format_line_payload(tab.hex_mode, line)),
-                            )
-                    })),
-            )
-            .child(
-                h_flex()
-                    .h(px(23.))
-                    .flex_none()
-                    .px_3()
-                    .gap_4()
-                    .border_t_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.status_bar))
-                    .text_size(px(10.))
-                    .text_color(rgb(palette.muted))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(div().size_1p5().rounded_full().bg(rgb(connection_color)))
-                            .child(status_label),
-                    )
-                    .child(selected.name)
-                    .child(tab.configuration.summary())
-                    .child(if tab.hex_mode { "HEX" } else { "ASCII" })
-                    .child(self.interface_theme.name()),
-            )
-            .into_any_element()
+    /// Restores the most recently saved session, or falls back to the
+    /// configuration dialog when nothing has been saved yet.
+    fn open_first_saved_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.presets.sessions.last().map(|saved| saved.id) {
+            Some(saved_id) => self.open_saved_session(saved_id, window, cx),
+            None => self.open_new_serial_tab_dialog(window, cx),
+        }
     }
 }
-
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
-        let sidebar_snapshot = active_snapshot.clone();
-        let (title, status_label, connection_color) = self
+        let breadcrumb = self
             .active_tab()
-            .map(|tab| {
-                (
-                    format!("Serial {} · {}", tab.id, tab.selected_port().name),
-                    tab.status_label(),
-                    if tab.connected {
-                        palette.success
-                    } else if tab.connecting {
-                        palette.warning
-                    } else {
-                        palette.muted
-                    },
-                )
-            })
-            .unwrap_or_else(|| ("No Serial Tab".into(), "Idle", palette.muted));
+            .map(|tab| format!("Serial {} · {}", tab.id, tab.selected_port().name));
 
         let mut tab_items = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             let tab_id = tab.id;
-            let tab_label = format!("Serial {}  {}", tab.id, tab.selected_port().name);
             let dot_color = if tab.connected {
                 palette.success
             } else if tab.connecting {
                 palette.warning
             } else {
-                palette.muted
+                palette.faint
             };
             tab_items.push(
                 Tab::new()
-                    .label(tab_label)
-                    .prefix(div().size_2().rounded_full().bg(rgb(dot_color)))
+                    .label(tab.selected_port().name.clone())
+                    .prefix(Self::status_dot(6., dot_color))
                     .suffix(
                         Button::new(("close-tab", tab_id))
                             .ghost()
@@ -764,59 +630,37 @@ impl Render for SerialWorkspace {
         }
 
         let workspace = cx.weak_entity();
-        let tab_bar = TabBar::new("serial-tabs")
-            .children(tab_items)
-            .selected_index(self.active_tab)
-            .menu(true)
-            .on_click(move |index, _, cx| {
-                let index = *index;
-                let _ = workspace.update(cx, |workspace, cx| {
-                    if index < workspace.tabs.len() {
-                        workspace.active_tab = index;
-                        cx.notify();
-                    }
-                });
-            });
-
-        let content = if let Some(tab) = active_snapshot {
-            self.render_active_tab(tab, cx)
-        } else {
-            v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .bg(rgb(palette.editor))
-                .gap_4()
-                .child(img(application_icon_image()).size(px(112.)))
-                .child(
-                    div()
-                        .text_size(px(30.))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.strong_foreground))
-                        .child("serialX"),
-                )
-                .child(
-                    h_flex()
-                        .gap_1p5()
-                        .items_center()
-                        .text_sm()
-                        .text_color(rgb(palette.muted))
-                        .child("Press")
-                        .children(Kbd::binding_for_action(&NewSerialTab, None, window).map(Kbd::outline))
-                        .child("for a new session, or pick one from the Session panel."),
-                )
-                .child(
-                    Button::new("empty-new-session")
-                        .primary()
-                        .large()
-                        .label("New Session")
+        let tab_bar = (!self.tabs.is_empty()).then(|| {
+            TabBar::new("serial-tabs")
+                .children(tab_items)
+                .selected_index(self.active_tab)
+                .menu(true)
+                .suffix(
+                    Button::new("new-tab")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip("New serial session")
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_new_serial_tab_dialog(window, cx);
                         })),
                 )
-                .into_any_element()
+                .on_click(move |index, _, cx| {
+                    let index = *index;
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        if index < workspace.tabs.len() {
+                            workspace.active_tab = index;
+                            cx.notify();
+                        }
+                    });
+                })
+        });
+
+        let content = match active_snapshot.clone() {
+            Some(tab) => self.render_active_tab(tab, cx),
+            None => self.render_empty_state(window, cx),
         };
-        let sidebar = self.render_right_sidebar(sidebar_snapshot, cx);
+        let sidebar = self.render_right_sidebar(active_snapshot.clone(), cx);
 
         // `Root` only renders the window chrome; dialogs, sheets and
         // notifications live in overlay layers the window content has to render
@@ -827,6 +671,7 @@ impl Render for SerialWorkspace {
 
         let workbench = v_flex()
             .size_full()
+            .ui_font()
             .bg(rgb(palette.editor))
             .text_color(rgb(palette.foreground))
             .child(
@@ -838,57 +683,91 @@ impl Render for SerialWorkspace {
                         h_flex()
                             .w_full()
                             .px_3()
-                            .justify_between()
+                            .gap_3()
+                            .items_center()
+                            .when(cfg!(not(target_os = "macos")), |row| {
+                                row.child(div().w(px(310.)).h_8().child(self.menu_bar.clone()))
+                            })
                             .child(
                                 h_flex()
-                                    .gap_3()
-                                    .items_center()
-                                    .when(cfg!(not(target_os = "macos")), |row| {
-                                        row.child(
-                                            div().w(px(310.)).h_8().child(self.menu_bar.clone()),
-                                        )
-                                    })
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(palette.strong_foreground))
-                                                    .child("serialX"),
-                                            )
-                                            .child(div().text_color(rgb(palette.muted)).child("/"))
-                                            .child(
-                                                div().text_color(rgb(palette.muted)).child(title),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_3()
+                                    .flex_none()
+                                    .gap_2()
                                     .items_center()
                                     .child(
                                         div()
-                                            .text_size(px(10.))
-                                            .text_color(rgb(palette.muted))
-                                            .child(self.interface_theme.name()),
+                                            .flex_none()
+                                            .size(px(20.))
+                                            .rounded(px(6.))
+                                            .bg(tint(palette.category_terminal, 0.14))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                Icon::new(Glyph::Terminal)
+                                                    .size(px(12.))
+                                                    .text_color(rgb(palette.category_terminal)),
+                                            ),
                                     )
                                     .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .size(px(6.))
-                                                    .rounded_full()
-                                                    .bg(rgb(connection_color)),
+                                        div()
+                                            .text_token(LABEL)
+                                            .text_color(rgb(palette.strong_foreground))
+                                            .child("serialX"),
+                                    ),
+                            )
+                            .when_some(breadcrumb, |row, breadcrumb| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_token(CAPTION)
+                                        .text_color(rgb(palette.faint))
+                                        .child("/"),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_token(CAPTION)
+                                        .text_color(rgb(palette.muted))
+                                        .child(breadcrumb),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_0p5()
+                                    .child(
+                                        Button::new("title-theme")
+                                            .ghost()
+                                            .with_size(px(26.))
+                                            .icon(if self.interface_theme.is_dark() {
+                                                IconName::Moon
+                                            } else {
+                                                IconName::Sun
+                                            })
+                                            .tooltip("Switch between the light and dark workbench")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.toggle_interface_theme(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("title-side-panel")
+                                            .ghost()
+                                            .with_size(px(26.))
+                                            .icon(if self.side_panel_collapsed {
+                                                IconName::PanelRightOpen
+                                            } else {
+                                                IconName::PanelRightClose
+                                            })
+                                            .tooltip_with_action(
+                                                "Show / hide the side panel",
+                                                &ToggleSidePanel,
+                                                None,
                                             )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.))
-                                                    .text_color(rgb(palette.muted))
-                                                    .child(status_label),
-                                            ),
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_side_panel(cx);
+                                            })),
                                     ),
                             ),
                     ),
@@ -903,7 +782,7 @@ impl Render for SerialWorkspace {
                             .h_full()
                             .min_w_0()
                             .min_h_0()
-                            .child(tab_bar)
+                            .children(tab_bar)
                             .child(content),
                     )
                     .child(sidebar),
@@ -930,9 +809,12 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn main() {
-    let app = gpui_kit::application().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(WorkbenchAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        // Before the first theme is built: the theme carries the resolved
+        // families, and every `ui_font()` call reads the same cache.
+        resolve_fonts(cx);
         apply_application_icon();
         configure_application_menus(cx);
 

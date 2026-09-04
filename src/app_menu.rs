@@ -16,6 +16,7 @@ actions!(
         ToggleHex,
         ToggleTimestamps,
         ToggleAutoScroll,
+        ToggleSidePanel,
         UseLightTheme,
         UseDarkTheme,
         CheckForUpdates,
@@ -34,6 +35,10 @@ const NEW_TAB_KEYSTROKE: &str = "ctrl-n";
 const QUIT_KEYSTROKE: &str = "cmd-q";
 #[cfg(not(target_os = "macos"))]
 const QUIT_KEYSTROKE: &str = "ctrl-q";
+#[cfg(target_os = "macos")]
+const SIDE_PANEL_KEYSTROKE: &str = "cmd-b";
+#[cfg(not(target_os = "macos"))]
+const SIDE_PANEL_KEYSTROKE: &str = "ctrl-b";
 
 fn application_menus() -> Vec<Menu> {
     vec![
@@ -61,6 +66,8 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
             MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
             MenuItem::separator(),
+            MenuItem::action("Show / Hide Side Panel", ToggleSidePanel),
+            MenuItem::separator(),
             MenuItem::action("Theme: Light", UseLightTheme),
             MenuItem::action("Theme: Dark", UseDarkTheme),
         ]),
@@ -72,6 +79,7 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(NEW_TAB_KEYSTROKE, NewSerialTab, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
+        KeyBinding::new(SIDE_PANEL_KEYSTROKE, ToggleSidePanel, None),
     ]);
     GlobalState::global_mut(cx)
         .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
@@ -155,6 +163,11 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
         defer_window_action(cx, view.clone(), |view, window, cx| {
             view.set_interface_theme(InterfaceTheme::Dark, window, cx);
         });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleSidePanel, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_side_panel(cx));
     });
 
     let view = workspace.downgrade();

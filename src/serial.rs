@@ -189,16 +189,6 @@ impl SerialTabState {
         &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
     }
 
-    pub(crate) fn status_label(&self) -> &'static str {
-        if self.connecting {
-            "Connecting…"
-        } else if self.connected {
-            "Connected"
-        } else {
-            "Disconnected"
-        }
-    }
-
     fn now(&mut self) -> String {
         self.clock_tick = self.clock_tick.wrapping_add(1);
         let seconds = 40 + (self.clock_tick % 19);
@@ -249,6 +239,22 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) auto_scroll: bool,
     pub(crate) terminal_lines: Vec<TerminalLine>,
     pub(crate) send_input: Entity<InputState>,
+}
+
+impl SerialTabSnapshot {
+    pub(crate) fn status_label(&self) -> &'static str {
+        if self.connecting {
+            "Connecting…"
+        } else if self.connected {
+            "Connected"
+        } else {
+            "Disconnected"
+        }
+    }
+
+    pub(crate) fn selected_port(&self) -> &PortItem {
+        &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
+    }
 }
 
 impl From<&SerialTabState> for SerialTabSnapshot {

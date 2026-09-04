@@ -1,5 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod updater;
+
 use std::{
     io::{Read, Write},
     sync::mpsc::{self, Receiver, Sender},
@@ -9,15 +11,21 @@ use std::{
 
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
-    Icon, IconName, Root, Sizable, TitleBar,
+    Disableable, GlobalState, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     button::{Button, ButtonCustomVariant, ButtonVariants},
+    dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
+    menu::{AppMenuBar, DropdownMenu, PopupMenuItem},
+    notification::Notification,
+    scroll::ScrollableElement,
+    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use smol::Timer;
+use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const NAVY: u32 = 0x17191f;
 const NAVY_SOFT: u32 = 0x22252d;
@@ -29,7 +37,31 @@ const LINE: u32 = 0xe7e5df;
 const MINT: u32 = 0xc9f2d2;
 const GREEN: u32 = 0x287a4a;
 const ORANGE: u32 = 0xff754c;
-const BLUE: u32 = 0x4d75ff;
+const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
+
+const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
+const DATA_BITS: &[&str] = &["5", "6", "7", "8"];
+const STOP_BITS: &[&str] = &["1", "2"];
+const PARITIES: &[&str] = &["无", "奇校验", "偶校验"];
+const FLOW_CONTROLS: &[&str] = &["无", "软件", "硬件"];
+
+actions!(
+    serialx_menu,
+    [
+        NewSerialTab,
+        CloseSerialTab,
+        RefreshPorts,
+        ToggleConnection,
+        TogglePause,
+        ClearTerminal,
+        ToggleHex,
+        ToggleTimestamps,
+        ToggleAutoScroll,
+        CheckForUpdates,
+        ShowAbout,
+        QuitSerialX
+    ]
+);
 
 #[derive(Clone)]
 struct PortItem {
@@ -45,6 +77,7 @@ enum LineKind {
     System,
 }
 
+#[derive(Clone)]
 struct TerminalLine {
     time: String,
     kind: LineKind,
@@ -64,11 +97,85 @@ enum SerialEvent {
     Closed,
 }
 
-pub struct SerialWorkspace {
+#[derive(Clone, Copy)]
+struct SerialConfiguration {
+    baud_index: usize,
+    data_bits_index: usize,
+    stop_bits_index: usize,
+    parity_index: usize,
+    flow_control_index: usize,
+}
+
+impl Default for SerialConfiguration {
+    fn default() -> Self {
+        Self {
+            baud_index: 4,
+            data_bits_index: 3,
+            stop_bits_index: 0,
+            parity_index: 0,
+            flow_control_index: 0,
+        }
+    }
+}
+
+impl SerialConfiguration {
+    fn baud_rate(self) -> u32 {
+        BAUD_RATES[self.baud_index]
+    }
+
+    fn data_bits(self) -> serialport::DataBits {
+        match self.data_bits_index {
+            0 => serialport::DataBits::Five,
+            1 => serialport::DataBits::Six,
+            2 => serialport::DataBits::Seven,
+            _ => serialport::DataBits::Eight,
+        }
+    }
+
+    fn stop_bits(self) -> serialport::StopBits {
+        match self.stop_bits_index {
+            1 => serialport::StopBits::Two,
+            _ => serialport::StopBits::One,
+        }
+    }
+
+    fn parity(self) -> serialport::Parity {
+        match self.parity_index {
+            1 => serialport::Parity::Odd,
+            2 => serialport::Parity::Even,
+            _ => serialport::Parity::None,
+        }
+    }
+
+    fn flow_control(self) -> serialport::FlowControl {
+        match self.flow_control_index {
+            1 => serialport::FlowControl::Software,
+            2 => serialport::FlowControl::Hardware,
+            _ => serialport::FlowControl::None,
+        }
+    }
+
+    fn summary(self) -> String {
+        let parity = match self.parity_index {
+            1 => 'O',
+            2 => 'E',
+            _ => 'N',
+        };
+        format!(
+            "{} {}{}{}",
+            self.baud_rate(),
+            DATA_BITS[self.data_bits_index],
+            parity,
+            STOP_BITS[self.stop_bits_index]
+        )
+    }
+}
+
+struct SerialTabState {
+    id: usize,
     ports: Vec<PortItem>,
     selected_port: usize,
-    baud_rates: Vec<u32>,
-    baud_index: usize,
+    configuration: SerialConfiguration,
     connected: bool,
     connecting: bool,
     paused: bool,
@@ -76,79 +183,55 @@ pub struct SerialWorkspace {
     timestamps: bool,
     auto_scroll: bool,
     terminal_lines: Vec<TerminalLine>,
-    rx_bytes: usize,
-    tx_bytes: usize,
     clock_tick: usize,
     send_input: Entity<InputState>,
     command_tx: Option<Sender<SerialCommand>>,
     event_tx: Sender<SerialEvent>,
     event_rx: Receiver<SerialEvent>,
-    _subscriptions: Vec<Subscription>,
+    _input_subscription: Subscription,
 }
 
-impl SerialWorkspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let send_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("输入要发送的数据，例如 AT+VERSION?")
-                .default_value("AT+STATUS?")
-        });
+impl SerialTabState {
+    fn new(id: usize, send_input: Entity<InputState>, input_subscription: Subscription) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
-
-        let mut workspace = Self {
+        Self {
+            id,
             ports: discover_ports(),
             selected_port: 0,
-            baud_rates: vec![9_600, 19_200, 38_400, 57_600, 115_200, 230_400],
-            baud_index: 4,
-            connected: true,
+            configuration: SerialConfiguration::default(),
+            connected: false,
             connecting: false,
             paused: false,
             hex_mode: false,
             timestamps: true,
             auto_scroll: true,
-            terminal_lines: demo_lines(),
-            rx_bytes: 18_642,
-            tx_bytes: 4_291,
-            clock_tick: 8,
-            send_input: send_input.clone(),
+            terminal_lines: vec![TerminalLine {
+                time: "14:32:40.018".into(),
+                kind: LineKind::System,
+                payload: Vec::new(),
+                note: Some("请配置串口参数，然后连接设备".into()),
+            }],
+            clock_tick: 0,
+            send_input,
             command_tx: None,
             event_tx,
             event_rx,
-            _subscriptions: Vec::new(),
-        };
-
-        workspace._subscriptions.push(cx.subscribe_in(
-            &send_input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.send_current(window, cx);
-                }
-            },
-        ));
-
-        cx.spawn(async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(80)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        if this.drain_serial_events() {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        workspace
+            _input_subscription: input_subscription,
+        }
     }
 
-    fn selected(&self) -> &PortItem {
+    fn selected_port(&self) -> &PortItem {
         &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
+    }
+
+    fn status_label(&self) -> &'static str {
+        if self.connecting {
+            "连接中…"
+        } else if self.connected {
+            "已连接"
+        } else {
+            "未连接"
+        }
     }
 
     fn now(&mut self) -> String {
@@ -177,12 +260,253 @@ impl SerialWorkspace {
         self.connected = false;
         self.connecting = false;
     }
+}
 
-    fn toggle_connection(&mut self, cx: &mut Context<Self>) {
-        if self.connected || self.connecting {
-            let device = self.selected().name.clone();
-            self.disconnect();
-            self.push_line(
+impl Drop for SerialTabState {
+    fn drop(&mut self) {
+        if let Some(tx) = self.command_tx.take() {
+            let _ = tx.send(SerialCommand::Stop);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SerialTabSnapshot {
+    id: usize,
+    ports: Vec<PortItem>,
+    selected_port: usize,
+    configuration: SerialConfiguration,
+    connected: bool,
+    connecting: bool,
+    paused: bool,
+    hex_mode: bool,
+    timestamps: bool,
+    auto_scroll: bool,
+    terminal_lines: Vec<TerminalLine>,
+    send_input: Entity<InputState>,
+}
+
+impl From<&SerialTabState> for SerialTabSnapshot {
+    fn from(tab: &SerialTabState) -> Self {
+        Self {
+            id: tab.id,
+            ports: tab.ports.clone(),
+            selected_port: tab.selected_port,
+            configuration: tab.configuration,
+            connected: tab.connected,
+            connecting: tab.connecting,
+            paused: tab.paused,
+            hex_mode: tab.hex_mode,
+            timestamps: tab.timestamps,
+            auto_scroll: tab.auto_scroll,
+            terminal_lines: tab.terminal_lines.clone(),
+            send_input: tab.send_input.clone(),
+        }
+    }
+}
+
+enum UpdateStatus {
+    Checking,
+    UpToDate,
+    Available(UpdateInfo),
+    Downloading { version: String, downloaded: u64 },
+    InstallerLaunched,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+enum ConfigurationField {
+    Port,
+    BaudRate,
+    DataBits,
+    StopBits,
+    Parity,
+    FlowControl,
+}
+
+struct ConfigurationButton {
+    id: String,
+    label: &'static str,
+    value: String,
+    options: Vec<String>,
+    selected_index: usize,
+    field: ConfigurationField,
+}
+
+pub struct SerialWorkspace {
+    tabs: Vec<SerialTabState>,
+    active_tab: usize,
+    next_tab_id: usize,
+    update_status: UpdateStatus,
+    update_tx: Sender<UpdateEvent>,
+    update_rx: Receiver<UpdateEvent>,
+    manual_update_check: bool,
+    menu_bar: Entity<AppMenuBar>,
+}
+
+impl SerialWorkspace {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let tab = Self::build_tab(1, window, cx);
+        let (update_tx, update_rx) = mpsc::channel();
+        let menu_bar = AppMenuBar::new(cx);
+
+        let workspace = Self {
+            tabs: vec![tab],
+            active_tab: 0,
+            next_tab_id: 2,
+            update_status: UpdateStatus::Checking,
+            update_tx,
+            update_rx,
+            manual_update_check: false,
+            menu_bar,
+        };
+
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                Timer::after(Duration::from_millis(80)).await;
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        let changed = this.drain_serial_events();
+                        if this.drain_update_events(window, cx) || changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        spawn_update_check(workspace.update_tx.clone());
+        workspace
+    }
+
+    fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
+        let send_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("输入要发送的数据，例如 AT+VERSION?")
+                .default_value("AT+STATUS?")
+        });
+        let subscription = cx.subscribe_in(
+            &send_input,
+            window,
+            move |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                    this.send_current(id, window, cx);
+                }
+            },
+        );
+        SerialTabState::new(id, send_input, subscription)
+    }
+
+    fn active_tab(&self) -> Option<&SerialTabState> {
+        self.tabs.get(self.active_tab)
+    }
+
+    fn tab_index(&self, id: usize) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    fn add_serial_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = Self::build_tab(id, window, cx);
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_index(id) else {
+            return;
+        };
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+        cx.notify();
+    }
+
+    fn close_active_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_tab().map(|tab| tab.id) {
+            self.close_tab(id, cx);
+        }
+    }
+
+    fn select_configuration(
+        &mut self,
+        tab_id: usize,
+        field: ConfigurationField,
+        selected_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.tab_index(tab_id) else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        if tab.connected || tab.connecting {
+            return;
+        }
+        match field {
+            ConfigurationField::Port => {
+                tab.selected_port = selected_index.min(tab.ports.len().saturating_sub(1));
+            }
+            ConfigurationField::BaudRate => {
+                tab.configuration.baud_index = selected_index.min(BAUD_RATES.len() - 1);
+            }
+            ConfigurationField::DataBits => {
+                tab.configuration.data_bits_index = selected_index.min(DATA_BITS.len() - 1);
+            }
+            ConfigurationField::StopBits => {
+                tab.configuration.stop_bits_index = selected_index.min(STOP_BITS.len() - 1);
+            }
+            ConfigurationField::Parity => {
+                tab.configuration.parity_index = selected_index.min(PARITIES.len() - 1);
+            }
+            ConfigurationField::FlowControl => {
+                tab.configuration.flow_control_index = selected_index.min(FLOW_CONTROLS.len() - 1);
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_ports(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if tab.connected || tab.connecting {
+            return;
+        }
+        let current = tab.selected_port().name.clone();
+        tab.ports = discover_ports();
+        tab.selected_port = tab
+            .ports
+            .iter()
+            .position(|port| port.name == current)
+            .unwrap_or(0);
+        tab.push_line(
+            LineKind::System,
+            Vec::new(),
+            Some(format!("扫描完成 · 发现 {} 个设备", tab.ports.len())),
+        );
+        cx.notify();
+    }
+
+    fn toggle_connection(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_index(tab_id) else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        if tab.connected || tab.connecting {
+            let device = tab.selected_port().name.clone();
+            tab.disconnect();
+            tab.push_line(
                 LineKind::System,
                 Vec::new(),
                 Some(format!("已断开 {device}")),
@@ -191,34 +515,52 @@ impl SerialWorkspace {
             return;
         }
 
-        let selected = self.selected().clone();
+        let selected = tab.selected_port().clone();
         if selected.is_demo {
-            self.connected = true;
-            self.push_line(
+            tab.connected = true;
+            tab.push_line(
                 LineKind::System,
                 Vec::new(),
-                Some("Loopback 会话已就绪 · 延迟 2 ms".into()),
+                Some(format!(
+                    "Loopback 会话已就绪 · {}",
+                    tab.configuration.summary()
+                )),
             );
             cx.notify();
             return;
         }
 
-        let baud = self.baud_rates[self.baud_index];
         let (command_tx, command_rx) = mpsc::channel();
-        self.command_tx = Some(command_tx);
-        self.connecting = true;
-        spawn_serial_worker(selected.name, baud, command_rx, self.event_tx.clone());
+        tab.command_tx = Some(command_tx);
+        tab.connecting = true;
+        spawn_serial_worker(
+            selected.name,
+            tab.configuration,
+            command_rx,
+            tab.event_tx.clone(),
+        );
         cx.notify();
     }
 
-    fn send_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let value = self.send_input.read(cx).value().trim().to_string();
+    fn toggle_active_connection(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.active_tab().map(|tab| tab.id) {
+            self.toggle_connection(id, cx);
+        }
+    }
+
+    fn send_current(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tab_index(tab_id) else {
+            return;
+        };
+        let input = self.tabs[index].send_input.clone();
+        let value = input.read(cx).value().trim().to_string();
         if value.is_empty() {
             return;
         }
 
-        if !self.connected {
-            self.push_line(
+        let tab = &mut self.tabs[index];
+        if !tab.connected {
+            tab.push_line(
                 LineKind::System,
                 Vec::new(),
                 Some("请先连接一个串口设备".into()),
@@ -227,160 +569,334 @@ impl SerialWorkspace {
             return;
         }
 
-        let mut bytes = if self.hex_mode {
+        let mut bytes = if tab.hex_mode {
             parse_hex(&value).unwrap_or_else(|| value.as_bytes().to_vec())
         } else {
             value.as_bytes().to_vec()
         };
         bytes.extend_from_slice(b"\r\n");
+        tab.push_line(LineKind::Tx, bytes.clone(), None);
 
-        self.tx_bytes += bytes.len();
-        self.push_line(LineKind::Tx, bytes.clone(), None);
-
-        if self.selected().is_demo {
-            let response = demo_response(&value);
-            self.rx_bytes += response.len();
-            self.push_line(LineKind::Rx, response, None);
-        } else if let Some(tx) = &self.command_tx {
+        if tab.selected_port().is_demo {
+            tab.push_line(LineKind::Rx, demo_response(&value), None);
+        } else if let Some(tx) = &tab.command_tx {
             let _ = tx.send(SerialCommand::Write(bytes));
         }
 
-        self.send_input.update(cx, |input, cx| {
-            input.set_value("", window, cx);
-        });
+        input.update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
     fn drain_serial_events(&mut self) -> bool {
-        let events: Vec<_> = self.event_rx.try_iter().collect();
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let events: Vec<_> = tab.event_rx.try_iter().collect();
+            if !events.is_empty() {
+                changed = true;
+            }
+            for event in events {
+                match event {
+                    SerialEvent::Connected => {
+                        tab.connecting = false;
+                        tab.connected = true;
+                        tab.push_line(
+                            LineKind::System,
+                            Vec::new(),
+                            Some("串口已打开，开始接收数据".into()),
+                        );
+                    }
+                    SerialEvent::Data(bytes) => {
+                        if !tab.paused {
+                            tab.push_line(LineKind::Rx, bytes, None);
+                        }
+                    }
+                    SerialEvent::Error(message) => {
+                        tab.disconnect();
+                        tab.push_line(LineKind::System, Vec::new(), Some(message));
+                    }
+                    SerialEvent::Closed => tab.disconnect(),
+                }
+            }
+        }
+        changed
+    }
+
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.paused = !tab.paused;
+            cx.notify();
+        }
+    }
+
+    fn clear_terminal(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.terminal_lines.clear();
+            cx.notify();
+        }
+    }
+
+    fn toggle_hex(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.hex_mode = !tab.hex_mode;
+            cx.notify();
+        }
+    }
+
+    fn toggle_timestamps(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.timestamps = !tab.timestamps;
+            cx.notify();
+        }
+    }
+
+    fn toggle_auto_scroll(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.auto_scroll = !tab.auto_scroll;
+            cx.notify();
+        }
+    }
+
+    fn drain_update_events(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let events: Vec<_> = self.update_rx.try_iter().collect();
         if events.is_empty() {
             return false;
         }
 
         for event in events {
             match event {
-                SerialEvent::Connected => {
-                    self.connecting = false;
-                    self.connected = true;
-                    self.push_line(
-                        LineKind::System,
-                        Vec::new(),
-                        Some("串口已打开，开始接收数据".into()),
-                    );
-                }
-                SerialEvent::Data(bytes) => {
-                    self.rx_bytes += bytes.len();
-                    if !self.paused {
-                        self.push_line(LineKind::Rx, bytes, None);
+                UpdateEvent::CheckCompleted(Ok(CheckResult::UpToDate { version })) => {
+                    let show_result = self.manual_update_check;
+                    self.manual_update_check = false;
+                    self.update_status = UpdateStatus::UpToDate;
+                    if show_result {
+                        Self::show_up_to_date_dialog(version, window, cx);
                     }
                 }
-                SerialEvent::Error(message) => {
-                    self.disconnect();
-                    self.push_line(LineKind::System, Vec::new(), Some(message));
+                UpdateEvent::CheckCompleted(Ok(CheckResult::Available(info))) => {
+                    self.manual_update_check = false;
+                    self.update_status = UpdateStatus::Available(info.clone());
+                    self.show_update_available_dialog(info, window, cx);
                 }
-                SerialEvent::Closed => {
-                    self.disconnect();
+                UpdateEvent::CheckCompleted(Err(message)) => {
+                    let show_result = self.manual_update_check;
+                    self.manual_update_check = false;
+                    self.update_status = UpdateStatus::Failed;
+                    if show_result {
+                        Self::show_update_error_dialog(message, window, cx);
+                    }
+                }
+                UpdateEvent::DownloadProgress { downloaded } => {
+                    if let UpdateStatus::Downloading { version, .. } = &self.update_status {
+                        self.update_status = UpdateStatus::Downloading {
+                            version: version.clone(),
+                            downloaded,
+                        };
+                    }
+                }
+                UpdateEvent::InstallerLaunched(Ok(version)) => {
+                    self.update_status = UpdateStatus::InstallerLaunched;
+                    #[cfg(target_os = "windows")]
+                    cx.quit();
+                    #[cfg(not(target_os = "windows"))]
+                    window.push_notification(
+                        Notification::success(format!(
+                            "serialX v{version} 安装程序已打开，请按系统提示完成更新。"
+                        ))
+                        .title("软件更新"),
+                        cx,
+                    );
+                }
+                UpdateEvent::InstallerLaunched(Err(message)) => {
+                    self.update_status = UpdateStatus::Failed;
+                    Self::show_update_error_dialog(message, window, cx);
                 }
             }
         }
         true
     }
 
-    fn refresh_ports(&mut self, cx: &mut Context<Self>) {
-        let current = self.selected().name.clone();
-        self.ports = discover_ports();
-        self.selected_port = self
-            .ports
-            .iter()
-            .position(|port| port.name == current)
-            .unwrap_or(0);
-        self.push_line(
-            LineKind::System,
-            Vec::new(),
-            Some(format!("扫描完成 · 发现 {} 个设备", self.ports.len())),
-        );
-        cx.notify();
+    fn begin_update(&mut self, cx: &mut Context<Self>) -> Option<String> {
+        if let UpdateStatus::Available(info) = &self.update_status {
+            let info = info.clone();
+            let version = info.version.clone();
+            self.update_status = UpdateStatus::Downloading {
+                version: version.clone(),
+                downloaded: 0,
+            };
+            spawn_update_install(info, self.update_tx.clone());
+            cx.notify();
+            Some(version)
+        } else {
+            None
+        }
     }
 
-    fn render_logo() -> impl IntoElement {
-        h_flex()
-            .gap_3()
-            .items_center()
-            .child(
-                div()
-                    .size_9()
-                    .rounded_lg()
-                    .bg(rgb(ORANGE))
-                    .text_color(rgb(0xffffff))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(IconName::SquareTerminal).size_5()),
-            )
-            .child(
-                v_flex()
-                    .gap_px()
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Serial X"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgba(0xffffff88))
-                            .child("DEVICE CONSOLE"),
-                    ),
-            )
+    fn check_for_updates_from_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.update_status {
+            UpdateStatus::Available(info) => {
+                self.show_update_available_dialog(info.clone(), window, cx);
+            }
+            UpdateStatus::Downloading {
+                version,
+                downloaded,
+            } => {
+                window.push_notification(
+                    Notification::info(format!(
+                        "正在下载 serialX v{version}（已下载 {}）",
+                        format_bytes(*downloaded)
+                    ))
+                    .title("软件更新"),
+                    cx,
+                );
+            }
+            UpdateStatus::Checking => {
+                self.manual_update_check = true;
+                window.push_notification(
+                    Notification::info("正在检查 GitHub Releases…").title("软件更新"),
+                    cx,
+                );
+            }
+            _ => {
+                self.manual_update_check = true;
+                self.update_status = UpdateStatus::Checking;
+                spawn_update_check(self.update_tx.clone());
+                window.push_notification(
+                    Notification::info("正在检查 GitHub Releases…").title("软件更新"),
+                    cx,
+                );
+                cx.notify();
+            }
+        }
     }
 
-    fn toggle_pill(
-        id: &'static str,
-        label: &'static str,
-        active: bool,
-        on_click: impl Fn(&mut Self, &ClickEvent, &mut Window, &mut Context<Self>) + 'static,
+    fn show_update_available_dialog(
+        &self,
+        info: UpdateInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.weak_entity();
+        let latest_version = info.version.clone();
+        let package_name = info.asset_name.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let workspace = workspace.clone();
+            let version_for_notice = latest_version.clone();
+            alert
+                .icon(Icon::new(IconName::RotateCw).size_5())
+                .title(format!("发现 serialX v{latest_version}"))
+                .description(format!(
+                    "当前版本：v{}\n安装包：{package_name}\n\n是否现在下载并安装？",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .show_cancel(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("下载并安装")
+                        .cancel_text("稍后"),
+                )
+                .on_ok(move |_, window, cx| {
+                    let started = workspace
+                        .update(cx, |workspace, cx| workspace.begin_update(cx))
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    if started {
+                        window.push_notification(
+                            Notification::info(format!("正在下载 serialX v{version_for_notice}…"))
+                                .title("软件更新"),
+                            cx,
+                        );
+                    }
+                    true
+                })
+        });
+    }
+
+    fn show_up_to_date_dialog(version: String, window: &mut Window, cx: &mut App) {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .icon(Icon::new(IconName::CircleCheck).size_5())
+                .title("serialX 已是最新版本")
+                .description(format!("当前版本：v{version}"))
+                .button_props(DialogButtonProps::default().ok_text("确定"))
+        });
+    }
+
+    fn show_update_error_dialog(message: String, window: &mut Window, cx: &mut App) {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .icon(Icon::new(IconName::CircleX).size_5())
+                .title("无法检查或安装更新")
+                .description(message.clone())
+                .button_props(DialogButtonProps::default().ok_text("关闭"))
+        });
+    }
+
+    fn show_about_dialog(window: &mut Window, cx: &mut App) {
+        window.open_alert_dialog(cx, |alert, _, _| {
+            alert
+                .icon(Icon::new(IconName::SquareTerminal).size_5())
+                .title("serialX")
+                .description(format!(
+                    "版本 {}\n现代串口调试工作台\n\nGNU GPL v3\n© 2026 miskin",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .show_cancel(true)
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("关闭")
+                        .cancel_text("查看 GitHub"),
+                )
+                .on_cancel(|_, _, cx| {
+                    cx.open_url(REPOSITORY_URL);
+                    true
+                })
+        });
+    }
+
+    fn configuration_button(
+        button: ConfigurationButton,
+        tab_id: usize,
+        disabled: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        div()
-            .id(id)
-            .h_7()
-            .px_3()
-            .rounded_full()
-            .border_1()
-            .border_color(if active { rgb(INK) } else { rgb(LINE) })
-            .bg(if active { rgb(INK) } else { rgb(PANEL) })
-            .text_color(if active { rgb(0xffffff) } else { rgb(MUTED) })
-            .text_xs()
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .hover(|style| style.opacity(0.82))
-            .child(label)
-            .on_click(cx.listener(on_click))
+        let ConfigurationButton {
+            id,
+            label,
+            value,
+            options,
+            selected_index,
+            field,
+        } = button;
+        let workspace = cx.weak_entity();
+        Button::new(id)
+            .outline()
+            .small()
+            .label(format!("{label}  {value}"))
+            .dropdown_caret(true)
+            .disabled(disabled)
+            .dropdown_menu(move |mut menu, _, _| {
+                for (index, option) in options.iter().enumerate() {
+                    let workspace = workspace.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option.clone())
+                            .checked(index == selected_index)
+                            .on_click(move |_, _, cx| {
+                                let _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.select_configuration(tab_id, field, index, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
-    fn parameter_row(label: &'static str, value: String) -> impl IntoElement {
-        h_flex()
-            .h_9()
-            .justify_between()
-            .border_b_1()
-            .border_color(rgb(LINE))
-            .child(div().text_sm().text_color(rgb(MUTED)).child(label))
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(INK))
-                    .child(value),
-            )
-    }
-
-    fn format_line_payload(&self, line: &TerminalLine) -> String {
+    fn format_line_payload(hex_mode: bool, line: &TerminalLine) -> String {
         if let Some(note) = &line.note {
             return note.clone();
         }
-        if self.hex_mode {
+        if hex_mode {
             line.payload
                 .iter()
                 .map(|byte| format!("{byte:02X}"))
@@ -392,20 +908,403 @@ impl SerialWorkspace {
                 .to_string()
         }
     }
-}
 
-impl Render for SerialWorkspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let selected = self.selected().clone();
-        let baud = self.baud_rates[self.baud_index];
-        let status_label = if self.connecting {
+    fn render_active_tab(&mut self, tab: SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
+        let selected = tab.ports[tab.selected_port.min(tab.ports.len().saturating_sub(1))].clone();
+        let locked = tab.connected || tab.connecting;
+        let status_label = if tab.connecting {
             "连接中…"
-        } else if self.connected {
+        } else if tab.connected {
             "已连接"
         } else {
             "未连接"
         };
-        let connection_color = if self.connected { GREEN } else { MUTED };
+        let connection_color = if tab.connected { GREEN } else { MUTED };
+        let tab_id = tab.id;
+
+        let port_options = tab
+            .ports
+            .iter()
+            .map(|port| format!("{} — {}", port.name, port.subtitle))
+            .collect();
+        let baud_options = BAUD_RATES.iter().map(u32::to_string).collect();
+        let data_bit_options = DATA_BITS.iter().map(|value| (*value).into()).collect();
+        let stop_bit_options = STOP_BITS.iter().map(|value| (*value).into()).collect();
+        let parity_options = PARITIES.iter().map(|value| (*value).into()).collect();
+        let flow_options = FLOW_CONTROLS.iter().map(|value| (*value).into()).collect();
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .rounded_b_2xl()
+            .border_1()
+            .border_t_0()
+            .border_color(rgb(LINE))
+            .bg(rgb(PANEL))
+            .shadow_sm()
+            .overflow_hidden()
+            .child(
+                v_flex()
+                    .flex_none()
+                    .p_4()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(0xfafaf8))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(Icon::new(IconName::Settings).size_4())
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("串口配置"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("连接后锁定参数"),
+                                    ),
+                            )
+                            .child(
+                                Button::new(("connect-tab", tab_id))
+                                    .when(tab.connected, |button| {
+                                        button.outline().label("断开连接")
+                                    })
+                                    .when(!tab.connected, |button| {
+                                        button
+                                            .custom(
+                                                ButtonCustomVariant::new(cx)
+                                                    .color(rgb(INK).into())
+                                                    .foreground(rgb(0xffffff).into())
+                                                    .hover(rgb(NAVY_SOFT).into())
+                                                    .active(rgb(NAVY).into())
+                                                    .shadow(true),
+                                            )
+                                            .label(if tab.connecting {
+                                                "连接中…"
+                                            } else {
+                                                "连接设备"
+                                            })
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_connection(tab_id, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("port-{tab_id}"),
+                                    label: "端口",
+                                    value: selected.name.clone(),
+                                    options: port_options,
+                                    selected_index: tab.selected_port,
+                                    field: ConfigurationField::Port,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            ))
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("baud-{tab_id}"),
+                                    label: "波特率",
+                                    value: tab.configuration.baud_rate().to_string(),
+                                    options: baud_options,
+                                    selected_index: tab.configuration.baud_index,
+                                    field: ConfigurationField::BaudRate,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            ))
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("data-bits-{tab_id}"),
+                                    label: "数据位",
+                                    value: DATA_BITS[tab.configuration.data_bits_index].into(),
+                                    options: data_bit_options,
+                                    selected_index: tab.configuration.data_bits_index,
+                                    field: ConfigurationField::DataBits,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            ))
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("stop-bits-{tab_id}"),
+                                    label: "停止位",
+                                    value: STOP_BITS[tab.configuration.stop_bits_index].into(),
+                                    options: stop_bit_options,
+                                    selected_index: tab.configuration.stop_bits_index,
+                                    field: ConfigurationField::StopBits,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            ))
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("parity-{tab_id}"),
+                                    label: "校验位",
+                                    value: PARITIES[tab.configuration.parity_index].into(),
+                                    options: parity_options,
+                                    selected_index: tab.configuration.parity_index,
+                                    field: ConfigurationField::Parity,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            ))
+                            .child(Self::configuration_button(
+                                ConfigurationButton {
+                                    id: format!("flow-{tab_id}"),
+                                    label: "流控制",
+                                    value: FLOW_CONTROLS[tab.configuration.flow_control_index]
+                                        .into(),
+                                    options: flow_options,
+                                    selected_index: tab.configuration.flow_control_index,
+                                    field: ConfigurationField::FlowControl,
+                                },
+                                tab_id,
+                                locked,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(52.))
+                    .flex_none()
+                    .px_4()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::SEMIBOLD).child("实时终端"))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_full()
+                                    .bg(if tab.connected {
+                                        rgb(MINT)
+                                    } else {
+                                        rgb(0xefefec)
+                                    })
+                                    .text_color(rgb(connection_color))
+                                    .text_xs()
+                                    .child(div().size_2().rounded_full().bg(rgb(connection_color)))
+                                    .child(status_label),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(if tab.hex_mode { "HEX" } else { "ASCII" })
+                            .when(tab.paused, |row| row.child("· 已暂停"))
+                            .when(!tab.auto_scroll, |row| row.child("· 手动滚动")),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .children(tab.terminal_lines.iter().enumerate().map(|(index, line)| {
+                        let badge = match line.kind {
+                            LineKind::Rx => "RX",
+                            LineKind::Tx => "TX",
+                            LineKind::System => "SYS",
+                        };
+                        let badge_color = match line.kind {
+                            LineKind::Rx => GREEN,
+                            LineKind::Tx => ORANGE,
+                            LineKind::System => MUTED,
+                        };
+                        h_flex()
+                            .id(("terminal-line", index))
+                            .items_start()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .w_8()
+                                    .flex_none()
+                                    .rounded_md()
+                                    .bg(rgba((badge_color << 8) | 0x18))
+                                    .text_color(rgb(badge_color))
+                                    .text_xs()
+                                    .text_center()
+                                    .child(badge),
+                            )
+                            .when(tab.timestamps, |row| {
+                                row.child(
+                                    div()
+                                        .w(px(88.))
+                                        .flex_none()
+                                        .pt_1()
+                                        .font_family("SF Mono")
+                                        .text_size(px(11.))
+                                        .text_color(rgb(MUTED))
+                                        .child(line.time.clone()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .pt_1()
+                                    .font_family("SF Mono")
+                                    .text_size(px(12.))
+                                    .text_color(if line.kind == LineKind::System {
+                                        rgb(MUTED)
+                                    } else {
+                                        rgb(INK)
+                                    })
+                                    .child(Self::format_line_payload(tab.hex_mode, line)),
+                            )
+                    })),
+            )
+            .child(
+                h_flex()
+                    .flex_none()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(LINE))
+                    .child(div().flex_1().min_w_0().child(Input::new(&tab.send_input)))
+                    .child(
+                        Button::new(("send", tab_id))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(rgb(ORANGE).into())
+                                    .foreground(rgb(0xffffff).into())
+                                    .hover(rgb(0xee633d).into())
+                                    .active(rgb(0xd95734).into())
+                                    .shadow(true),
+                            )
+                            .icon(IconName::ArrowUp)
+                            .label("发送")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.send_current(tab_id, window, cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for SerialWorkspace {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
+        let (title, status_label, connection_color) = self
+            .active_tab()
+            .map(|tab| {
+                (
+                    format!("串口 {} · {}", tab.id, tab.selected_port().name),
+                    tab.status_label(),
+                    if tab.connected { GREEN } else { MUTED },
+                )
+            })
+            .unwrap_or_else(|| ("未打开串口标签".into(), "空闲", MUTED));
+
+        let mut tab_items = Vec::with_capacity(self.tabs.len());
+        for tab in &self.tabs {
+            let tab_id = tab.id;
+            let tab_label = format!("串口 {} · {}", tab.id, tab.selected_port().name);
+            let dot_color = if tab.connected { GREEN } else { MUTED };
+            tab_items.push(
+                Tab::new()
+                    .label(tab_label)
+                    .prefix(div().size_2().rounded_full().bg(rgb(dot_color)))
+                    .suffix(
+                        Button::new(("close-tab", tab_id))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.close_tab(tab_id, cx);
+                            })),
+                    ),
+            );
+        }
+
+        let workspace = cx.weak_entity();
+        let tab_bar = TabBar::new("serial-tabs")
+            .children(tab_items)
+            .selected_index(self.active_tab)
+            .menu(true)
+            .on_click(move |index, _, cx| {
+                let index = *index;
+                let _ = workspace.update(cx, |workspace, cx| {
+                    if index < workspace.tabs.len() {
+                        workspace.active_tab = index;
+                        cx.notify();
+                    }
+                });
+            });
+
+        let content = if let Some(tab) = active_snapshot {
+            self.render_active_tab(tab, cx)
+        } else {
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .rounded_b_2xl()
+                .border_1()
+                .border_t_0()
+                .border_color(rgb(LINE))
+                .bg(rgb(PANEL))
+                .shadow_sm()
+                .gap_3()
+                .child(
+                    div()
+                        .size_12()
+                        .rounded_xl()
+                        .bg(rgb(0xf3f2ee))
+                        .text_color(rgb(MUTED))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::SquareTerminal).size_6()),
+                )
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("没有打开的串口标签"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child("使用“文件 > 新建串口标签”开始一个会话"),
+                )
+                .into_any_element()
+        };
 
         v_flex()
             .size_full()
@@ -419,638 +1318,38 @@ impl Render for SerialWorkspace {
                         .justify_between()
                         .child(
                             h_flex()
-                                .gap_2()
-                                .text_sm()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child("Serial X")
-                                .child(div().text_color(rgb(MUTED)).child("/"))
+                                .gap_4()
+                                .items_center()
+                                .when(cfg!(not(target_os = "macos")), |row| {
+                                    row.child(div().w(px(310.)).h_8().child(self.menu_bar.clone()))
+                                })
                                 .child(
-                                    div()
-                                        .text_color(rgb(MUTED))
-                                        .child(selected.name.clone()),
+                                    h_flex()
+                                        .gap_2()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("serialX")
+                                        .child(div().text_color(rgb(MUTED)).child("/"))
+                                        .child(div().text_color(rgb(MUTED)).child(title)),
                                 ),
                         )
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(
-                                    div()
-                                        .size_2()
-                                        .rounded_full()
-                                        .bg(rgb(connection_color)),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child(status_label),
-                                ),
+                                .child(div().size_2().rounded_full().bg(rgb(connection_color)))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child(status_label)),
                         ),
                 ),
             )
             .child(
-                h_flex()
+                v_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        v_flex()
-                            .w(px(250.))
-                            .h_full()
-                            .flex_none()
-                            .bg(rgb(NAVY))
-                            .text_color(rgb(0xffffff))
-                            .p_4()
-                            .gap_5()
-                            .child(Self::render_logo())
-                            .child(
-                                h_flex()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgba(0xffffff78))
-                                            .child("可用设备"),
-                                    )
-                                    .child(
-                                        Button::new("refresh-ports")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::RotateCw)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.refresh_ports(cx)
-                                            })),
-                                    ),
-                            )
-                            .child(
-                                v_flex().gap_2().children(self.ports.iter().enumerate().map(
-                                    |(index, port)| {
-                                        let active = index == self.selected_port;
-                                        let name = port.name.clone();
-                                        let subtitle = port.subtitle.clone();
-                                        div()
-                                            .id(("port", index))
-                                            .w_full()
-                                            .rounded_xl()
-                                            .p_3()
-                                            .gap_3()
-                                            .flex()
-                                            .items_center()
-                                            .cursor_pointer()
-                                            .bg(if active {
-                                                rgb(NAVY_SOFT)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .border_1()
-                                            .border_color(if active {
-                                                rgba(0xffffff18)
-                                            } else {
-                                                rgba(0x00000000)
-                                            })
-                                            .hover(|style| style.bg(rgb(NAVY_SOFT)))
-                                            .child(
-                                                div()
-                                                    .size_9()
-                                                    .flex_none()
-                                                    .rounded_lg()
-                                                    .bg(if active {
-                                                        rgb(MINT)
-                                                    } else {
-                                                        rgba(0xffffff12)
-                                                    })
-                                                    .text_color(if active {
-                                                        rgb(GREEN)
-                                                    } else {
-                                                        rgba(0xffffffaa)
-                                                    })
-                                                    .flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .child(Icon::new(IconName::Network).size_4()),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .min_w_0()
-                                                    .gap_px()
-                                                    .child(
-                                                        div()
-                                                            .text_sm()
-                                                            .font_weight(FontWeight::MEDIUM)
-                                                            .truncate()
-                                                            .child(name),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgba(0xffffff70))
-                                                            .truncate()
-                                                            .child(subtitle),
-                                                    ),
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if this.selected_port != index {
-                                                    this.disconnect();
-                                                    this.selected_port = index;
-                                                    cx.notify();
-                                                }
-                                            }))
-                                    },
-                                )),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                v_flex()
-                                    .rounded_xl()
-                                    .bg(rgba(0xffffff0d))
-                                    .p_3()
-                                    .gap_3()
-                                    .child(
-                                        h_flex()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgba(0xffffff78))
-                                                    .child("会话流量"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(MINT))
-                                                    .child("LIVE"),
-                                            ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .gap_4()
-                                            .child(
-                                                v_flex()
-                                                    .child(
-                                                        div()
-                                                            .text_base()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child(format_bytes(self.rx_bytes)),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgba(0xffffff68))
-                                                            .child("接收"),
-                                                    ),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .child(
-                                                        div()
-                                                            .text_base()
-                                                            .font_weight(FontWeight::SEMIBOLD)
-                                                            .child(format_bytes(self.tx_bytes)),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgba(0xffffff68))
-                                                            .child("发送"),
-                                                    ),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .p_5()
-                            .child(
-                                h_flex()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .gap_4()
-                                    .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h_full()
-                                            .rounded_2xl()
-                                            .border_1()
-                                            .border_color(rgb(LINE))
-                                            .bg(rgb(PANEL))
-                                            .shadow_sm()
-                                            .overflow_hidden()
-                                            .child(
-                                                h_flex()
-                                                    .h(px(56.))
-                                                    .flex_none()
-                                                    .px_4()
-                                                    .justify_between()
-                                                    .border_b_1()
-                                                    .border_color(rgb(LINE))
-                                                    .child(
-                                                        h_flex()
-                                                            .gap_2()
-                                                            .child(
-                                                                div()
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .child("实时终端"),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .px_2()
-                                                                    .py_1()
-                                                                    .rounded_full()
-                                                                    .bg(rgb(MINT))
-                                                                    .text_color(rgb(GREEN))
-                                                                    .text_xs()
-                                                                    .child(status_label),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        h_flex()
-                                                            .gap_2()
-                                                            .child(Self::toggle_pill(
-                                                                "toggle-hex",
-                                                                "HEX",
-                                                                self.hex_mode,
-                                                                |this, _, _, cx| {
-                                                                    this.hex_mode = !this.hex_mode;
-                                                                    cx.notify();
-                                                                },
-                                                                cx,
-                                                            ))
-                                                            .child(Self::toggle_pill(
-                                                                "toggle-time",
-                                                                "时间戳",
-                                                                self.timestamps,
-                                                                |this, _, _, cx| {
-                                                                    this.timestamps = !this.timestamps;
-                                                                    cx.notify();
-                                                                },
-                                                                cx,
-                                                            ))
-                                                            .child(
-                                                                Button::new("pause-terminal")
-                                                                    .ghost()
-                                                                    .xsmall()
-                                                                    .icon(if self.paused {
-                                                                        IconName::Play
-                                                                    } else {
-                                                                        IconName::Pause
-                                                                    })
-                                                                    .on_click(cx.listener(
-                                                                        |this, _, _, cx| {
-                                                                            this.paused =
-                                                                                !this.paused;
-                                                                            cx.notify();
-                                                                        },
-                                                                    )),
-                                                            )
-                                                            .child(
-                                                                Button::new("clear-terminal")
-                                                                    .ghost()
-                                                                    .xsmall()
-                                                                    .icon(IconName::Delete)
-                                                                    .on_click(cx.listener(
-                                                                        |this, _, _, cx| {
-                                                                            this.terminal_lines
-                                                                                .clear();
-                                                                            cx.notify();
-                                                                        },
-                                                                    )),
-                                                            ),
-                                                    ),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .id("terminal-scroll")
-                                                    .flex_1()
-                                                    .min_h_0()
-                                                    .overflow_y_scroll()
-                                                    .bg(rgb(0xfdfdfc))
-                                                    .px_4()
-                                                    .py_3()
-                                                    .gap_1()
-                                                    .children(self.terminal_lines.iter().map(
-                                                        |line| {
-                                                            let (tag, color, tint) = match line.kind {
-                                                                LineKind::Rx => {
-                                                                    ("RX", GREEN, 0xe9f8ed)
-                                                                }
-                                                                LineKind::Tx => {
-                                                                    ("TX", BLUE, 0xeef1ff)
-                                                                }
-                                                                LineKind::System => {
-                                                                    ("•", MUTED, 0xf1f1ef)
-                                                                }
-                                                            };
-                                                            h_flex()
-                                                                .min_h_8()
-                                                                .items_start()
-                                                                .gap_3()
-                                                                .text_sm()
-                                                                .child(
-                                                                    div()
-                                                                        .w_8()
-                                                                        .h_6()
-                                                                        .flex_none()
-                                                                        .rounded_md()
-                                                                        .bg(rgb(tint))
-                                                                        .text_color(rgb(color))
-                                                                        .text_xs()
-                                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .justify_center()
-                                                                        .child(tag),
-                                                                )
-                                                                .when(self.timestamps, |row| {
-                                                                    row.child(
-                                                                        div()
-                                                                            .w(px(88.))
-                                                                            .flex_none()
-                                                                            .pt_1()
-                                                                            .text_xs()
-                                                                            .text_color(rgb(MUTED))
-                                                                            .child(line.time.clone()),
-                                                                    )
-                                                                })
-                                                                .child(
-                                                                    div()
-                                                                        .min_w_0()
-                                                                        .flex_1()
-                                                                        .pt_1()
-                                                                        .font_family("SF Mono")
-                                                                        .text_size(px(12.))
-                                                                        .text_color(if line.kind
-                                                                            == LineKind::System
-                                                                        {
-                                                                            rgb(MUTED)
-                                                                        } else {
-                                                                            rgb(INK)
-                                                                        })
-                                                                        .child(
-                                                                            self.format_line_payload(
-                                                                                line,
-                                                                            ),
-                                                                        ),
-                                                                )
-                                                        },
-                                                    )),
-                                            )
-                                            .child(
-                                                h_flex()
-                                                    .flex_none()
-                                                    .p_3()
-                                                    .gap_2()
-                                                    .border_t_1()
-                                                    .border_color(rgb(LINE))
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w_0()
-                                                            .child(Input::new(&self.send_input)),
-                                                    )
-                                                    .child(
-                                                        Button::new("send")
-                                                            .custom(
-                                                                ButtonCustomVariant::new(cx)
-                                                                    .color(rgb(ORANGE).into())
-                                                                    .foreground(
-                                                                        rgb(0xffffff).into(),
-                                                                    )
-                                                                    .hover(rgb(0xee633d).into())
-                                                                    .active(rgb(0xd95734).into())
-                                                                    .shadow(true),
-                                                            )
-                                                            .icon(IconName::ArrowUp)
-                                                            .label("发送")
-                                                            .on_click(cx.listener(
-                                                                |this, _, window, cx| {
-                                                                    this.send_current(window, cx)
-                                                                },
-                                                            )),
-                                                    ),
-                                            ),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .w(px(268.))
-                                            .h_full()
-                                            .flex_none()
-                                            .gap_4()
-                                            .child(
-                                                v_flex()
-                                                    .rounded_2xl()
-                                                    .border_1()
-                                                    .border_color(rgb(LINE))
-                                                    .bg(rgb(PANEL))
-                                                    .shadow_sm()
-                                                    .p_4()
-                                                    .gap_3()
-                                                    .child(
-                                                        h_flex()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .child("连接设置"),
-                                                            )
-                                                            .child(
-                                                                Icon::new(IconName::Settings)
-                                                                    .size_4()
-                                                                    .text_color(rgb(MUTED)),
-                                                            ),
-                                                    )
-                                                    .child(Self::parameter_row(
-                                                        "端口",
-                                                        selected.name.clone(),
-                                                    ))
-                                                    .child(
-                                                        h_flex()
-                                                            .id("cycle-baud")
-                                                            .h_9()
-                                                            .justify_between()
-                                                            .border_b_1()
-                                                            .border_color(rgb(LINE))
-                                                            .cursor_pointer()
-                                                            .hover(|style| {
-                                                                style.text_color(rgb(BLUE))
-                                                            })
-                                                            .child(
-                                                                div()
-                                                                    .text_sm()
-                                                                    .text_color(rgb(MUTED))
-                                                                    .child("波特率"),
-                                                            )
-                                                            .child(
-                                                                h_flex()
-                                                                    .gap_1()
-                                                                    .child(
-                                                                        div()
-                                                                            .text_sm()
-                                                                            .font_weight(FontWeight::MEDIUM)
-                                                                            .child(baud.to_string()),
-                                                                    )
-                                                                    .child(
-                                                                        Icon::new(
-                                                                            IconName::ChevronDown,
-                                                                        )
-                                                                        .size_3(),
-                                                                    ),
-                                                            )
-                                                            .on_click(cx.listener(
-                                                                |this, _, _, cx| {
-                                                                    if !this.connected {
-                                                                        this.baud_index =
-                                                                            (this.baud_index + 1)
-                                                                                % this
-                                                                                    .baud_rates
-                                                                                    .len();
-                                                                        cx.notify();
-                                                                    }
-                                                                },
-                                                            )),
-                                                    )
-                                                    .child(Self::parameter_row(
-                                                        "数据位",
-                                                        "8 bits".into(),
-                                                    ))
-                                                    .child(Self::parameter_row(
-                                                        "停止位",
-                                                        "1 bit".into(),
-                                                    ))
-                                                    .child(Self::parameter_row(
-                                                        "校验位",
-                                                        "None".into(),
-                                                    ))
-                                                    .child(Self::parameter_row(
-                                                        "流控制",
-                                                        "None".into(),
-                                                    ))
-                                                    .child(
-                                                        Button::new("connect")
-                                                            .w_full()
-                                                            .when(self.connected, |button| {
-                                                                button.outline().label("断开连接")
-                                                            })
-                                                            .when(!self.connected, |button| {
-                                                                button
-                                                                    .custom(
-                                                                        ButtonCustomVariant::new(cx)
-                                                                            .color(rgb(INK).into())
-                                                                            .foreground(
-                                                                                rgb(0xffffff)
-                                                                                    .into(),
-                                                                            )
-                                                                            .hover(
-                                                                                rgb(NAVY_SOFT)
-                                                                                    .into(),
-                                                                            )
-                                                                            .active(
-                                                                                rgb(NAVY).into(),
-                                                                            )
-                                                                            .shadow(true),
-                                                                    )
-                                                                    .label(if self.connecting {
-                                                                        "连接中…"
-                                                                    } else {
-                                                                        "连接设备"
-                                                                    })
-                                                            })
-                                                            .on_click(cx.listener(
-                                                                |this, _, _, cx| {
-                                                                    this.toggle_connection(cx)
-                                                                },
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                v_flex()
-                                                    .rounded_2xl()
-                                                    .bg(rgb(NAVY))
-                                                    .text_color(rgb(0xffffff))
-                                                    .p_4()
-                                                    .gap_3()
-                                                    .child(
-                                                        h_flex()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .text_sm()
-                                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                                    .child("会话选项"),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .size_2()
-                                                                    .rounded_full()
-                                                                    .bg(rgb(MINT)),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        h_flex()
-                                                            .justify_between()
-                                                            .child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(rgba(0xffffff88))
-                                                                    .child("自动滚动"),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id("auto-scroll")
-                                                                    .w_9()
-                                                                    .h_5()
-                                                                    .p_px()
-                                                                    .rounded_full()
-                                                                    .cursor_pointer()
-                                                                    .bg(if self.auto_scroll {
-                                                                        rgb(MINT)
-                                                                    } else {
-                                                                        rgba(0xffffff22)
-                                                                    })
-                                                                    .flex()
-                                                                    .justify_end()
-                                                                    .when(!self.auto_scroll, |el| {
-                                                                        el.justify_start()
-                                                                    })
-                                                                    .child(
-                                                                        div()
-                                                                            .size_4()
-                                                                            .rounded_full()
-                                                                            .bg(rgb(0xffffff)),
-                                                                    )
-                                                                    .on_click(cx.listener(
-                                                                        |this, _, _, cx| {
-                                                                            this.auto_scroll =
-                                                                                !this.auto_scroll;
-                                                                            cx.notify();
-                                                                        },
-                                                                    )),
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(rgba(0xffffff72))
-                                                            .child(
-                                                                "Enter 快速发送 · Shift + Enter 换行\n数据仅在本机处理",
-                                                            ),
-                                                    ),
-                                            ),
-                                    ),
-                            ),
-                    ),
+                    .p_5()
+                    .child(tab_bar)
+                    .child(content),
             )
-    }
-}
-
-impl Drop for SerialWorkspace {
-    fn drop(&mut self) {
-        if let Some(tx) = self.command_tx.take() {
-            let _ = tx.send(SerialCommand::Stop);
-        }
     }
 }
 
@@ -1080,12 +1379,16 @@ fn discover_ports() -> Vec<PortItem> {
 
 fn spawn_serial_worker(
     port_name: String,
-    baud: u32,
+    configuration: SerialConfiguration,
     commands: Receiver<SerialCommand>,
     events: Sender<SerialEvent>,
 ) {
     thread::spawn(move || {
-        let mut port = match serialport::new(&port_name, baud)
+        let mut port = match serialport::new(&port_name, configuration.baud_rate())
+            .data_bits(configuration.data_bits())
+            .stop_bits(configuration.stop_bits())
+            .parity(configuration.parity())
+            .flow_control(configuration.flow_control())
             .timeout(Duration::from_millis(24))
             .open()
         {
@@ -1150,48 +1453,7 @@ fn demo_response(command: &str) -> Vec<u8> {
     }
 }
 
-fn demo_lines() -> Vec<TerminalLine> {
-    vec![
-        TerminalLine {
-            time: "14:32:40.018".into(),
-            kind: LineKind::System,
-            payload: vec![],
-            note: Some("Loopback 会话已就绪 · 115200 8N1".into()),
-        },
-        TerminalLine {
-            time: "14:32:41.106".into(),
-            kind: LineKind::Tx,
-            payload: b"AT+VERSION?\r\n".to_vec(),
-            note: None,
-        },
-        TerminalLine {
-            time: "14:32:41.108".into(),
-            kind: LineKind::Rx,
-            payload: b"+VERSION:SerialX-Demo/1.4.2\r\nOK\r\n".to_vec(),
-            note: None,
-        },
-        TerminalLine {
-            time: "14:32:44.221".into(),
-            kind: LineKind::Rx,
-            payload: b"$SENSOR,24.6,48.2,3.301*7A\r\n".to_vec(),
-            note: None,
-        },
-        TerminalLine {
-            time: "14:32:47.073".into(),
-            kind: LineKind::Tx,
-            payload: b"AT+STATUS?\r\n".to_vec(),
-            note: None,
-        },
-        TerminalLine {
-            time: "14:32:47.075".into(),
-            kind: LineKind::Rx,
-            payload: b"+STATUS:READY,RSSI=-48,TEMP=24.6\r\nOK\r\n".to_vec(),
-            note: None,
-        },
-    ]
-}
-
-fn format_bytes(bytes: usize) -> String {
+fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else if bytes >= 1024 {
@@ -1201,21 +1463,128 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
+fn application_menus() -> Vec<Menu> {
+    vec![
+        Menu::new("serialX").items([
+            MenuItem::action("关于 serialX", ShowAbout),
+            MenuItem::separator(),
+            MenuItem::action("退出 serialX", QuitSerialX),
+        ]),
+        Menu::new("文件").items([
+            MenuItem::action("新建串口标签", NewSerialTab),
+            MenuItem::action("关闭当前标签", CloseSerialTab),
+        ]),
+        Menu::new("会话").items([
+            MenuItem::action("连接 / 断开", ToggleConnection),
+            MenuItem::action("刷新串口列表", RefreshPorts),
+            MenuItem::separator(),
+            MenuItem::action("暂停 / 继续接收", TogglePause),
+            MenuItem::action("清空终端", ClearTerminal),
+        ]),
+        Menu::new("显示").items([
+            MenuItem::action("ASCII / HEX", ToggleHex),
+            MenuItem::action("显示 / 隐藏时间戳", ToggleTimestamps),
+            MenuItem::action("自动 / 手动滚动", ToggleAutoScroll),
+        ]),
+        Menu::new("帮助").items([
+            MenuItem::action("检查更新…", CheckForUpdates),
+            MenuItem::separator(),
+            MenuItem::action("关于 serialX", ShowAbout),
+        ]),
+    ]
+}
+
+fn configure_application_menus(cx: &mut App) {
+    cx.on_action(|_: &QuitSerialX, cx| cx.quit());
+    GlobalState::global_mut(cx)
+        .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
+    cx.set_menus(application_menus());
+}
+
+fn bind_window_actions(workspace: &Entity<SerialWorkspace>, window: &mut Window, cx: &mut App) {
+    let window_handle = window.window_handle();
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &NewSerialTab, cx| {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            let _ = view.update(cx, |view, cx| view.add_serial_tab(window, cx));
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &CloseSerialTab, cx| {
+        let _ = view.update(cx, |view, cx| view.close_active_tab(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &RefreshPorts, cx| {
+        let _ = view.update(cx, |view, cx| view.refresh_ports(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleConnection, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_active_connection(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &TogglePause, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_pause(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ClearTerminal, cx| {
+        let _ = view.update(cx, |view, cx| view.clear_terminal(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleHex, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_hex(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleTimestamps, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_timestamps(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleAutoScroll, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_auto_scroll(cx));
+    });
+
+    let window_handle = window.window_handle();
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &CheckForUpdates, cx| {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.check_for_updates_from_menu(window, cx);
+            });
+        });
+    });
+
+    let window_handle = window.window_handle();
+    cx.on_action(move |_: &ShowAbout, cx| {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            SerialWorkspace::show_about_dialog(window, cx);
+        });
+    });
+}
+
 fn main() {
     let app = gpui_kit::application().with_assets(Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        configure_application_menus(cx);
 
         let mut options = TitleBar::window_options();
         options.window_bounds = Some(WindowBounds::centered(size(px(1280.), px(800.)), cx));
-        options.window_min_size = Some(size(px(1024.), px(680.)));
+        options.window_min_size = Some(size(px(960.), px(640.)));
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
                 let workspace = cx.new(|cx| SerialWorkspace::new(window, cx));
+                bind_window_actions(&workspace, window, cx);
                 cx.new(|cx| Root::new(workspace, window, cx).bg(rgb(CANVAS)))
             })
-            .expect("failed to open Serial X window");
+            .expect("failed to open serialX window");
         })
         .detach();
     });
@@ -1223,19 +1592,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use core::prelude::v1::test;
+    use super::parse_hex;
 
     #[test]
-    fn parses_spaced_hex() {
+    fn parses_hex_with_or_without_spaces() {
         assert_eq!(parse_hex("41 54 0D 0A"), Some(b"AT\r\n".to_vec()));
+        assert_eq!(parse_hex("41540d0a"), Some(b"AT\r\n".to_vec()));
         assert_eq!(parse_hex("123"), None);
         assert_eq!(parse_hex("GG"), None);
-    }
-
-    #[test]
-    fn formats_byte_counts() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(18_642), "18.2 KB");
     }
 }

@@ -104,7 +104,7 @@ fn check_for_update() -> Result<CheckResult, Box<dyn std::error::Error>> {
         .assets
         .iter()
         .find(|asset| asset.name == asset_name)
-        .ok_or_else(|| format!("Release v{latest} 缺少当前系统的安装包 {asset_name}"))?;
+        .ok_or_else(|| format!("Release v{latest} does not include {asset_name}"))?;
     let checksum_url = release
         .assets
         .iter()
@@ -138,7 +138,7 @@ fn expected_asset_name(
         ("windows", "x86_64") => "windows_x86_64-setup.exe",
         ("linux", "x86_64") => "linux_amd64.deb",
         ("linux", "aarch64") => "linux_arm64.deb",
-        _ => return Err(format!("暂不支持 {os}/{arch} 的自动更新").into()),
+        _ => return Err(format!("Automatic updates are not supported on {os}/{arch}").into()),
     };
     Ok(format!("serialX_{version}_{platform_suffix}"))
 }
@@ -154,14 +154,15 @@ fn download_and_launch(
             let checksum_url = info
                 .checksum_url
                 .as_deref()
-                .ok_or("Release 缺少 SHA256SUMS.txt，已拒绝安装")?;
+                .ok_or("The release has no SHA256SUMS.txt; installation was refused")?;
             let manifest = client
                 .get(checksum_url)
                 .send()?
                 .error_for_status()?
                 .text()?;
-            checksum_from_manifest(&manifest, &info.asset_name)
-                .ok_or("校验清单中没有当前安装包，已拒绝安装")?
+            checksum_from_manifest(&manifest, &info.asset_name).ok_or(
+                "The checksum manifest does not list this package; installation was refused",
+            )?
         }
     };
 
@@ -194,7 +195,7 @@ fn download_and_launch(
     if actual_checksum != expected_checksum {
         let _ = fs::remove_file(&partial_path);
         return Err(format!(
-            "安装包 SHA-256 校验失败（期望 {expected_checksum}，实际 {actual_checksum}）"
+            "Package SHA-256 verification failed (expected {expected_checksum}, got {actual_checksum})"
         )
         .into());
     }
@@ -246,7 +247,7 @@ fn launch_installer(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 fn launch_installer(_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    Err("当前系统不支持自动打开安装包".into())
+    Err("This system cannot open the update package automatically".into())
 }
 
 #[cfg(test)]

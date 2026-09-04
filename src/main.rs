@@ -42,8 +42,8 @@ const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
 const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
 const DATA_BITS: &[&str] = &["5", "6", "7", "8"];
 const STOP_BITS: &[&str] = &["1", "2"];
-const PARITIES: &[&str] = &["无", "奇校验", "偶校验"];
-const FLOW_CONTROLS: &[&str] = &["无", "软件", "硬件"];
+const PARITIES: &[&str] = &["None", "Odd", "Even"];
+const FLOW_CONTROLS: &[&str] = &["None", "Software", "Hardware"];
 
 actions!(
     serialx_menu,
@@ -209,7 +209,7 @@ impl SerialTabState {
                 time: "14:32:40.018".into(),
                 kind: LineKind::System,
                 payload: Vec::new(),
-                note: Some("请配置串口参数，然后连接设备".into()),
+                note: Some("Configure the serial port, then connect.".into()),
             }],
             clock_tick: 0,
             send_input,
@@ -226,11 +226,11 @@ impl SerialTabState {
 
     fn status_label(&self) -> &'static str {
         if self.connecting {
-            "连接中…"
+            "Connecting…"
         } else if self.connected {
-            "已连接"
+            "Connected"
         } else {
-            "未连接"
+            "Disconnected"
         }
     }
 
@@ -386,7 +386,7 @@ impl SerialWorkspace {
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
         let send_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("输入要发送的数据，例如 AT+VERSION?")
+                .placeholder("Enter data to send, for example AT+VERSION?")
                 .default_value("AT+STATUS?")
         });
         let subscription = cx.subscribe_in(
@@ -493,7 +493,7 @@ impl SerialWorkspace {
         tab.push_line(
             LineKind::System,
             Vec::new(),
-            Some(format!("扫描完成 · 发现 {} 个设备", tab.ports.len())),
+            Some(format!("Scan complete · {} devices found", tab.ports.len())),
         );
         cx.notify();
     }
@@ -509,7 +509,7 @@ impl SerialWorkspace {
             tab.push_line(
                 LineKind::System,
                 Vec::new(),
-                Some(format!("已断开 {device}")),
+                Some(format!("Disconnected from {device}")),
             );
             cx.notify();
             return;
@@ -522,7 +522,7 @@ impl SerialWorkspace {
                 LineKind::System,
                 Vec::new(),
                 Some(format!(
-                    "Loopback 会话已就绪 · {}",
+                    "Loopback session ready · {}",
                     tab.configuration.summary()
                 )),
             );
@@ -563,7 +563,7 @@ impl SerialWorkspace {
             tab.push_line(
                 LineKind::System,
                 Vec::new(),
-                Some("请先连接一个串口设备".into()),
+                Some("Connect a serial port before sending data.".into()),
             );
             cx.notify();
             return;
@@ -602,7 +602,7 @@ impl SerialWorkspace {
                         tab.push_line(
                             LineKind::System,
                             Vec::new(),
-                            Some("串口已打开，开始接收数据".into()),
+                            Some("Serial port opened; receiving data.".into()),
                         );
                     }
                     SerialEvent::Data(bytes) => {
@@ -700,9 +700,9 @@ impl SerialWorkspace {
                     #[cfg(not(target_os = "windows"))]
                     window.push_notification(
                         Notification::success(format!(
-                            "serialX v{version} 安装程序已打开，请按系统提示完成更新。"
+                            "The serialX v{version} installer is open. Follow the system prompts to finish updating."
                         ))
-                        .title("软件更新"),
+                        .title("Software Update"),
                         cx,
                     );
                 }
@@ -742,17 +742,17 @@ impl SerialWorkspace {
             } => {
                 window.push_notification(
                     Notification::info(format!(
-                        "正在下载 serialX v{version}（已下载 {}）",
+                        "Downloading serialX v{version} ({} downloaded)",
                         format_bytes(*downloaded)
                     ))
-                    .title("软件更新"),
+                    .title("Software Update"),
                     cx,
                 );
             }
             UpdateStatus::Checking => {
                 self.manual_update_check = true;
                 window.push_notification(
-                    Notification::info("正在检查 GitHub Releases…").title("软件更新"),
+                    Notification::info("Checking GitHub Releases…").title("Software Update"),
                     cx,
                 );
             }
@@ -761,7 +761,7 @@ impl SerialWorkspace {
                 self.update_status = UpdateStatus::Checking;
                 spawn_update_check(self.update_tx.clone());
                 window.push_notification(
-                    Notification::info("正在检查 GitHub Releases…").title("软件更新"),
+                    Notification::info("Checking GitHub Releases…").title("Software Update"),
                     cx,
                 );
                 cx.notify();
@@ -783,16 +783,16 @@ impl SerialWorkspace {
             let version_for_notice = latest_version.clone();
             alert
                 .icon(Icon::new(IconName::RotateCw).size_5())
-                .title(format!("发现 serialX v{latest_version}"))
+                .title(format!("serialX v{latest_version} is available"))
                 .description(format!(
-                    "当前版本：v{}\n安装包：{package_name}\n\n是否现在下载并安装？",
+                    "Current version: v{}\nPackage: {package_name}\n\nDownload and install now?",
                     env!("CARGO_PKG_VERSION")
                 ))
                 .show_cancel(true)
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("下载并安装")
-                        .cancel_text("稍后"),
+                        .ok_text("Download and Install")
+                        .cancel_text("Later"),
                 )
                 .on_ok(move |_, window, cx| {
                     let started = workspace
@@ -802,8 +802,10 @@ impl SerialWorkspace {
                         .is_some();
                     if started {
                         window.push_notification(
-                            Notification::info(format!("正在下载 serialX v{version_for_notice}…"))
-                                .title("软件更新"),
+                            Notification::info(format!(
+                                "Downloading serialX v{version_for_notice}…"
+                            ))
+                            .title("Software Update"),
                             cx,
                         );
                     }
@@ -816,9 +818,9 @@ impl SerialWorkspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             alert
                 .icon(Icon::new(IconName::CircleCheck).size_5())
-                .title("serialX 已是最新版本")
-                .description(format!("当前版本：v{version}"))
-                .button_props(DialogButtonProps::default().ok_text("确定"))
+                .title("serialX is up to date")
+                .description(format!("Current version: v{version}"))
+                .button_props(DialogButtonProps::default().ok_text("OK"))
         });
     }
 
@@ -826,9 +828,9 @@ impl SerialWorkspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             alert
                 .icon(Icon::new(IconName::CircleX).size_5())
-                .title("无法检查或安装更新")
+                .title("Unable to Check for or Install Update")
                 .description(message.clone())
-                .button_props(DialogButtonProps::default().ok_text("关闭"))
+                .button_props(DialogButtonProps::default().ok_text("Close"))
         });
     }
 
@@ -838,14 +840,14 @@ impl SerialWorkspace {
                 .icon(Icon::new(IconName::SquareTerminal).size_5())
                 .title("serialX")
                 .description(format!(
-                    "版本 {}\n现代串口调试工作台\n\nGNU GPL v3\n© 2026 miskin",
+                    "Version {}\nA modern serial port workspace\n\nGNU GPL v3\n© 2026 miskin",
                     env!("CARGO_PKG_VERSION")
                 ))
                 .show_cancel(true)
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("关闭")
-                        .cancel_text("查看 GitHub"),
+                        .ok_text("Close")
+                        .cancel_text("View on GitHub"),
                 )
                 .on_cancel(|_, _, cx| {
                     cx.open_url(REPOSITORY_URL);
@@ -913,11 +915,11 @@ impl SerialWorkspace {
         let selected = tab.ports[tab.selected_port.min(tab.ports.len().saturating_sub(1))].clone();
         let locked = tab.connected || tab.connecting;
         let status_label = if tab.connecting {
-            "连接中…"
+            "Connecting…"
         } else if tab.connected {
-            "已连接"
+            "Connected"
         } else {
-            "未连接"
+            "Disconnected"
         };
         let connection_color = if tab.connected { GREEN } else { MUTED };
         let tab_id = tab.id;
@@ -963,19 +965,19 @@ impl SerialWorkspace {
                                         div()
                                             .text_sm()
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("串口配置"),
+                                            .child("Serial Configuration"),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(rgb(MUTED))
-                                            .child("连接后锁定参数"),
+                                            .child("Settings lock while connected"),
                                     ),
                             )
                             .child(
                                 Button::new(("connect-tab", tab_id))
                                     .when(tab.connected, |button| {
-                                        button.outline().label("断开连接")
+                                        button.outline().label("Disconnect")
                                     })
                                     .when(!tab.connected, |button| {
                                         button
@@ -988,9 +990,9 @@ impl SerialWorkspace {
                                                     .shadow(true),
                                             )
                                             .label(if tab.connecting {
-                                                "连接中…"
+                                                "Connecting…"
                                             } else {
-                                                "连接设备"
+                                                "Connect"
                                             })
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1006,7 +1008,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("port-{tab_id}"),
-                                    label: "端口",
+                                    label: "Port",
                                     value: selected.name.clone(),
                                     options: port_options,
                                     selected_index: tab.selected_port,
@@ -1019,7 +1021,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("baud-{tab_id}"),
-                                    label: "波特率",
+                                    label: "Baud Rate",
                                     value: tab.configuration.baud_rate().to_string(),
                                     options: baud_options,
                                     selected_index: tab.configuration.baud_index,
@@ -1032,7 +1034,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("data-bits-{tab_id}"),
-                                    label: "数据位",
+                                    label: "Data Bits",
                                     value: DATA_BITS[tab.configuration.data_bits_index].into(),
                                     options: data_bit_options,
                                     selected_index: tab.configuration.data_bits_index,
@@ -1045,7 +1047,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("stop-bits-{tab_id}"),
-                                    label: "停止位",
+                                    label: "Stop Bits",
                                     value: STOP_BITS[tab.configuration.stop_bits_index].into(),
                                     options: stop_bit_options,
                                     selected_index: tab.configuration.stop_bits_index,
@@ -1058,7 +1060,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("parity-{tab_id}"),
-                                    label: "校验位",
+                                    label: "Parity",
                                     value: PARITIES[tab.configuration.parity_index].into(),
                                     options: parity_options,
                                     selected_index: tab.configuration.parity_index,
@@ -1071,7 +1073,7 @@ impl SerialWorkspace {
                             .child(Self::configuration_button(
                                 ConfigurationButton {
                                     id: format!("flow-{tab_id}"),
-                                    label: "流控制",
+                                    label: "Flow Control",
                                     value: FLOW_CONTROLS[tab.configuration.flow_control_index]
                                         .into(),
                                     options: flow_options,
@@ -1095,7 +1097,11 @@ impl SerialWorkspace {
                     .child(
                         h_flex()
                             .gap_2()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("实时终端"))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Live Terminal"),
+                            )
                             .child(
                                 h_flex()
                                     .gap_2()
@@ -1120,8 +1126,8 @@ impl SerialWorkspace {
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child(if tab.hex_mode { "HEX" } else { "ASCII" })
-                            .when(tab.paused, |row| row.child("· 已暂停"))
-                            .when(!tab.auto_scroll, |row| row.child("· 手动滚动")),
+                            .when(tab.paused, |row| row.child("· Paused"))
+                            .when(!tab.auto_scroll, |row| row.child("· Manual Scroll")),
                     ),
             )
             .child(
@@ -1206,7 +1212,7 @@ impl SerialWorkspace {
                                     .shadow(true),
                             )
                             .icon(IconName::ArrowUp)
-                            .label("发送")
+                            .label("Send")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.send_current(tab_id, window, cx)
                             })),
@@ -1223,17 +1229,17 @@ impl Render for SerialWorkspace {
             .active_tab()
             .map(|tab| {
                 (
-                    format!("串口 {} · {}", tab.id, tab.selected_port().name),
+                    format!("Serial {} · {}", tab.id, tab.selected_port().name),
                     tab.status_label(),
                     if tab.connected { GREEN } else { MUTED },
                 )
             })
-            .unwrap_or_else(|| ("未打开串口标签".into(), "空闲", MUTED));
+            .unwrap_or_else(|| ("No Serial Tab".into(), "Idle", MUTED));
 
         let mut tab_items = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             let tab_id = tab.id;
-            let tab_label = format!("串口 {} · {}", tab.id, tab.selected_port().name);
+            let tab_label = format!("Serial {} · {}", tab.id, tab.selected_port().name);
             let dot_color = if tab.connected { GREEN } else { MUTED };
             tab_items.push(
                 Tab::new()
@@ -1295,13 +1301,13 @@ impl Render for SerialWorkspace {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("没有打开的串口标签"),
+                        .child("No Serial Tabs Open"),
                 )
                 .child(
                     div()
                         .text_sm()
                         .text_color(rgb(MUTED))
-                        .child("使用“文件 > 新建串口标签”开始一个会话"),
+                        .child("Use File > New Serial Tab to start a session."),
                 )
                 .into_any_element()
         };
@@ -1356,7 +1362,7 @@ impl Render for SerialWorkspace {
 fn discover_ports() -> Vec<PortItem> {
     let mut ports = vec![PortItem {
         name: "Loopback".into(),
-        subtitle: "内置演示设备".into(),
+        subtitle: "Built-in demo device".into(),
         is_demo: true,
     }];
 
@@ -1394,7 +1400,9 @@ fn spawn_serial_worker(
         {
             Ok(port) => port,
             Err(error) => {
-                let _ = events.send(SerialEvent::Error(format!("无法打开 {port_name}: {error}")));
+                let _ = events.send(SerialEvent::Error(format!(
+                    "Unable to open {port_name}: {error}"
+                )));
                 return;
             }
         };
@@ -1406,7 +1414,8 @@ fn spawn_serial_worker(
                 match command {
                     SerialCommand::Write(bytes) => {
                         if let Err(error) = port.write_all(&bytes) {
-                            let _ = events.send(SerialEvent::Error(format!("发送失败: {error}")));
+                            let _ =
+                                events.send(SerialEvent::Error(format!("Send failed: {error}")));
                             return;
                         }
                     }
@@ -1424,7 +1433,7 @@ fn spawn_serial_worker(
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(error) => {
-                    let _ = events.send(SerialEvent::Error(format!("读取失败: {error}")));
+                    let _ = events.send(SerialEvent::Error(format!("Read failed: {error}")));
                     return;
                 }
             }
@@ -1466,30 +1475,30 @@ fn format_bytes(bytes: u64) -> String {
 fn application_menus() -> Vec<Menu> {
     vec![
         Menu::new("serialX").items([
-            MenuItem::action("关于 serialX", ShowAbout),
+            MenuItem::action("About serialX", ShowAbout),
             MenuItem::separator(),
-            MenuItem::action("退出 serialX", QuitSerialX),
+            MenuItem::action("Quit serialX", QuitSerialX),
         ]),
-        Menu::new("文件").items([
-            MenuItem::action("新建串口标签", NewSerialTab),
-            MenuItem::action("关闭当前标签", CloseSerialTab),
+        Menu::new("File").items([
+            MenuItem::action("New Serial Tab", NewSerialTab),
+            MenuItem::action("Close Current Tab", CloseSerialTab),
         ]),
-        Menu::new("会话").items([
-            MenuItem::action("连接 / 断开", ToggleConnection),
-            MenuItem::action("刷新串口列表", RefreshPorts),
+        Menu::new("Session").items([
+            MenuItem::action("Connect / Disconnect", ToggleConnection),
+            MenuItem::action("Refresh Port List", RefreshPorts),
             MenuItem::separator(),
-            MenuItem::action("暂停 / 继续接收", TogglePause),
-            MenuItem::action("清空终端", ClearTerminal),
+            MenuItem::action("Pause / Resume Receiving", TogglePause),
+            MenuItem::action("Clear Terminal", ClearTerminal),
         ]),
-        Menu::new("显示").items([
+        Menu::new("View").items([
             MenuItem::action("ASCII / HEX", ToggleHex),
-            MenuItem::action("显示 / 隐藏时间戳", ToggleTimestamps),
-            MenuItem::action("自动 / 手动滚动", ToggleAutoScroll),
+            MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
+            MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
         ]),
-        Menu::new("帮助").items([
-            MenuItem::action("检查更新…", CheckForUpdates),
+        Menu::new("Help").items([
+            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
-            MenuItem::action("关于 serialX", ShowAbout),
+            MenuItem::action("About serialX", ShowAbout),
         ]),
     ]
 }

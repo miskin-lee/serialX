@@ -1,23 +1,25 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app_menu;
+mod presets;
+mod serial;
+mod sidebar;
+mod theme;
 mod updater;
 
 use std::{
-    io::{Read, Write},
-    rc::Rc,
     sync::mpsc::{self, Receiver, Sender},
-    thread,
     time::Duration,
 };
 
+use app_menu::{bind_window_actions, configure_application_menus};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
-    Disableable, GlobalState, Icon, IconName, Root, Sizable, Theme, ThemeConfig, ThemeConfigColors,
-    ThemeMode, TitleBar, WindowExt,
+    Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
     menu::{AppMenuBar, DropdownMenu, PopupMenuItem},
     notification::Notification,
     scroll::ScrollableElement,
@@ -26,500 +28,13 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use presets::PresetStore;
+use serial::*;
 use smol::Timer;
+use theme::{InterfaceTheme, apply_interface_theme};
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
-
-const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
-const DATA_BITS: &[&str] = &["5", "6", "7", "8"];
-const STOP_BITS: &[&str] = &["1", "2"];
-const PARITIES: &[&str] = &["None", "Odd", "Even"];
-const FLOW_CONTROLS: &[&str] = &["None", "Software", "Hardware"];
-
-actions!(
-    serialx_menu,
-    [
-        NewSerialTab,
-        CloseSerialTab,
-        RefreshPorts,
-        ToggleConnection,
-        TogglePause,
-        ClearTerminal,
-        ToggleHex,
-        ToggleTimestamps,
-        ToggleAutoScroll,
-        UseLightTheme,
-        UseDarkTheme,
-        CheckForUpdates,
-        ShowAbout,
-        QuitSerialX
-    ]
-);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InterfaceTheme {
-    Light,
-    Dark,
-}
-
-#[derive(Clone, Copy)]
-struct WorkbenchPalette {
-    title_bar: u32,
-    tab_bar: u32,
-    editor: u32,
-    panel: u32,
-    status_bar: u32,
-    border: u32,
-    foreground: u32,
-    strong_foreground: u32,
-    muted: u32,
-    input: u32,
-    input_border: u32,
-    hover: u32,
-    accent: u32,
-    accent_hover: u32,
-    accent_active: u32,
-    selection: u32,
-    success: u32,
-    warning: u32,
-    danger: u32,
-    badge: u32,
-}
-
-impl InterfaceTheme {
-    fn from_appearance(appearance: WindowAppearance) -> Self {
-        match appearance {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
-            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Light => "Light Modern",
-            Self::Dark => "Dark Modern",
-        }
-    }
-
-    fn mode(self) -> ThemeMode {
-        match self {
-            Self::Light => ThemeMode::Light,
-            Self::Dark => ThemeMode::Dark,
-        }
-    }
-
-    fn window_appearance(self) -> WindowAppearance {
-        match self {
-            Self::Light => WindowAppearance::Light,
-            Self::Dark => WindowAppearance::Dark,
-        }
-    }
-
-    fn palette(self) -> WorkbenchPalette {
-        match self {
-            Self::Light => WorkbenchPalette {
-                title_bar: 0xf8f8f8,
-                tab_bar: 0xf8f8f8,
-                editor: 0xffffff,
-                panel: 0xf8f8f8,
-                status_bar: 0xf8f8f8,
-                border: 0xe5e5e5,
-                foreground: 0x3b3b3b,
-                strong_foreground: 0x1f1f1f,
-                muted: 0x868686,
-                input: 0xffffff,
-                input_border: 0xcecece,
-                hover: 0xf2f2f2,
-                accent: 0x005fb8,
-                accent_hover: 0x0258a8,
-                accent_active: 0x004a8f,
-                selection: 0xadd6ff,
-                success: 0x2ea043,
-                warning: 0xbf8700,
-                danger: 0xf85149,
-                badge: 0xcccccc,
-            },
-            Self::Dark => WorkbenchPalette {
-                title_bar: 0x181818,
-                tab_bar: 0x181818,
-                editor: 0x1f1f1f,
-                panel: 0x181818,
-                status_bar: 0x181818,
-                border: 0x2b2b2b,
-                foreground: 0xcccccc,
-                strong_foreground: 0xffffff,
-                muted: 0x9d9d9d,
-                input: 0x313131,
-                input_border: 0x3c3c3c,
-                hover: 0x2b2b2b,
-                accent: 0x0078d4,
-                accent_hover: 0x026ec1,
-                accent_active: 0x005a9e,
-                selection: 0x264f78,
-                success: 0x2ea043,
-                warning: 0xd29922,
-                danger: 0xf85149,
-                badge: 0x616161,
-            },
-        }
-    }
-}
-
-fn theme_color(value: u32) -> Option<SharedString> {
-    Some(format!("#{value:06X}").into())
-}
-
-fn vscode_theme_config(theme: InterfaceTheme) -> ThemeConfig {
-    let palette = theme.palette();
-    let white = theme_color(0xffffff);
-    let foreground = theme_color(palette.foreground);
-    let background = theme_color(palette.editor);
-    let panel = theme_color(palette.panel);
-    let hover = theme_color(palette.hover);
-    let accent = theme_color(palette.accent);
-    let accent_hover = theme_color(palette.accent_hover);
-    let accent_active = theme_color(palette.accent_active);
-    let border = theme_color(palette.border);
-    let success = theme_color(palette.success);
-    let warning = theme_color(palette.warning);
-    let danger = theme_color(palette.danger);
-
-    let mut colors = ThemeConfigColors::default();
-    colors.accent = hover.clone();
-    colors.accent_foreground = foreground.clone();
-    colors.background = background.clone();
-    colors.border = border.clone();
-    colors.button = panel.clone();
-    colors.button_active = hover.clone();
-    colors.button_foreground = foreground.clone();
-    colors.button_hover = hover.clone();
-    colors.button_primary = accent.clone();
-    colors.button_primary_active = accent_active.clone();
-    colors.button_primary_foreground = white.clone();
-    colors.button_primary_hover = accent_hover.clone();
-    colors.caret = accent.clone();
-    colors.danger = danger.clone();
-    colors.danger_active = danger.clone();
-    colors.danger_foreground = white.clone();
-    colors.danger_hover = danger;
-    colors.foreground = foreground.clone();
-    colors.input = theme_color(palette.input_border);
-    colors.link = accent.clone();
-    colors.link_active = accent_active.clone();
-    colors.link_hover = accent_hover.clone();
-    colors.list = background.clone();
-    colors.list_active = theme_color(palette.selection);
-    colors.list_active_border = accent.clone();
-    colors.list_even = background.clone();
-    colors.list_head = panel.clone();
-    colors.list_hover = hover.clone();
-    colors.muted = panel.clone();
-    colors.muted_foreground = theme_color(palette.muted);
-    colors.popover = theme_color(palette.input);
-    colors.popover_foreground = foreground.clone();
-    colors.primary = accent.clone();
-    colors.primary_active = accent_active;
-    colors.primary_foreground = white;
-    colors.primary_hover = accent_hover;
-    colors.ring = accent;
-    colors.scrollbar = background.clone();
-    colors.scrollbar_thumb = theme_color(palette.badge);
-    colors.scrollbar_thumb_hover = theme_color(palette.muted);
-    colors.secondary = panel.clone();
-    colors.secondary_active = hover.clone();
-    colors.secondary_foreground = foreground.clone();
-    colors.secondary_hover = hover.clone();
-    colors.selection = theme_color(palette.selection);
-    colors.sidebar = panel.clone();
-    colors.sidebar_accent = hover.clone();
-    colors.sidebar_accent_foreground = foreground.clone();
-    colors.sidebar_border = border.clone();
-    colors.sidebar_foreground = foreground.clone();
-    colors.success = success;
-    colors.success_foreground = theme_color(palette.strong_foreground);
-    colors.tab = theme_color(palette.tab_bar);
-    colors.tab_active = background.clone();
-    colors.tab_active_foreground = theme_color(palette.strong_foreground);
-    colors.tab_bar = theme_color(palette.tab_bar);
-    colors.tab_foreground = theme_color(palette.muted);
-    colors.table = background;
-    colors.table_active = hover.clone();
-    colors.table_active_border = theme_color(palette.accent);
-    colors.table_even = theme_color(palette.editor);
-    colors.table_head = panel.clone();
-    colors.table_head_foreground = foreground;
-    colors.table_hover = hover;
-    colors.table_row_border = border.clone();
-    colors.title_bar = theme_color(palette.title_bar);
-    colors.title_bar_border = border.clone();
-    colors.status_bar = theme_color(palette.status_bar);
-    colors.status_bar_border = border;
-    colors.warning = warning;
-    colors.warning_foreground = theme_color(palette.strong_foreground);
-
-    ThemeConfig {
-        name: format!("serialX {}", theme.name()).into(),
-        mode: theme.mode(),
-        font_size: Some(13.),
-        mono_font_size: Some(12.),
-        radius: Some(3),
-        radius_lg: Some(5),
-        shadow: Some(false),
-        colors,
-        ..Default::default()
-    }
-}
-
-fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, cx: &mut App) {
-    let config = Rc::new(vscode_theme_config(theme));
-    Theme::global_mut(cx).apply_config(&config);
-    Theme::sync_base(cx);
-    cx.set_window_appearance(Some(theme.window_appearance()));
-    window.refresh();
-}
-
-#[derive(Clone)]
-struct PortItem {
-    name: String,
-    subtitle: String,
-    is_demo: bool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LineKind {
-    Rx,
-    Tx,
-    System,
-}
-
-#[derive(Clone)]
-struct TerminalLine {
-    time: String,
-    kind: LineKind,
-    payload: Vec<u8>,
-    note: Option<String>,
-}
-
-enum SerialCommand {
-    Write(Vec<u8>),
-    Stop,
-}
-
-enum SerialEvent {
-    Connected,
-    Data(Vec<u8>),
-    Error(String),
-    Closed,
-}
-
-#[derive(Clone, Copy)]
-struct SerialConfiguration {
-    baud_index: usize,
-    data_bits_index: usize,
-    stop_bits_index: usize,
-    parity_index: usize,
-    flow_control_index: usize,
-}
-
-impl Default for SerialConfiguration {
-    fn default() -> Self {
-        Self {
-            baud_index: 4,
-            data_bits_index: 3,
-            stop_bits_index: 0,
-            parity_index: 0,
-            flow_control_index: 0,
-        }
-    }
-}
-
-impl SerialConfiguration {
-    fn baud_rate(self) -> u32 {
-        BAUD_RATES[self.baud_index]
-    }
-
-    fn data_bits(self) -> serialport::DataBits {
-        match self.data_bits_index {
-            0 => serialport::DataBits::Five,
-            1 => serialport::DataBits::Six,
-            2 => serialport::DataBits::Seven,
-            _ => serialport::DataBits::Eight,
-        }
-    }
-
-    fn stop_bits(self) -> serialport::StopBits {
-        match self.stop_bits_index {
-            1 => serialport::StopBits::Two,
-            _ => serialport::StopBits::One,
-        }
-    }
-
-    fn parity(self) -> serialport::Parity {
-        match self.parity_index {
-            1 => serialport::Parity::Odd,
-            2 => serialport::Parity::Even,
-            _ => serialport::Parity::None,
-        }
-    }
-
-    fn flow_control(self) -> serialport::FlowControl {
-        match self.flow_control_index {
-            1 => serialport::FlowControl::Software,
-            2 => serialport::FlowControl::Hardware,
-            _ => serialport::FlowControl::None,
-        }
-    }
-
-    fn summary(self) -> String {
-        let parity = match self.parity_index {
-            1 => 'O',
-            2 => 'E',
-            _ => 'N',
-        };
-        format!(
-            "{} {}{}{}",
-            self.baud_rate(),
-            DATA_BITS[self.data_bits_index],
-            parity,
-            STOP_BITS[self.stop_bits_index]
-        )
-    }
-}
-
-struct SerialTabState {
-    id: usize,
-    ports: Vec<PortItem>,
-    selected_port: usize,
-    configuration: SerialConfiguration,
-    connected: bool,
-    connecting: bool,
-    paused: bool,
-    hex_mode: bool,
-    timestamps: bool,
-    auto_scroll: bool,
-    terminal_lines: Vec<TerminalLine>,
-    clock_tick: usize,
-    send_input: Entity<InputState>,
-    command_tx: Option<Sender<SerialCommand>>,
-    event_tx: Sender<SerialEvent>,
-    event_rx: Receiver<SerialEvent>,
-    _input_subscription: Subscription,
-}
-
-impl SerialTabState {
-    fn new(id: usize, send_input: Entity<InputState>, input_subscription: Subscription) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
-        Self {
-            id,
-            ports: discover_ports(),
-            selected_port: 0,
-            configuration: SerialConfiguration::default(),
-            connected: false,
-            connecting: false,
-            paused: false,
-            hex_mode: false,
-            timestamps: true,
-            auto_scroll: true,
-            terminal_lines: vec![TerminalLine {
-                time: "14:32:40.018".into(),
-                kind: LineKind::System,
-                payload: Vec::new(),
-                note: Some("Configure the serial port, then connect.".into()),
-            }],
-            clock_tick: 0,
-            send_input,
-            command_tx: None,
-            event_tx,
-            event_rx,
-            _input_subscription: input_subscription,
-        }
-    }
-
-    fn selected_port(&self) -> &PortItem {
-        &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
-    }
-
-    fn status_label(&self) -> &'static str {
-        if self.connecting {
-            "Connecting…"
-        } else if self.connected {
-            "Connected"
-        } else {
-            "Disconnected"
-        }
-    }
-
-    fn now(&mut self) -> String {
-        self.clock_tick = self.clock_tick.wrapping_add(1);
-        let seconds = 40 + (self.clock_tick % 19);
-        format!("14:32:{seconds:02}.{:03}", (self.clock_tick * 73) % 1000)
-    }
-
-    fn push_line(&mut self, kind: LineKind, payload: Vec<u8>, note: Option<String>) {
-        let time = self.now();
-        self.terminal_lines.push(TerminalLine {
-            time,
-            kind,
-            payload,
-            note,
-        });
-        if self.terminal_lines.len() > 400 {
-            self.terminal_lines.drain(..80);
-        }
-    }
-
-    fn disconnect(&mut self) {
-        if let Some(tx) = self.command_tx.take() {
-            let _ = tx.send(SerialCommand::Stop);
-        }
-        self.connected = false;
-        self.connecting = false;
-    }
-}
-
-impl Drop for SerialTabState {
-    fn drop(&mut self) {
-        if let Some(tx) = self.command_tx.take() {
-            let _ = tx.send(SerialCommand::Stop);
-        }
-    }
-}
-
-#[derive(Clone)]
-struct SerialTabSnapshot {
-    id: usize,
-    ports: Vec<PortItem>,
-    selected_port: usize,
-    configuration: SerialConfiguration,
-    connected: bool,
-    connecting: bool,
-    paused: bool,
-    hex_mode: bool,
-    timestamps: bool,
-    auto_scroll: bool,
-    terminal_lines: Vec<TerminalLine>,
-    send_input: Entity<InputState>,
-}
-
-impl From<&SerialTabState> for SerialTabSnapshot {
-    fn from(tab: &SerialTabState) -> Self {
-        Self {
-            id: tab.id,
-            ports: tab.ports.clone(),
-            selected_port: tab.selected_port,
-            configuration: tab.configuration,
-            connected: tab.connected,
-            connecting: tab.connecting,
-            paused: tab.paused,
-            hex_mode: tab.hex_mode,
-            timestamps: tab.timestamps,
-            auto_scroll: tab.auto_scroll,
-            terminal_lines: tab.terminal_lines.clone(),
-            send_input: tab.send_input.clone(),
-        }
-    }
-}
 
 enum UpdateStatus {
     Checking,
@@ -554,6 +69,7 @@ pub struct SerialWorkspace {
     active_tab: usize,
     next_tab_id: usize,
     interface_theme: InterfaceTheme,
+    presets: PresetStore,
     update_status: UpdateStatus,
     update_tx: Sender<UpdateEvent>,
     update_rx: Receiver<UpdateEvent>,
@@ -572,6 +88,7 @@ impl SerialWorkspace {
             active_tab: 0,
             next_tab_id: 2,
             interface_theme,
+            presets: PresetStore::load(),
             update_status: UpdateStatus::Checking,
             update_tx,
             update_rx,
@@ -618,7 +135,7 @@ impl SerialWorkspace {
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
         let send_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Enter data to send, for example AT+VERSION?")
+                .placeholder("Enter a command…")
                 .default_value("AT+STATUS?")
         });
         let subscription = cx.subscribe_in(
@@ -1439,33 +956,6 @@ impl SerialWorkspace {
             )
             .child(
                 h_flex()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel))
-                    .child(
-                        div()
-                            .font_family("SF Mono")
-                            .text_color(rgb(palette.accent))
-                            .child(">"),
-                    )
-                    .child(div().flex_1().min_w_0().child(Input::new(&tab.send_input)))
-                    .child(
-                        Button::new(("send", tab_id))
-                            .primary()
-                            .small()
-                            .icon(IconName::ArrowUp)
-                            .label("Send")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.send_current(tab_id, window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
                     .h(px(23.))
                     .flex_none()
                     .px_3()
@@ -1494,6 +984,7 @@ impl Render for SerialWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
+        let sidebar_snapshot = active_snapshot.clone();
         let (title, status_label, connection_color) = self
             .active_tab()
             .map(|tab| {
@@ -1579,175 +1070,95 @@ impl Render for SerialWorkspace {
                     div()
                         .text_xs()
                         .text_color(rgb(palette.muted))
-                        .child("Use File > New Serial Tab to start a session."),
+                        .child("Use Session > New Serial Tab to start a session."),
                 )
                 .into_any_element()
         };
+        let sidebar = self.render_right_sidebar(sidebar_snapshot, cx);
 
         v_flex()
             .size_full()
             .bg(rgb(palette.editor))
             .text_color(rgb(palette.foreground))
             .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .px_3()
-                        .justify_between()
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .items_center()
-                                .when(cfg!(not(target_os = "macos")), |row| {
-                                    row.child(div().w(px(310.)).h_8().child(self.menu_bar.clone()))
-                                })
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(
-                                            div()
-                                                .text_color(rgb(palette.strong_foreground))
-                                                .child("serialX"),
+                TitleBar::new()
+                    .bg(rgb(palette.title_bar))
+                    .border_b_1()
+                    .border_color(rgb(palette.border))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_3()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .when(cfg!(not(target_os = "macos")), |row| {
+                                        row.child(
+                                            div().w(px(310.)).h_8().child(self.menu_bar.clone()),
                                         )
-                                        .child(div().text_color(rgb(palette.muted)).child("/"))
-                                        .child(div().text_color(rgb(palette.muted)).child(title)),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_size(px(10.))
-                                        .text_color(rgb(palette.muted))
-                                        .child(self.interface_theme.name()),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .size(px(6.))
-                                                .rounded_full()
-                                                .bg(rgb(connection_color)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .text_color(rgb(palette.muted))
-                                                .child(status_label),
-                                        ),
-                                ),
-                        ),
-                ),
+                                    })
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(palette.strong_foreground))
+                                                    .child("serialX"),
+                                            )
+                                            .child(div().text_color(rgb(palette.muted)).child("/"))
+                                            .child(
+                                                div().text_color(rgb(palette.muted)).child(title),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(palette.muted))
+                                            .child(self.interface_theme.name()),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .size(px(6.))
+                                                    .rounded_full()
+                                                    .bg(rgb(connection_color)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(palette.muted))
+                                                    .child(status_label),
+                                            ),
+                                    ),
+                            ),
+                    ),
             )
-            .child(v_flex().flex_1().min_h_0().child(tab_bar).child(content))
-    }
-}
-
-fn discover_ports() -> Vec<PortItem> {
-    let mut ports = vec![PortItem {
-        name: "Loopback".into(),
-        subtitle: "Built-in demo device".into(),
-        is_demo: true,
-    }];
-
-    if let Ok(detected) = serialport::available_ports() {
-        ports.extend(detected.into_iter().map(|port| PortItem {
-            subtitle: match port.port_type {
-                serialport::SerialPortType::UsbPort(info) => {
-                    info.product.unwrap_or_else(|| "USB Serial".into())
-                }
-                serialport::SerialPortType::BluetoothPort => "Bluetooth Serial".into(),
-                serialport::SerialPortType::PciPort => "PCI Serial".into(),
-                serialport::SerialPortType::Unknown => "Serial Device".into(),
-            },
-            name: port.port_name,
-            is_demo: false,
-        }));
-    }
-    ports
-}
-
-fn spawn_serial_worker(
-    port_name: String,
-    configuration: SerialConfiguration,
-    commands: Receiver<SerialCommand>,
-    events: Sender<SerialEvent>,
-) {
-    thread::spawn(move || {
-        let mut port = match serialport::new(&port_name, configuration.baud_rate())
-            .data_bits(configuration.data_bits())
-            .stop_bits(configuration.stop_bits())
-            .parity(configuration.parity())
-            .flow_control(configuration.flow_control())
-            .timeout(Duration::from_millis(24))
-            .open()
-        {
-            Ok(port) => port,
-            Err(error) => {
-                let _ = events.send(SerialEvent::Error(format!(
-                    "Unable to open {port_name}: {error}"
-                )));
-                return;
-            }
-        };
-
-        let _ = events.send(SerialEvent::Connected);
-        let mut buffer = [0_u8; 2048];
-        loop {
-            while let Ok(command) = commands.try_recv() {
-                match command {
-                    SerialCommand::Write(bytes) => {
-                        if let Err(error) = port.write_all(&bytes) {
-                            let _ =
-                                events.send(SerialEvent::Error(format!("Send failed: {error}")));
-                            return;
-                        }
-                    }
-                    SerialCommand::Stop => {
-                        let _ = events.send(SerialEvent::Closed);
-                        return;
-                    }
-                }
-            }
-
-            match port.read(&mut buffer) {
-                Ok(count) if count > 0 => {
-                    let _ = events.send(SerialEvent::Data(buffer[..count].to_vec()));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(error) => {
-                    let _ = events.send(SerialEvent::Error(format!("Read failed: {error}")));
-                    return;
-                }
-            }
-        }
-    });
-}
-
-fn parse_hex(value: &str) -> Option<Vec<u8>> {
-    let compact: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if compact.is_empty() || !compact.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..compact.len())
-        .step_by(2)
-        .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).ok())
-        .collect()
-}
-
-fn demo_response(command: &str) -> Vec<u8> {
-    if command.trim().eq_ignore_ascii_case("AT+STATUS?") {
-        b"+STATUS:READY,RSSI=-48,TEMP=24.6\r\nOK\r\n".to_vec()
-    } else if command.trim().eq_ignore_ascii_case("AT+VERSION?") {
-        b"+VERSION:SerialX-Demo/1.4.2\r\nOK\r\n".to_vec()
-    } else {
-        format!("ECHO:{}\r\nOK\r\n", command.trim()).into_bytes()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .min_h_0()
+                            .child(tab_bar)
+                            .child(content),
+                    )
+                    .child(sidebar),
+            )
     }
 }
 
@@ -1759,134 +1170,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-fn application_menus() -> Vec<Menu> {
-    vec![
-        Menu::new("serialX").items([
-            MenuItem::action("About serialX", ShowAbout),
-            MenuItem::separator(),
-            MenuItem::action("Quit serialX", QuitSerialX),
-        ]),
-        Menu::new("File").items([
-            MenuItem::action("New Serial Tab", NewSerialTab),
-            MenuItem::action("Close Current Tab", CloseSerialTab),
-        ]),
-        Menu::new("Session").items([
-            MenuItem::action("Connect / Disconnect", ToggleConnection),
-            MenuItem::action("Refresh Port List", RefreshPorts),
-            MenuItem::separator(),
-            MenuItem::action("Pause / Resume Receiving", TogglePause),
-            MenuItem::action("Clear Terminal", ClearTerminal),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("ASCII / HEX", ToggleHex),
-            MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
-            MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
-            MenuItem::separator(),
-            MenuItem::action("Theme: Light Modern", UseLightTheme),
-            MenuItem::action("Theme: Dark Modern", UseDarkTheme),
-        ]),
-        Menu::new("Help").items([
-            MenuItem::action("Check for Updates…", CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action("About serialX", ShowAbout),
-        ]),
-    ]
-}
-
-fn configure_application_menus(cx: &mut App) {
-    cx.on_action(|_: &QuitSerialX, cx| cx.quit());
-    GlobalState::global_mut(cx)
-        .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
-    cx.set_menus(application_menus());
-}
-
-fn bind_window_actions(workspace: &Entity<SerialWorkspace>, window: &mut Window, cx: &mut App) {
-    let window_handle = window.window_handle();
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &NewSerialTab, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| view.add_serial_tab(window, cx));
-        });
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &CloseSerialTab, cx| {
-        let _ = view.update(cx, |view, cx| view.close_active_tab(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &RefreshPorts, cx| {
-        let _ = view.update(cx, |view, cx| view.refresh_ports(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleConnection, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_active_connection(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &TogglePause, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_pause(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ClearTerminal, cx| {
-        let _ = view.update(cx, |view, cx| view.clear_terminal(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleHex, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_hex(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleTimestamps, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_timestamps(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleAutoScroll, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_auto_scroll(cx));
-    });
-
-    let window_handle = window.window_handle();
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &UseLightTheme, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.set_interface_theme(InterfaceTheme::Light, window, cx);
-            });
-        });
-    });
-
-    let window_handle = window.window_handle();
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &UseDarkTheme, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.set_interface_theme(InterfaceTheme::Dark, window, cx);
-            });
-        });
-    });
-
-    let window_handle = window.window_handle();
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &CheckForUpdates, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.check_for_updates_from_menu(window, cx);
-            });
-        });
-    });
-
-    let window_handle = window.window_handle();
-    cx.on_action(move |_: &ShowAbout, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            SerialWorkspace::show_about_dialog(window, cx);
-        });
-    });
 }
 
 fn main() {
@@ -1913,17 +1196,4 @@ fn main() {
         })
         .detach();
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_hex;
-
-    #[test]
-    fn parses_hex_with_or_without_spaces() {
-        assert_eq!(parse_hex("41 54 0D 0A"), Some(b"AT\r\n".to_vec()));
-        assert_eq!(parse_hex("41540d0a"), Some(b"AT\r\n".to_vec()));
-        assert_eq!(parse_hex("123"), None);
-        assert_eq!(parse_hex("GG"), None);
-    }
 }

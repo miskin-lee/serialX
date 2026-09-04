@@ -10,6 +10,7 @@ gpui-kit = "0.6"
 reqwest = { package = "gpui-pre-reqwest", version = "0.12.15", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 serialport = "4.8"
 smol = "2"

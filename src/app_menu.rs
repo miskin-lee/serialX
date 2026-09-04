@@ -1,7 +1,7 @@
 use gpui_kit::component::GlobalState;
 use gpui_kit::*;
 
-use crate::{SerialWorkspace, theme::InterfaceTheme};
+use crate::{REPOSITORY_URL, SerialWorkspace, theme::InterfaceTheme};
 
 actions!(
     serialx_menu,
@@ -19,12 +19,32 @@ actions!(
         UseLightTheme,
         UseDarkTheme,
         CheckForUpdates,
-        ShowAbout
+        OpenRepository,
+        ShowAbout,
+        QuitApplication
     ]
 );
 
+/// Keystrokes shown next to their menu items, and bound below.
+#[cfg(target_os = "macos")]
+const NEW_TAB_KEYSTROKE: &str = "cmd-n";
+#[cfg(not(target_os = "macos"))]
+const NEW_TAB_KEYSTROKE: &str = "ctrl-n";
+#[cfg(target_os = "macos")]
+const QUIT_KEYSTROKE: &str = "cmd-q";
+#[cfg(not(target_os = "macos"))]
+const QUIT_KEYSTROKE: &str = "ctrl-q";
+
 fn application_menus() -> Vec<Menu> {
     vec![
+        // macOS always titles the first menu after the application, so the
+        // application menu has to come first for "Session" to keep its own name.
+        Menu::new("serialX").items([
+            MenuItem::action("About serialX", ShowAbout),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
+            MenuItem::action("Quit serialX", QuitApplication),
+        ]),
         Menu::new("Session").items([
             MenuItem::action("New Serial Tab", NewSerialTab),
             MenuItem::action("Close Current Tab", CloseSerialTab),
@@ -44,15 +64,15 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Theme: Light", UseLightTheme),
             MenuItem::action("Theme: Dark", UseDarkTheme),
         ]),
-        Menu::new("Help").items([
-            MenuItem::action("Check for Updates…", CheckForUpdates),
-            MenuItem::separator(),
-            MenuItem::action("About serialX", ShowAbout),
-        ]),
+        Menu::new("Help").items([MenuItem::action("serialX on GitHub", OpenRepository)]),
     ]
 }
 
 pub(crate) fn configure_application_menus(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new(NEW_TAB_KEYSTROKE, NewSerialTab, None),
+        KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
+    ]);
     GlobalState::global_mut(cx)
         .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
     cx.set_menus(application_menus());
@@ -149,5 +169,13 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
         defer_window_action(cx, view.clone(), |_, window, cx| {
             SerialWorkspace::show_about_dialog(window, cx);
         });
+    });
+
+    cx.on_action(|_: &OpenRepository, cx| {
+        cx.open_url(REPOSITORY_URL);
+    });
+
+    cx.on_action(|_: &QuitApplication, cx| {
+        cx.quit();
     });
 }

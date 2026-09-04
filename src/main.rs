@@ -4,6 +4,7 @@ mod updater;
 
 use std::{
     io::{Read, Write},
+    rc::Rc,
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::Duration,
@@ -11,8 +12,9 @@ use std::{
 
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
-    Disableable, GlobalState, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
-    button::{Button, ButtonCustomVariant, ButtonVariants},
+    Disableable, GlobalState, Icon, IconName, Root, Sizable, Theme, ThemeConfig, ThemeConfigColors,
+    ThemeMode, TitleBar, WindowExt,
+    button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -27,16 +29,6 @@ use gpui_kit::*;
 use smol::Timer;
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
-const NAVY: u32 = 0x17191f;
-const NAVY_SOFT: u32 = 0x22252d;
-const CANVAS: u32 = 0xf4f3ef;
-const PANEL: u32 = 0xffffff;
-const INK: u32 = 0x202229;
-const MUTED: u32 = 0x777a83;
-const LINE: u32 = 0xe7e5df;
-const MINT: u32 = 0xc9f2d2;
-const GREEN: u32 = 0x287a4a;
-const ORANGE: u32 = 0xff754c;
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
 
 const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
@@ -57,11 +49,235 @@ actions!(
         ToggleHex,
         ToggleTimestamps,
         ToggleAutoScroll,
+        UseLightTheme,
+        UseDarkTheme,
         CheckForUpdates,
         ShowAbout,
         QuitSerialX
     ]
 );
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterfaceTheme {
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy)]
+struct WorkbenchPalette {
+    title_bar: u32,
+    tab_bar: u32,
+    editor: u32,
+    panel: u32,
+    status_bar: u32,
+    border: u32,
+    foreground: u32,
+    strong_foreground: u32,
+    muted: u32,
+    input: u32,
+    input_border: u32,
+    hover: u32,
+    accent: u32,
+    accent_hover: u32,
+    accent_active: u32,
+    selection: u32,
+    success: u32,
+    warning: u32,
+    danger: u32,
+    badge: u32,
+}
+
+impl InterfaceTheme {
+    fn from_appearance(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
+            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Light => "Light Modern",
+            Self::Dark => "Dark Modern",
+        }
+    }
+
+    fn mode(self) -> ThemeMode {
+        match self {
+            Self::Light => ThemeMode::Light,
+            Self::Dark => ThemeMode::Dark,
+        }
+    }
+
+    fn window_appearance(self) -> WindowAppearance {
+        match self {
+            Self::Light => WindowAppearance::Light,
+            Self::Dark => WindowAppearance::Dark,
+        }
+    }
+
+    fn palette(self) -> WorkbenchPalette {
+        match self {
+            Self::Light => WorkbenchPalette {
+                title_bar: 0xf8f8f8,
+                tab_bar: 0xf8f8f8,
+                editor: 0xffffff,
+                panel: 0xf8f8f8,
+                status_bar: 0xf8f8f8,
+                border: 0xe5e5e5,
+                foreground: 0x3b3b3b,
+                strong_foreground: 0x1f1f1f,
+                muted: 0x868686,
+                input: 0xffffff,
+                input_border: 0xcecece,
+                hover: 0xf2f2f2,
+                accent: 0x005fb8,
+                accent_hover: 0x0258a8,
+                accent_active: 0x004a8f,
+                selection: 0xadd6ff,
+                success: 0x2ea043,
+                warning: 0xbf8700,
+                danger: 0xf85149,
+                badge: 0xcccccc,
+            },
+            Self::Dark => WorkbenchPalette {
+                title_bar: 0x181818,
+                tab_bar: 0x181818,
+                editor: 0x1f1f1f,
+                panel: 0x181818,
+                status_bar: 0x181818,
+                border: 0x2b2b2b,
+                foreground: 0xcccccc,
+                strong_foreground: 0xffffff,
+                muted: 0x9d9d9d,
+                input: 0x313131,
+                input_border: 0x3c3c3c,
+                hover: 0x2b2b2b,
+                accent: 0x0078d4,
+                accent_hover: 0x026ec1,
+                accent_active: 0x005a9e,
+                selection: 0x264f78,
+                success: 0x2ea043,
+                warning: 0xd29922,
+                danger: 0xf85149,
+                badge: 0x616161,
+            },
+        }
+    }
+}
+
+fn theme_color(value: u32) -> Option<SharedString> {
+    Some(format!("#{value:06X}").into())
+}
+
+fn vscode_theme_config(theme: InterfaceTheme) -> ThemeConfig {
+    let palette = theme.palette();
+    let white = theme_color(0xffffff);
+    let foreground = theme_color(palette.foreground);
+    let background = theme_color(palette.editor);
+    let panel = theme_color(palette.panel);
+    let hover = theme_color(palette.hover);
+    let accent = theme_color(palette.accent);
+    let accent_hover = theme_color(palette.accent_hover);
+    let accent_active = theme_color(palette.accent_active);
+    let border = theme_color(palette.border);
+    let success = theme_color(palette.success);
+    let warning = theme_color(palette.warning);
+    let danger = theme_color(palette.danger);
+
+    let mut colors = ThemeConfigColors::default();
+    colors.accent = hover.clone();
+    colors.accent_foreground = foreground.clone();
+    colors.background = background.clone();
+    colors.border = border.clone();
+    colors.button = panel.clone();
+    colors.button_active = hover.clone();
+    colors.button_foreground = foreground.clone();
+    colors.button_hover = hover.clone();
+    colors.button_primary = accent.clone();
+    colors.button_primary_active = accent_active.clone();
+    colors.button_primary_foreground = white.clone();
+    colors.button_primary_hover = accent_hover.clone();
+    colors.caret = accent.clone();
+    colors.danger = danger.clone();
+    colors.danger_active = danger.clone();
+    colors.danger_foreground = white.clone();
+    colors.danger_hover = danger;
+    colors.foreground = foreground.clone();
+    colors.input = theme_color(palette.input_border);
+    colors.link = accent.clone();
+    colors.link_active = accent_active.clone();
+    colors.link_hover = accent_hover.clone();
+    colors.list = background.clone();
+    colors.list_active = theme_color(palette.selection);
+    colors.list_active_border = accent.clone();
+    colors.list_even = background.clone();
+    colors.list_head = panel.clone();
+    colors.list_hover = hover.clone();
+    colors.muted = panel.clone();
+    colors.muted_foreground = theme_color(palette.muted);
+    colors.popover = theme_color(palette.input);
+    colors.popover_foreground = foreground.clone();
+    colors.primary = accent.clone();
+    colors.primary_active = accent_active;
+    colors.primary_foreground = white;
+    colors.primary_hover = accent_hover;
+    colors.ring = accent;
+    colors.scrollbar = background.clone();
+    colors.scrollbar_thumb = theme_color(palette.badge);
+    colors.scrollbar_thumb_hover = theme_color(palette.muted);
+    colors.secondary = panel.clone();
+    colors.secondary_active = hover.clone();
+    colors.secondary_foreground = foreground.clone();
+    colors.secondary_hover = hover.clone();
+    colors.selection = theme_color(palette.selection);
+    colors.sidebar = panel.clone();
+    colors.sidebar_accent = hover.clone();
+    colors.sidebar_accent_foreground = foreground.clone();
+    colors.sidebar_border = border.clone();
+    colors.sidebar_foreground = foreground.clone();
+    colors.success = success;
+    colors.success_foreground = theme_color(palette.strong_foreground);
+    colors.tab = theme_color(palette.tab_bar);
+    colors.tab_active = background.clone();
+    colors.tab_active_foreground = theme_color(palette.strong_foreground);
+    colors.tab_bar = theme_color(palette.tab_bar);
+    colors.tab_foreground = theme_color(palette.muted);
+    colors.table = background;
+    colors.table_active = hover.clone();
+    colors.table_active_border = theme_color(palette.accent);
+    colors.table_even = theme_color(palette.editor);
+    colors.table_head = panel.clone();
+    colors.table_head_foreground = foreground;
+    colors.table_hover = hover;
+    colors.table_row_border = border.clone();
+    colors.title_bar = theme_color(palette.title_bar);
+    colors.title_bar_border = border.clone();
+    colors.status_bar = theme_color(palette.status_bar);
+    colors.status_bar_border = border;
+    colors.warning = warning;
+    colors.warning_foreground = theme_color(palette.strong_foreground);
+
+    ThemeConfig {
+        name: format!("serialX {}", theme.name()).into(),
+        mode: theme.mode(),
+        font_size: Some(13.),
+        mono_font_size: Some(12.),
+        radius: Some(3),
+        radius_lg: Some(5),
+        shadow: Some(false),
+        colors,
+        ..Default::default()
+    }
+}
+
+fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, cx: &mut App) {
+    let config = Rc::new(vscode_theme_config(theme));
+    Theme::global_mut(cx).apply_config(&config);
+    Theme::sync_base(cx);
+    cx.set_window_appearance(Some(theme.window_appearance()));
+    window.refresh();
+}
 
 #[derive(Clone)]
 struct PortItem {
@@ -337,6 +553,7 @@ pub struct SerialWorkspace {
     tabs: Vec<SerialTabState>,
     active_tab: usize,
     next_tab_id: usize,
+    interface_theme: InterfaceTheme,
     update_status: UpdateStatus,
     update_tx: Sender<UpdateEvent>,
     update_rx: Receiver<UpdateEvent>,
@@ -345,7 +562,7 @@ pub struct SerialWorkspace {
 }
 
 impl SerialWorkspace {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(interface_theme: InterfaceTheme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let tab = Self::build_tab(1, window, cx);
         let (update_tx, update_rx) = mpsc::channel();
         let menu_bar = AppMenuBar::new(cx);
@@ -354,6 +571,7 @@ impl SerialWorkspace {
             tabs: vec![tab],
             active_tab: 0,
             next_tab_id: 2,
+            interface_theme,
             update_status: UpdateStatus::Checking,
             update_tx,
             update_rx,
@@ -381,6 +599,20 @@ impl SerialWorkspace {
 
         spawn_update_check(workspace.update_tx.clone());
         workspace
+    }
+
+    fn set_interface_theme(
+        &mut self,
+        theme: InterfaceTheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.interface_theme == theme {
+            return;
+        }
+        self.interface_theme = theme;
+        apply_interface_theme(theme, window, cx);
+        cx.notify();
     }
 
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
@@ -912,6 +1144,7 @@ impl SerialWorkspace {
     }
 
     fn render_active_tab(&mut self, tab: SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.interface_theme.palette();
         let selected = tab.ports[tab.selected_port.min(tab.ports.len().saturating_sub(1))].clone();
         let locked = tab.connected || tab.connecting;
         let status_label = if tab.connecting {
@@ -921,7 +1154,13 @@ impl SerialWorkspace {
         } else {
             "Disconnected"
         };
-        let connection_color = if tab.connected { GREEN } else { MUTED };
+        let connection_color = if tab.connected {
+            palette.success
+        } else if tab.connecting {
+            palette.warning
+        } else {
+            palette.muted
+        };
         let tab_id = tab.id;
 
         let port_options = tab
@@ -938,62 +1177,68 @@ impl SerialWorkspace {
         v_flex()
             .flex_1()
             .min_h_0()
-            .rounded_b_2xl()
-            .border_1()
-            .border_t_0()
-            .border_color(rgb(LINE))
-            .bg(rgb(PANEL))
-            .shadow_sm()
+            .bg(rgb(palette.editor))
             .overflow_hidden()
             .child(
                 v_flex()
                     .flex_none()
-                    .p_4()
-                    .gap_3()
                     .border_b_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(0xfafaf8))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
                     .child(
                         h_flex()
+                            .h(px(40.))
+                            .px_3()
                             .justify_between()
                             .child(
                                 h_flex()
-                                    .gap_2()
+                                    .gap_3()
                                     .items_center()
-                                    .child(Icon::new(IconName::Settings).size_4())
                                     .child(
                                         div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Serial Configuration"),
+                                            .size_6()
+                                            .rounded_sm()
+                                            .bg(rgb(palette.hover))
+                                            .text_color(rgb(palette.muted))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(Icon::new(IconName::Settings).size_4()),
                                     )
                                     .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(MUTED))
-                                            .child("Settings lock while connected"),
+                                        v_flex()
+                                            .gap_0p5()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(palette.strong_foreground))
+                                                    .child(selected.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(palette.muted))
+                                                    .child(if locked {
+                                                        "Configuration locked while connected"
+                                                    } else {
+                                                        "Configure this serial session"
+                                                    }),
+                                            ),
                                     ),
                             )
                             .child(
                                 Button::new(("connect-tab", tab_id))
+                                    .small()
                                     .when(tab.connected, |button| {
                                         button.outline().label("Disconnect")
                                     })
                                     .when(!tab.connected, |button| {
-                                        button
-                                            .custom(
-                                                ButtonCustomVariant::new(cx)
-                                                    .color(rgb(INK).into())
-                                                    .foreground(rgb(0xffffff).into())
-                                                    .hover(rgb(NAVY_SOFT).into())
-                                                    .active(rgb(NAVY).into())
-                                                    .shadow(true),
-                                            )
-                                            .label(if tab.connecting {
-                                                "Connecting…"
-                                            } else {
-                                                "Connect"
-                                            })
+                                        button.primary().label(if tab.connecting {
+                                            "Connecting…"
+                                        } else {
+                                            "Connect"
+                                        })
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle_connection(tab_id, cx)
@@ -1004,6 +1249,8 @@ impl SerialWorkspace {
                         h_flex()
                             .w_full()
                             .flex_wrap()
+                            .px_3()
+                            .py_2()
                             .gap_2()
                             .child(Self::configuration_button(
                                 ConfigurationButton {
@@ -1088,32 +1335,33 @@ impl SerialWorkspace {
             )
             .child(
                 h_flex()
-                    .h(px(52.))
+                    .h(px(35.))
                     .flex_none()
-                    .px_4()
+                    .px_3()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.editor))
                     .child(
                         h_flex()
-                            .gap_2()
+                            .h_full()
+                            .gap_3()
                             .child(
                                 div()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .border_b_1()
+                                    .border_color(rgb(palette.accent))
+                                    .text_size(px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Live Terminal"),
+                                    .text_color(rgb(palette.strong_foreground))
+                                    .child("TERMINAL"),
                             )
                             .child(
                                 h_flex()
                                     .gap_2()
                                     .items_center()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_full()
-                                    .bg(if tab.connected {
-                                        rgb(MINT)
-                                    } else {
-                                        rgb(0xefefec)
-                                    })
                                     .text_color(rgb(connection_color))
                                     .text_xs()
                                     .child(div().size_2().rounded_full().bg(rgb(connection_color)))
@@ -1124,7 +1372,7 @@ impl SerialWorkspace {
                         h_flex()
                             .gap_2()
                             .text_xs()
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .child(if tab.hex_mode { "HEX" } else { "ASCII" })
                             .when(tab.paused, |row| row.child("· Paused"))
                             .when(!tab.auto_scroll, |row| row.child("· Manual Scroll")),
@@ -1135,9 +1383,7 @@ impl SerialWorkspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scrollbar()
-                    .px_4()
-                    .py_3()
-                    .gap_2()
+                    .py_2()
                     .children(tab.terminal_lines.iter().enumerate().map(|(index, line)| {
                         let badge = match line.kind {
                             LineKind::Rx => "RX",
@@ -1145,35 +1391,34 @@ impl SerialWorkspace {
                             LineKind::System => "SYS",
                         };
                         let badge_color = match line.kind {
-                            LineKind::Rx => GREEN,
-                            LineKind::Tx => ORANGE,
-                            LineKind::System => MUTED,
+                            LineKind::Rx => palette.success,
+                            LineKind::Tx => palette.accent,
+                            LineKind::System => palette.muted,
                         };
                         h_flex()
                             .id(("terminal-line", index))
                             .items_start()
-                            .gap_3()
+                            .min_h(px(24.))
+                            .px_3()
+                            .py_1()
+                            .gap_2()
                             .child(
                                 div()
-                                    .mt_1()
-                                    .w_8()
+                                    .w(px(30.))
                                     .flex_none()
-                                    .rounded_md()
-                                    .bg(rgba((badge_color << 8) | 0x18))
                                     .text_color(rgb(badge_color))
-                                    .text_xs()
-                                    .text_center()
+                                    .text_size(px(10.))
+                                    .font_weight(FontWeight::SEMIBOLD)
                                     .child(badge),
                             )
                             .when(tab.timestamps, |row| {
                                 row.child(
                                     div()
-                                        .w(px(88.))
+                                        .w(px(76.))
                                         .flex_none()
-                                        .pt_1()
                                         .font_family("SF Mono")
-                                        .text_size(px(11.))
-                                        .text_color(rgb(MUTED))
+                                        .text_size(px(10.))
+                                        .text_color(rgb(palette.muted))
                                         .child(line.time.clone()),
                                 )
                             })
@@ -1181,13 +1426,12 @@ impl SerialWorkspace {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .pt_1()
                                     .font_family("SF Mono")
                                     .text_size(px(12.))
                                     .text_color(if line.kind == LineKind::System {
-                                        rgb(MUTED)
+                                        rgb(palette.muted)
                                     } else {
-                                        rgb(INK)
+                                        rgb(palette.foreground)
                                     })
                                     .child(Self::format_line_payload(tab.hex_mode, line)),
                             )
@@ -1196,21 +1440,23 @@ impl SerialWorkspace {
             .child(
                 h_flex()
                     .flex_none()
-                    .p_3()
+                    .px_3()
+                    .py_2()
                     .gap_2()
                     .border_t_1()
-                    .border_color(rgb(LINE))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.panel))
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_color(rgb(palette.accent))
+                            .child(">"),
+                    )
                     .child(div().flex_1().min_w_0().child(Input::new(&tab.send_input)))
                     .child(
                         Button::new(("send", tab_id))
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .color(rgb(ORANGE).into())
-                                    .foreground(rgb(0xffffff).into())
-                                    .hover(rgb(0xee633d).into())
-                                    .active(rgb(0xd95734).into())
-                                    .shadow(true),
-                            )
+                            .primary()
+                            .small()
                             .icon(IconName::ArrowUp)
                             .label("Send")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1218,12 +1464,35 @@ impl SerialWorkspace {
                             })),
                     ),
             )
+            .child(
+                h_flex()
+                    .h(px(23.))
+                    .flex_none()
+                    .px_3()
+                    .gap_4()
+                    .border_t_1()
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.status_bar))
+                    .text_size(px(10.))
+                    .text_color(rgb(palette.muted))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(div().size_1p5().rounded_full().bg(rgb(connection_color)))
+                            .child(status_label),
+                    )
+                    .child(selected.name)
+                    .child(tab.configuration.summary())
+                    .child(if tab.hex_mode { "HEX" } else { "ASCII" })
+                    .child(self.interface_theme.name()),
+            )
             .into_any_element()
     }
 }
 
 impl Render for SerialWorkspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
         let (title, status_label, connection_color) = self
             .active_tab()
@@ -1231,16 +1500,28 @@ impl Render for SerialWorkspace {
                 (
                     format!("Serial {} · {}", tab.id, tab.selected_port().name),
                     tab.status_label(),
-                    if tab.connected { GREEN } else { MUTED },
+                    if tab.connected {
+                        palette.success
+                    } else if tab.connecting {
+                        palette.warning
+                    } else {
+                        palette.muted
+                    },
                 )
             })
-            .unwrap_or_else(|| ("No Serial Tab".into(), "Idle", MUTED));
+            .unwrap_or_else(|| ("No Serial Tab".into(), "Idle", palette.muted));
 
         let mut tab_items = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
             let tab_id = tab.id;
-            let tab_label = format!("Serial {} · {}", tab.id, tab.selected_port().name);
-            let dot_color = if tab.connected { GREEN } else { MUTED };
+            let tab_label = format!("Serial {}  {}", tab.id, tab.selected_port().name);
+            let dot_color = if tab.connected {
+                palette.success
+            } else if tab.connecting {
+                palette.warning
+            } else {
+                palette.muted
+            };
             tab_items.push(
                 Tab::new()
                     .label(tab_label)
@@ -1280,33 +1561,24 @@ impl Render for SerialWorkspace {
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .rounded_b_2xl()
-                .border_1()
-                .border_t_0()
-                .border_color(rgb(LINE))
-                .bg(rgb(PANEL))
-                .shadow_sm()
-                .gap_3()
+                .bg(rgb(palette.editor))
+                .gap_2()
                 .child(
                     div()
-                        .size_12()
-                        .rounded_xl()
-                        .bg(rgb(0xf3f2ee))
-                        .text_color(rgb(MUTED))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(Icon::new(IconName::SquareTerminal).size_6()),
-                )
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child("No Serial Tabs Open"),
+                        .text_color(rgb(palette.muted))
+                        .child(Icon::new(IconName::SquareTerminal).size_8()),
                 )
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(MUTED))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(palette.foreground))
+                        .child("No Serial Tabs Open"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette.muted))
                         .child("Use File > New Serial Tab to start a session."),
                 )
                 .into_any_element()
@@ -1314,17 +1586,17 @@ impl Render for SerialWorkspace {
 
         v_flex()
             .size_full()
-            .bg(rgb(CANVAS))
-            .text_color(rgb(INK))
+            .bg(rgb(palette.editor))
+            .text_color(rgb(palette.foreground))
             .child(
                 TitleBar::new().child(
                     h_flex()
                         .w_full()
-                        .px_4()
+                        .px_3()
                         .justify_between()
                         .child(
                             h_flex()
-                                .gap_4()
+                                .gap_3()
                                 .items_center()
                                 .when(cfg!(not(target_os = "macos")), |row| {
                                     row.child(div().w(px(310.)).h_8().child(self.menu_bar.clone()))
@@ -1332,30 +1604,47 @@ impl Render for SerialWorkspace {
                                 .child(
                                     h_flex()
                                         .gap_2()
-                                        .text_sm()
+                                        .text_xs()
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child("serialX")
-                                        .child(div().text_color(rgb(MUTED)).child("/"))
-                                        .child(div().text_color(rgb(MUTED)).child(title)),
+                                        .child(
+                                            div()
+                                                .text_color(rgb(palette.strong_foreground))
+                                                .child("serialX"),
+                                        )
+                                        .child(div().text_color(rgb(palette.muted)).child("/"))
+                                        .child(div().text_color(rgb(palette.muted)).child(title)),
                                 ),
                         )
                         .child(
                             h_flex()
-                                .gap_2()
+                                .gap_3()
                                 .items_center()
-                                .child(div().size_2().rounded_full().bg(rgb(connection_color)))
-                                .child(div().text_xs().text_color(rgb(MUTED)).child(status_label)),
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(rgb(palette.muted))
+                                        .child(self.interface_theme.name()),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .size(px(6.))
+                                                .rounded_full()
+                                                .bg(rgb(connection_color)),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(10.))
+                                                .text_color(rgb(palette.muted))
+                                                .child(status_label),
+                                        ),
+                                ),
                         ),
                 ),
             )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .p_5()
-                    .child(tab_bar)
-                    .child(content),
-            )
+            .child(v_flex().flex_1().min_h_0().child(tab_bar).child(content))
     }
 }
 
@@ -1494,6 +1783,9 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("ASCII / HEX", ToggleHex),
             MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
             MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
+            MenuItem::separator(),
+            MenuItem::action("Theme: Light Modern", UseLightTheme),
+            MenuItem::action("Theme: Dark Modern", UseDarkTheme),
         ]),
         Menu::new("Help").items([
             MenuItem::action("Check for Updates…", CheckForUpdates),
@@ -1561,6 +1853,26 @@ fn bind_window_actions(workspace: &Entity<SerialWorkspace>, window: &mut Window,
 
     let window_handle = window.window_handle();
     let view = workspace.downgrade();
+    cx.on_action(move |_: &UseLightTheme, cx| {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.set_interface_theme(InterfaceTheme::Light, window, cx);
+            });
+        });
+    });
+
+    let window_handle = window.window_handle();
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &UseDarkTheme, cx| {
+        let _ = window_handle.update(cx, |_, window, cx| {
+            let _ = view.update(cx, |view, cx| {
+                view.set_interface_theme(InterfaceTheme::Dark, window, cx);
+            });
+        });
+    });
+
+    let window_handle = window.window_handle();
+    let view = workspace.downgrade();
     cx.on_action(move |_: &CheckForUpdates, cx| {
         let _ = window_handle.update(cx, |_, window, cx| {
             let _ = view.update(cx, |view, cx| {
@@ -1589,9 +1901,13 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let workspace = cx.new(|cx| SerialWorkspace::new(window, cx));
+                let interface_theme = InterfaceTheme::from_appearance(window.appearance());
+                apply_interface_theme(interface_theme, window, cx);
+                let workspace = cx.new(|cx| SerialWorkspace::new(interface_theme, window, cx));
                 bind_window_actions(&workspace, window, cx);
-                cx.new(|cx| Root::new(workspace, window, cx).bg(rgb(CANVAS)))
+                cx.new(|cx| {
+                    Root::new(workspace, window, cx).bg(rgb(interface_theme.palette().editor))
+                })
             })
             .expect("failed to open serialX window");
         })

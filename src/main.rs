@@ -14,8 +14,8 @@ use std::{
     time::Duration,
 };
 
-use app_icon::apply_application_icon;
-use app_menu::{bind_window_actions, configure_application_menus};
+use app_icon::{application_icon_image, apply_application_icon};
+use app_menu::{NewSerialTab, bind_window_actions, configure_application_menus};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
     Icon, IconName, Root, Sizable, TitleBar, WindowExt,
@@ -23,6 +23,7 @@ use gpui_kit::component::{
     dialog::DialogButtonProps,
     h_flex,
     input::{InputEvent, InputState},
+    kbd::Kbd,
     menu::AppMenuBar,
     notification::Notification,
     scroll::ScrollableElement,
@@ -785,24 +786,33 @@ impl Render for SerialWorkspace {
                 .items_center()
                 .justify_center()
                 .bg(rgb(palette.editor))
-                .gap_2()
+                .gap_4()
+                .child(img(application_icon_image()).size(px(112.)))
                 .child(
                     div()
-                        .text_color(rgb(palette.muted))
-                        .child(Icon::new(IconName::SquareTerminal).size_8()),
-                )
-                .child(
-                    div()
-                        .text_sm()
+                        .text_size(px(30.))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(palette.foreground))
-                        .child("No Serial Tabs Open"),
+                        .text_color(rgb(palette.strong_foreground))
+                        .child("serialX"),
                 )
                 .child(
-                    div()
-                        .text_xs()
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .text_sm()
                         .text_color(rgb(palette.muted))
-                        .child("Use Session > New Serial Tab to start a session."),
+                        .child("Press")
+                        .children(Kbd::binding_for_action(&NewSerialTab, None, window).map(Kbd::outline))
+                        .child("for a new session, or pick one from the Session panel."),
+                )
+                .child(
+                    Button::new("empty-new-session")
+                        .primary()
+                        .large()
+                        .label("New Session")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_new_serial_tab_dialog(window, cx);
+                        })),
                 )
                 .into_any_element()
         };

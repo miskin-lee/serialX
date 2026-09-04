@@ -1,4 +1,5 @@
-//! Applies the application icon to the running process.
+//! Supplies the application icon, both to the running process and to the
+//! workbench itself.
 //!
 //! Packaged builds get their icon from the platform bundle: `serialX.app`
 //! points `CFBundleIconFile` at `SerialX.icns` on macOS, and `build.rs` embeds
@@ -7,6 +8,10 @@
 //! and the Dock falls back to the generic executable icon. Handing the icon to
 //! `NSApplication` gives development builds the same Dock and switcher icon the
 //! packaged app ships with.
+
+use std::sync::{Arc, OnceLock};
+
+use gpui_kit::{Image, ImageFormat};
 
 /// Sets the Dock and switcher icon for the current process.
 ///
@@ -35,4 +40,20 @@ pub fn apply_application_icon() {
             NSApplication::sharedApplication(main_thread).setApplicationIconImage(Some(&icon));
         }
     }
+}
+
+/// The application icon, decoded once for in-app rendering.
+///
+/// The window content cannot reach the platform icon, so the same artwork the
+/// bundles ship is embedded here and handed to `img`.
+pub fn application_icon_image() -> Arc<Image> {
+    static ICON: OnceLock<Arc<Image>> = OnceLock::new();
+
+    ICON.get_or_init(|| {
+        Arc::new(Image::from_bytes(
+            ImageFormat::Png,
+            include_bytes!("../assets/icons/png/serialx-256.png").to_vec(),
+        ))
+    })
+    .clone()
 }

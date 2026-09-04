@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod app_icon;
 mod app_menu;
 mod configuration;
 mod presets;
@@ -13,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use app_icon::apply_application_icon;
 use app_menu::{bind_window_actions, configure_application_menus};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
@@ -906,6 +908,7 @@ fn main() {
     let app = gpui_kit::application().with_assets(Assets);
     app.run(move |cx| {
         gpui_kit::init(cx);
+        apply_application_icon();
         configure_application_menus(cx);
 
         let mut options = TitleBar::window_options();

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=serialX
+Comment=Modern serial port workspace
+Exec=serialx
+Icon=serialx
+Terminal=false
+Categories=Development;Utility;
+Keywords=serial;uart;terminal;

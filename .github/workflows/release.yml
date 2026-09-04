@@ -1,0 +1,537 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare draft release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+      release_name: ${{ steps.version.outputs.release_name }}
+      release_id: ${{ steps.release.outputs.release_id }}
+
+    steps:
+      - name: Check out repository and tags
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate and export version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_version="$(awk -F '"' '/^\[package\]/{in_package=1; next} in_package && /^version = /{print $2; exit}' Cargo.toml)"
+          if [[ -z "$app_version" ]]; then
+            echo "Unable to read the application version from Cargo.toml." >&2
+            exit 1
+          fi
+
+          tag_name="v${app_version}"
+          if git rev-parse --verify --quiet "refs/tags/${tag_name}^{commit}" >/dev/null; then
+            tagged_commit="$(git rev-parse "refs/tags/${tag_name}^{commit}")"
+            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+              echo "${tag_name} already points to ${tagged_commit}; bump Cargo.toml before releasing ${GITHUB_SHA}." >&2
+              exit 1
+            fi
+          fi
+
+          echo "app_version=${app_version}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+          echo "release_name=serialX v${app_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or reuse draft release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}
+          RELEASE_NAME: ${{ steps.version.outputs.release_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          short_sha="${GITHUB_SHA:0:7}"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          previous_tag="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude "$TAG_NAME" "$GITHUB_SHA" 2>/dev/null || true)"
+
+          if [[ -n "$previous_tag" ]]; then
+            log_range="${previous_tag}..${GITHUB_SHA}"
+          else
+            log_range="$GITHUB_SHA"
+          fi
+
+          changelog="$(git log --no-merges --format="- %s ([%h](${repo_url}/commit/%H))" "$log_range" || true)"
+          {
+            echo "serialX v${APP_VERSION}, built from commit [\`${short_sha}\`](${repo_url}/commit/${GITHUB_SHA})."
+            echo
+            if [[ -n "$changelog" ]]; then
+              echo "$changelog"
+              echo
+            fi
+            echo "Choose the package matching your operating system and CPU architecture:"
+            echo
+            echo "- macOS Apple Silicon: DMG"
+            echo "- Windows x86_64: installer EXE or portable ZIP"
+            echo "- Linux x86_64 / ARM64: DEB or portable tar.gz"
+            echo
+            echo "The packages are currently unsigned. macOS and Windows may display a security warning on first launch."
+          } > release-notes.md
+
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$TAG_NAME" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "${TAG_NAME} is already published; bump Cargo.toml before releasing again." >&2
+              exit 1
+            fi
+            gh release edit "$TAG_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_NAME" \
+              --notes-file release-notes.md \
+              --draft
+          fi
+
+          release_id="$(gh release view "$TAG_NAME" --json databaseId --jq .databaseId)"
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: prepare
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            platform: ubuntu-22.04
+            os: linux
+            archive_arch: x86_64
+            deb_arch: amd64
+          - name: Linux ARM64
+            platform: ubuntu-22.04-arm
+            os: linux
+            archive_arch: aarch64
+            deb_arch: arm64
+          - name: Windows x64
+            platform: windows-2022
+            os: windows
+            archive_arch: x86_64
+          - name: macOS Apple Silicon
+            platform: macos-15
+            os: macos
+            archive_arch: aarch64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -i '\|azure\.archive\.ubuntu\.com|d' /etc/apt/apt-mirrors.txt
+          fi
+
+          run_apt() {
+            local attempt
+            for attempt in 1 2 3; do
+              if sudo timeout --signal=TERM --kill-after=15s 10m \
+                apt-get \
+                  -o Acquire::Retries=3 \
+                  -o Acquire::http::Timeout=30 \
+                  -o Acquire::https::Timeout=30 \
+                  -o Acquire::ForceIPv4=true \
+                  "$@"; then
+                return 0
+              fi
+
+              if [[ "$attempt" -eq 3 ]]; then
+                echo "apt-get failed after ${attempt} attempts." >&2
+                return 1
+              fi
+
+              echo "apt-get attempt ${attempt} failed; retrying..." >&2
+              sleep $((attempt * 5))
+            done
+          }
+
+          run_apt update
+          run_apt install -y \
+            libfontconfig-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Package Linux archives
+        if: matrix.os == 'linux'
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+          ARCHIVE_ARCH: ${{ matrix.archive_arch }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_name="serialX-${APP_VERSION}-linux-${ARCHIVE_ARCH}"
+          bundle_root="work/${bundle_name}"
+          deb_root="work/deb"
+
+          install -Dm755 target/release/serialx "${bundle_root}/bin/serialx"
+          install -Dm644 packaging/linux/serialx.desktop "${bundle_root}/share/applications/serialx.desktop"
+          install -Dm644 assets/icons/png/serialx-512.png "${bundle_root}/share/icons/hicolor/512x512/apps/serialx.png"
+          install -Dm644 README.md "${bundle_root}/README.md"
+          install -Dm644 LICENSE "${bundle_root}/LICENSE"
+
+          mkdir -p dist
+          tar -C work -czf "dist/serialX_${APP_VERSION}_linux_${ARCHIVE_ARCH}.tar.gz" "$bundle_name"
+
+          install -Dm755 target/release/serialx "${deb_root}/usr/bin/serialx"
+          install -Dm644 packaging/linux/serialx.desktop "${deb_root}/usr/share/applications/serialx.desktop"
+          install -Dm644 assets/icons/png/serialx-512.png "${deb_root}/usr/share/icons/hicolor/512x512/apps/serialx.png"
+          install -Dm644 README.md "${deb_root}/usr/share/doc/serialx/README.md"
+          install -Dm644 LICENSE "${deb_root}/usr/share/doc/serialx/copyright"
+          mkdir -p "${deb_root}/DEBIAN"
+          installed_size="$(du -sk "${deb_root}/usr" | cut -f1)"
+          cat > "${deb_root}/DEBIAN/control" <<EOF
+          Package: serialx
+          Version: ${APP_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: ${DEB_ARCH}
+          Installed-Size: ${installed_size}
+          Depends: libc6, libfontconfig1, libudev1, libvulkan1, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1
+          Maintainer: serialX contributors
+          Description: Modern serial port workspace built with GPUI
+           serialX provides serial device discovery, ASCII and hexadecimal
+           send/receive modes, timestamps, and real-time traffic statistics.
+          EOF
+
+          dpkg-deb --build --root-owner-group \
+            "$deb_root" \
+            "dist/serialX_${APP_VERSION}_linux_${DEB_ARCH}.deb"
+
+      - name: Package Windows archive
+        if: matrix.os == 'windows'
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p work/windows/serialX dist
+          cp target/release/serialx.exe work/windows/serialX/serialX.exe
+          cp README.md LICENSE work/windows/serialX/
+          (cd work/windows && 7z a -tzip \
+            "$GITHUB_WORKSPACE/dist/serialX_${APP_VERSION}_windows_x86_64.zip" \
+            serialX)
+
+      - name: Package Windows installer
+        if: matrix.os == 'windows'
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: pwsh
+        run: |
+          @'
+          Unicode True
+          !include "MUI2.nsh"
+
+          Name "serialX"
+          OutFile "${PROJECT_ROOT}\dist\serialX_${APP_VERSION}_windows_x86_64-setup.exe"
+          InstallDir "$LOCALAPPDATA\Programs\serialX"
+          InstallDirRegKey HKCU "Software\serialX" "InstallDir"
+          RequestExecutionLevel user
+
+          !define MUI_ABORTWARNING
+
+          !insertmacro MUI_PAGE_WELCOME
+          !insertmacro MUI_PAGE_DIRECTORY
+          !insertmacro MUI_PAGE_INSTFILES
+          !insertmacro MUI_PAGE_FINISH
+          !insertmacro MUI_UNPAGE_CONFIRM
+          !insertmacro MUI_UNPAGE_INSTFILES
+          !insertmacro MUI_LANGUAGE "English"
+
+          Section "serialX" SecMain
+            SetShellVarContext current
+            SetOutPath "$INSTDIR"
+            File "/oname=serialX.exe" "${PROJECT_ROOT}\target\release\serialx.exe"
+            File "${PROJECT_ROOT}\README.md"
+            File "${PROJECT_ROOT}\LICENSE"
+
+            CreateDirectory "$SMPROGRAMS\serialX"
+            CreateShortcut "$SMPROGRAMS\serialX\serialX.lnk" "$INSTDIR\serialX.exe"
+            CreateShortcut "$DESKTOP\serialX.lnk" "$INSTDIR\serialX.exe"
+
+            WriteRegStr HKCU "Software\serialX" "InstallDir" "$INSTDIR"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "DisplayName" "serialX"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "DisplayVersion" "${APP_VERSION}"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "DisplayIcon" "$INSTDIR\serialX.exe"
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+            WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "NoModify" 1
+            WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX" "NoRepair" 1
+            WriteUninstaller "$INSTDIR\Uninstall.exe"
+          SectionEnd
+
+          Section "Uninstall"
+            SetShellVarContext current
+            Delete "$DESKTOP\serialX.lnk"
+            Delete "$SMPROGRAMS\serialX\serialX.lnk"
+            RMDir "$SMPROGRAMS\serialX"
+            Delete "$INSTDIR\serialX.exe"
+            Delete "$INSTDIR\README.md"
+            Delete "$INSTDIR\LICENSE"
+            Delete "$INSTDIR\Uninstall.exe"
+            RMDir "$INSTDIR"
+            DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\serialX"
+            DeleteRegKey HKCU "Software\serialX"
+          SectionEnd
+          '@ | Set-Content -Encoding utf8 work/installer.nsi
+
+          makensis "/DAPP_VERSION=$env:APP_VERSION" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" work/installer.nsi
+          if ($LASTEXITCODE -ne 0) {
+            throw "makensis failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Package macOS disk image
+        if: matrix.os == 'macos'
+        env:
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_root="work/serialX.app"
+          mkdir -p "${app_root}/Contents/MacOS" "${app_root}/Contents/Resources" dist
+          install -m 755 target/release/serialx "${app_root}/Contents/MacOS/serialx"
+          install -m 644 assets/icons/macos/SerialX.icns "${app_root}/Contents/Resources/SerialX.icns"
+
+          cat > "${app_root}/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key>
+            <string>serialX</string>
+            <key>CFBundleExecutable</key>
+            <string>serialx</string>
+            <key>CFBundleIconFile</key>
+            <string>SerialX</string>
+            <key>CFBundleIdentifier</key>
+            <string>io.github.miskin-lee.serialx</string>
+            <key>CFBundleInfoDictionaryVersion</key>
+            <string>6.0</string>
+            <key>CFBundleName</key>
+            <string>serialX</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${APP_VERSION}</string>
+            <key>CFBundleVersion</key>
+            <string>${APP_VERSION}</string>
+            <key>LSApplicationCategoryType</key>
+            <string>public.app-category.developer-tools</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          plutil -lint "${app_root}/Contents/Info.plist"
+          codesign --force --deep --sign - "$app_root"
+          codesign --verify --deep --strict "$app_root"
+
+          mkdir -p work/disk-image
+          cp -R "$app_root" work/disk-image/
+          ln -s /Applications work/disk-image/Applications
+          hdiutil create \
+            -volname "serialX ${APP_VERSION}" \
+            -srcfolder work/disk-image \
+            -ov \
+            -format UDZO \
+            "dist/serialX_${APP_VERSION}_macos_aarch64.dmg"
+
+      - name: Upload packages to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        shell: bash
+        run: gh release upload "$TAG_NAME" dist/* --clobber
+
+      - name: Keep packages as workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: serialX-${{ needs.prepare.outputs.app_version }}-${{ matrix.os }}-${{ matrix.archive_arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Verify and publish release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Download and checksum release packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_assets=(
+            "serialX_${APP_VERSION}_macos_aarch64.dmg"
+            "serialX_${APP_VERSION}_windows_x86_64-setup.exe"
+            "serialX_${APP_VERSION}_windows_x86_64.zip"
+            "serialX_${APP_VERSION}_linux_x86_64.tar.gz"
+            "serialX_${APP_VERSION}_linux_aarch64.tar.gz"
+            "serialX_${APP_VERSION}_linux_amd64.deb"
+            "serialX_${APP_VERSION}_linux_arm64.deb"
+          )
+
+          mkdir -p release-check
+          for asset_name in "${expected_assets[@]}"; do
+            gh release download "$TAG_NAME" \
+              --pattern "$asset_name" \
+              --dir release-check \
+              --clobber
+            if [[ ! -s "release-check/${asset_name}" ]]; then
+              echo "Missing or empty release asset: ${asset_name}" >&2
+              exit 1
+            fi
+          done
+
+          (cd release-check && sha256sum "${expected_assets[@]}" > SHA256SUMS.txt)
+          gh release upload "$TAG_NAME" release-check/SHA256SUMS.txt --clobber
+
+      - name: Remove unexpected release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_assets=(
+            "SHA256SUMS.txt"
+            "serialX_${APP_VERSION}_macos_aarch64.dmg"
+            "serialX_${APP_VERSION}_windows_x86_64-setup.exe"
+            "serialX_${APP_VERSION}_windows_x86_64.zip"
+            "serialX_${APP_VERSION}_linux_x86_64.tar.gz"
+            "serialX_${APP_VERSION}_linux_aarch64.tar.gz"
+            "serialX_${APP_VERSION}_linux_amd64.deb"
+            "serialX_${APP_VERSION}_linux_arm64.deb"
+          )
+
+          is_expected_asset() {
+            local expected
+            for expected in "${expected_assets[@]}"; do
+              if [[ "$1" == "$expected" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | [.id, .name] | @tsv' > release-assets.tsv
+
+          while IFS=$'\t' read -r asset_id asset_name; do
+            if ! is_expected_asset "$asset_name"; then
+              echo "Deleting unexpected release asset: ${asset_name}"
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            fi
+          done < release-assets.tsv
+
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          APP_VERSION: ${{ needs.prepare.outputs.app_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected_assets=(
+            "SHA256SUMS.txt"
+            "serialX_${APP_VERSION}_macos_aarch64.dmg"
+            "serialX_${APP_VERSION}_windows_x86_64-setup.exe"
+            "serialX_${APP_VERSION}_windows_x86_64.zip"
+            "serialX_${APP_VERSION}_linux_x86_64.tar.gz"
+            "serialX_${APP_VERSION}_linux_aarch64.tar.gz"
+            "serialX_${APP_VERSION}_linux_amd64.deb"
+            "serialX_${APP_VERSION}_linux_arm64.deb"
+          )
+
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            > release-assets.json
+
+          if [[ "$(jq 'length' release-assets.json)" -ne "${#expected_assets[@]}" ]]; then
+            echo "Release does not contain exactly the expected assets:" >&2
+            jq -r '.[].name' release-assets.json >&2
+            exit 1
+          fi
+
+          for asset_name in "${expected_assets[@]}"; do
+            if ! jq -e --arg asset_name "$asset_name" \
+              'any(.[]; .name == $asset_name and .size > 0)' \
+              release-assets.json >/dev/null; then
+              echo "Missing or empty release asset: ${asset_name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        shell: bash
+        run: |
+          gh release edit "$TAG_NAME" \
+            --draft=false \
+            --prerelease=false \
+            --latest

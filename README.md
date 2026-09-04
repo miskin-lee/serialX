@@ -25,8 +25,23 @@ cargo run
 首次构建需要下载 GPUI 相关依赖，耗时会稍长。建议使用最新稳定版 Rust；macOS
 还需要完整的 Xcode / Command Line Tools 环境。
 
+## 下载
+
+GitHub Releases 提供以下预编译包：
+
+- macOS Apple Silicon：DMG
+- Windows x86_64：安装程序与便携 ZIP
+- Linux x86_64 / ARM64：DEB 与便携 tar.gz
+
+当前发布包尚未进行 Apple 公证或 Windows 代码签名，首次启动时系统可能显示安全提示。
+
 ## 快捷操作
 
 - `Enter`：发送当前内容
 - `HEX`：按十六进制字节解析输入和展示终端数据
 - 点击波特率：未连接时循环切换常用波特率
+
+## 图标版权
+
+serialX 应用图标及 `assets/icons/` 下的衍生图标资源由 miskin 设计，
+版权所有 © 2026 miskin，并与本项目一致采用 GNU GPL v3 授权。

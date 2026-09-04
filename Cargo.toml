@@ -10,6 +10,9 @@ gpui-kit = "0.6"
 serialport = "4.8"
 smol = "2"
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 lto = "thin"
 strip = true

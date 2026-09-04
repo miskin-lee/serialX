@@ -917,7 +917,7 @@ fn main() {
                 let interface_theme = InterfaceTheme::from_appearance(window.appearance());
                 apply_interface_theme(interface_theme, window, cx);
                 let workspace = cx.new(|cx| SerialWorkspace::new(interface_theme, window, cx));
-                bind_window_actions(&workspace, window, cx);
+                bind_window_actions(&workspace, cx);
                 cx.new(|cx| {
                     Root::new(workspace, window, cx).bg(rgb(interface_theme.palette().editor))
                 })

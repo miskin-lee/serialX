@@ -58,18 +58,23 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
     cx.set_menus(application_menus());
 }
 
-pub(crate) fn bind_window_actions(
-    workspace: &Entity<SerialWorkspace>,
-    window: &mut Window,
+fn defer_window_action(
     cx: &mut App,
+    workspace: WeakEntity<SerialWorkspace>,
+    action: impl FnOnce(&mut SerialWorkspace, &mut Window, &mut Context<SerialWorkspace>) + 'static,
 ) {
-    let window_handle = window.window_handle();
+    cx.defer(move |cx| {
+        if let Err(error) = workspace.update_in(cx, action) {
+            eprintln!("failed to run serialX window action: {error}");
+        }
+    });
+}
+
+pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut App) {
     let view = workspace.downgrade();
     cx.on_action(move |_: &NewSerialTab, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.open_new_serial_tab_dialog(window, cx);
-            });
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_new_serial_tab_dialog(window, cx);
         });
     });
 
@@ -118,39 +123,30 @@ pub(crate) fn bind_window_actions(
         let _ = view.update(cx, |view, cx| view.toggle_auto_scroll(cx));
     });
 
-    let window_handle = window.window_handle();
     let view = workspace.downgrade();
     cx.on_action(move |_: &UseLightTheme, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.set_interface_theme(InterfaceTheme::Light, window, cx);
-            });
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.set_interface_theme(InterfaceTheme::Light, window, cx);
         });
     });
 
-    let window_handle = window.window_handle();
     let view = workspace.downgrade();
     cx.on_action(move |_: &UseDarkTheme, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.set_interface_theme(InterfaceTheme::Dark, window, cx);
-            });
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.set_interface_theme(InterfaceTheme::Dark, window, cx);
         });
     });
 
-    let window_handle = window.window_handle();
     let view = workspace.downgrade();
     cx.on_action(move |_: &CheckForUpdates, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| {
-                view.check_for_updates_from_menu(window, cx);
-            });
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.check_for_updates_from_menu(window, cx);
         });
     });
 
-    let window_handle = window.window_handle();
+    let view = workspace.downgrade();
     cx.on_action(move |_: &ShowAbout, cx| {
-        let _ = window_handle.update(cx, |_, window, cx| {
+        defer_window_action(cx, view.clone(), |_, window, cx| {
             SerialWorkspace::show_about_dialog(window, cx);
         });
     });

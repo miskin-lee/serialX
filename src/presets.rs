@@ -76,6 +76,20 @@ impl PresetStore {
         self.persist();
     }
 
+    pub(crate) fn update_session(
+        &mut self,
+        id: u64,
+        port_name: String,
+        configuration: SerialConfiguration,
+    ) {
+        if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
+            saved.label = format!("{} · {}", port_name, configuration.summary());
+            saved.port_name = port_name;
+            saved.configuration = configuration;
+            self.persist();
+        }
+    }
+
     pub(crate) fn add_command(&mut self, command: String) {
         if command.is_empty() || self.commands.iter().any(|saved| saved.command == command) {
             return;

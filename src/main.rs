@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app_menu;
+mod configuration;
 mod presets;
 mod serial;
 mod sidebar;
@@ -15,12 +16,12 @@ use std::{
 use app_menu::{bind_window_actions, configure_application_menus};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
-    Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
+    Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     h_flex,
     input::{InputEvent, InputState},
-    menu::{AppMenuBar, DropdownMenu, PopupMenuItem},
+    menu::AppMenuBar,
     notification::Notification,
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
@@ -45,25 +46,6 @@ enum UpdateStatus {
     Failed,
 }
 
-#[derive(Clone, Copy)]
-enum ConfigurationField {
-    Port,
-    BaudRate,
-    DataBits,
-    StopBits,
-    Parity,
-    FlowControl,
-}
-
-struct ConfigurationButton {
-    id: String,
-    label: &'static str,
-    value: String,
-    options: Vec<String>,
-    selected_index: usize,
-    field: ConfigurationField,
-}
-
 pub struct SerialWorkspace {
     tabs: Vec<SerialTabState>,
     active_tab: usize,
@@ -79,14 +61,13 @@ pub struct SerialWorkspace {
 
 impl SerialWorkspace {
     fn new(interface_theme: InterfaceTheme, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let tab = Self::build_tab(1, window, cx);
         let (update_tx, update_rx) = mpsc::channel();
         let menu_bar = AppMenuBar::new(cx);
 
         let workspace = Self {
-            tabs: vec![tab],
+            tabs: Vec::new(),
             active_tab: 0,
-            next_tab_id: 2,
+            next_tab_id: 1,
             interface_theme,
             presets: PresetStore::load(),
             update_status: UpdateStatus::Checking,
@@ -158,15 +139,6 @@ impl SerialWorkspace {
         self.tabs.iter().position(|tab| tab.id == id)
     }
 
-    fn add_serial_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.next_tab_id;
-        self.next_tab_id += 1;
-        let tab = Self::build_tab(id, window, cx);
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
-        cx.notify();
-    }
-
     fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
         let Some(index) = self.tab_index(id) else {
             return;
@@ -186,43 +158,6 @@ impl SerialWorkspace {
         if let Some(id) = self.active_tab().map(|tab| tab.id) {
             self.close_tab(id, cx);
         }
-    }
-
-    fn select_configuration(
-        &mut self,
-        tab_id: usize,
-        field: ConfigurationField,
-        selected_index: usize,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(index) = self.tab_index(tab_id) else {
-            return;
-        };
-        let tab = &mut self.tabs[index];
-        if tab.connected || tab.connecting {
-            return;
-        }
-        match field {
-            ConfigurationField::Port => {
-                tab.selected_port = selected_index.min(tab.ports.len().saturating_sub(1));
-            }
-            ConfigurationField::BaudRate => {
-                tab.configuration.baud_index = selected_index.min(BAUD_RATES.len() - 1);
-            }
-            ConfigurationField::DataBits => {
-                tab.configuration.data_bits_index = selected_index.min(DATA_BITS.len() - 1);
-            }
-            ConfigurationField::StopBits => {
-                tab.configuration.stop_bits_index = selected_index.min(STOP_BITS.len() - 1);
-            }
-            ConfigurationField::Parity => {
-                tab.configuration.parity_index = selected_index.min(PARITIES.len() - 1);
-            }
-            ConfigurationField::FlowControl => {
-                tab.configuration.flow_control_index = selected_index.min(FLOW_CONTROLS.len() - 1);
-            }
-        }
-        cx.notify();
     }
 
     fn refresh_ports(&mut self, cx: &mut Context<Self>) {
@@ -605,44 +540,6 @@ impl SerialWorkspace {
         });
     }
 
-    fn configuration_button(
-        button: ConfigurationButton,
-        tab_id: usize,
-        disabled: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let ConfigurationButton {
-            id,
-            label,
-            value,
-            options,
-            selected_index,
-            field,
-        } = button;
-        let workspace = cx.weak_entity();
-        Button::new(id)
-            .outline()
-            .small()
-            .label(format!("{label}  {value}"))
-            .dropdown_caret(true)
-            .disabled(disabled)
-            .dropdown_menu(move |mut menu, _, _| {
-                for (index, option) in options.iter().enumerate() {
-                    let workspace = workspace.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(option.clone())
-                            .checked(index == selected_index)
-                            .on_click(move |_, _, cx| {
-                                let _ = workspace.update(cx, |workspace, cx| {
-                                    workspace.select_configuration(tab_id, field, index, cx);
-                                });
-                            }),
-                    );
-                }
-                menu
-            })
-    }
-
     fn format_line_payload(hex_mode: bool, line: &TerminalLine) -> String {
         if let Some(note) = &line.note {
             return note.clone();
@@ -660,10 +557,9 @@ impl SerialWorkspace {
         }
     }
 
-    fn render_active_tab(&mut self, tab: SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_active_tab(&mut self, tab: SerialTabSnapshot, _cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
         let selected = tab.ports[tab.selected_port.min(tab.ports.len().saturating_sub(1))].clone();
-        let locked = tab.connected || tab.connecting;
         let status_label = if tab.connecting {
             "Connecting…"
         } else if tab.connected {
@@ -678,178 +574,12 @@ impl SerialWorkspace {
         } else {
             palette.muted
         };
-        let tab_id = tab.id;
-
-        let port_options = tab
-            .ports
-            .iter()
-            .map(|port| format!("{} — {}", port.name, port.subtitle))
-            .collect();
-        let baud_options = BAUD_RATES.iter().map(u32::to_string).collect();
-        let data_bit_options = DATA_BITS.iter().map(|value| (*value).into()).collect();
-        let stop_bit_options = STOP_BITS.iter().map(|value| (*value).into()).collect();
-        let parity_options = PARITIES.iter().map(|value| (*value).into()).collect();
-        let flow_options = FLOW_CONTROLS.iter().map(|value| (*value).into()).collect();
 
         v_flex()
             .flex_1()
             .min_h_0()
             .bg(rgb(palette.editor))
             .overflow_hidden()
-            .child(
-                v_flex()
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel))
-                    .child(
-                        h_flex()
-                            .h(px(40.))
-                            .px_3()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .size_6()
-                                            .rounded_sm()
-                                            .bg(rgb(palette.hover))
-                                            .text_color(rgb(palette.muted))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(Icon::new(IconName::Settings).size_4()),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .gap_0p5()
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::MEDIUM)
-                                                    .text_color(rgb(palette.strong_foreground))
-                                                    .child(selected.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(10.))
-                                                    .text_color(rgb(palette.muted))
-                                                    .child(if locked {
-                                                        "Configuration locked while connected"
-                                                    } else {
-                                                        "Configure this serial session"
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                Button::new(("connect-tab", tab_id))
-                                    .small()
-                                    .when(tab.connected, |button| {
-                                        button.outline().label("Disconnect")
-                                    })
-                                    .when(!tab.connected, |button| {
-                                        button.primary().label(if tab.connecting {
-                                            "Connecting…"
-                                        } else {
-                                            "Connect"
-                                        })
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_connection(tab_id, cx)
-                                    })),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .flex_wrap()
-                            .px_3()
-                            .py_2()
-                            .gap_2()
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("port-{tab_id}"),
-                                    label: "Port",
-                                    value: selected.name.clone(),
-                                    options: port_options,
-                                    selected_index: tab.selected_port,
-                                    field: ConfigurationField::Port,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            ))
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("baud-{tab_id}"),
-                                    label: "Baud Rate",
-                                    value: tab.configuration.baud_rate().to_string(),
-                                    options: baud_options,
-                                    selected_index: tab.configuration.baud_index,
-                                    field: ConfigurationField::BaudRate,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            ))
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("data-bits-{tab_id}"),
-                                    label: "Data Bits",
-                                    value: DATA_BITS[tab.configuration.data_bits_index].into(),
-                                    options: data_bit_options,
-                                    selected_index: tab.configuration.data_bits_index,
-                                    field: ConfigurationField::DataBits,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            ))
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("stop-bits-{tab_id}"),
-                                    label: "Stop Bits",
-                                    value: STOP_BITS[tab.configuration.stop_bits_index].into(),
-                                    options: stop_bit_options,
-                                    selected_index: tab.configuration.stop_bits_index,
-                                    field: ConfigurationField::StopBits,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            ))
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("parity-{tab_id}"),
-                                    label: "Parity",
-                                    value: PARITIES[tab.configuration.parity_index].into(),
-                                    options: parity_options,
-                                    selected_index: tab.configuration.parity_index,
-                                    field: ConfigurationField::Parity,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            ))
-                            .child(Self::configuration_button(
-                                ConfigurationButton {
-                                    id: format!("flow-{tab_id}"),
-                                    label: "Flow Control",
-                                    value: FLOW_CONTROLS[tab.configuration.flow_control_index]
-                                        .into(),
-                                    options: flow_options,
-                                    selected_index: tab.configuration.flow_control_index,
-                                    field: ConfigurationField::FlowControl,
-                                },
-                                tab_id,
-                                locked,
-                                cx,
-                            )),
-                    ),
-            )
             .child(
                 h_flex()
                     .h(px(35.))

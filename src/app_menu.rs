@@ -19,18 +19,12 @@ actions!(
         UseLightTheme,
         UseDarkTheme,
         CheckForUpdates,
-        ShowAbout,
-        QuitSerialX
+        ShowAbout
     ]
 );
 
 fn application_menus() -> Vec<Menu> {
     vec![
-        Menu::new("serialX").items([
-            MenuItem::action("About serialX", ShowAbout),
-            MenuItem::separator(),
-            MenuItem::action("Quit serialX", QuitSerialX),
-        ]),
         Menu::new("Session").items([
             MenuItem::action("New Serial Tab", NewSerialTab),
             MenuItem::action("Close Current Tab", CloseSerialTab),
@@ -59,7 +53,6 @@ fn application_menus() -> Vec<Menu> {
 }
 
 pub(crate) fn configure_application_menus(cx: &mut App) {
-    cx.on_action(|_: &QuitSerialX, cx| cx.quit());
     GlobalState::global_mut(cx)
         .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
     cx.set_menus(application_menus());
@@ -74,7 +67,9 @@ pub(crate) fn bind_window_actions(
     let view = workspace.downgrade();
     cx.on_action(move |_: &NewSerialTab, cx| {
         let _ = window_handle.update(cx, |_, window, cx| {
-            let _ = view.update(cx, |view, cx| view.add_serial_tab(window, cx));
+            let _ = view.update(cx, |view, cx| {
+                view.open_new_serial_tab_dialog(window, cx);
+            });
         });
     });
 

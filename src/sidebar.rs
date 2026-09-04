@@ -159,6 +159,7 @@ impl SerialWorkspace {
                     })
                     .children(saved_sessions.into_iter().map(|saved| {
                         let open_workspace = workspace.clone();
+                        let edit_workspace = workspace.clone();
                         let remove_workspace = workspace.clone();
                         let saved_id = saved.id;
                         h_flex()
@@ -171,9 +172,15 @@ impl SerialWorkspace {
                             .border_color(rgb(palette.border))
                             .hover(|row| row.bg(rgb(palette.hover)))
                             .cursor_pointer()
-                            .on_click(move |_, window, cx| {
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                 let _ = open_workspace.update(cx, |this, cx| {
                                     this.open_saved_session(saved_id, window, cx);
+                                });
+                            })
+                            .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                                cx.stop_propagation();
+                                let _ = edit_workspace.update(cx, |this, cx| {
+                                    this.open_saved_session_editor(saved_id, window, cx);
                                 });
                             })
                             .child(
@@ -197,7 +204,10 @@ impl SerialWorkspace {
                                         div()
                                             .text_size(px(10.))
                                             .text_color(rgb(palette.muted))
-                                            .child(saved.port_name),
+                                            .child(format!(
+                                                "{} · Right-click to edit",
+                                                saved.port_name
+                                            )),
                                     ),
                             )
                             .child(

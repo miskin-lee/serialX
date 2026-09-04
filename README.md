@@ -35,6 +35,15 @@ GitHub Releases 提供以下预编译包：
 
 当前发布包尚未进行 Apple 公证或 Windows 代码签名，首次启动时系统可能显示安全提示。
 
+发布新版本前，使用版本升级脚本同步更新 `Cargo.toml` 与 `Cargo.lock`：
+
+```bash
+scripts/version-bump.sh 0.2.0
+```
+
+脚本会校验版本号，创建 `chore: bump version to 0.2.0` 提交并推送当前分支；
+Release 工作流会从 `Cargo.toml` 读取该版本并创建对应的 `v0.2.0` 标签。
+
 ## 快捷操作
 
 - `Enter`：发送当前内容

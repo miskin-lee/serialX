@@ -275,12 +275,16 @@ impl SerialWorkspace {
             ConfigurationTarget::SavedSession(_) => "Save Changes",
         };
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        // `Dialog` only renders a footer it is handed, so the confirm and cancel
+        // buttons come from `AlertDialog`, which builds one out of the button
+        // props.
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let workspace = workspace.clone();
             let editor = editor_for_submit.clone();
-            dialog
+            alert
                 .width(px(560.))
                 .title(title)
+                .close_button(true)
                 .child(editor_for_dialog.clone())
                 .button_props(
                     DialogButtonProps::default()

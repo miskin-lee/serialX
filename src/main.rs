@@ -474,10 +474,10 @@ impl SerialWorkspace {
                     "Current version: v{}\nPackage: {package_name}\n\nDownload and install now?",
                     env!("CARGO_PKG_VERSION")
                 ))
-                .show_cancel(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Download and Install")
+                        .show_cancel(true)
                         .cancel_text("Later"),
                 )
                 .on_ok(move |_, window, cx| {
@@ -529,10 +529,10 @@ impl SerialWorkspace {
                     "Version {}\nA modern serial port workspace\n\nGNU GPL v3\n© 2026 miskin",
                     env!("CARGO_PKG_VERSION")
                 ))
-                .show_cancel(true)
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text("Close")
+                        .show_cancel(true)
                         .cancel_text("View on GitHub"),
                 )
                 .on_cancel(|_, _, cx| {
@@ -713,7 +713,7 @@ impl SerialWorkspace {
 }
 
 impl Render for SerialWorkspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
         let sidebar_snapshot = active_snapshot.clone();
@@ -808,7 +808,14 @@ impl Render for SerialWorkspace {
         };
         let sidebar = self.render_right_sidebar(sidebar_snapshot, cx);
 
-        v_flex()
+        // `Root` only renders the window chrome; dialogs, sheets and
+        // notifications live in overlay layers the window content has to render
+        // itself, otherwise opening one silently does nothing.
+        let sheet_layer = Root::render_sheet_layer(window, cx);
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
+        let workbench = v_flex()
             .size_full()
             .bg(rgb(palette.editor))
             .text_color(rgb(palette.foreground))
@@ -890,7 +897,15 @@ impl Render for SerialWorkspace {
                             .child(content),
                     )
                     .child(sidebar),
-            )
+            );
+
+        div()
+            .relative()
+            .size_full()
+            .child(workbench)
+            .children(sheet_layer)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }
 

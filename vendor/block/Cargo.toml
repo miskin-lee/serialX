@@ -1,0 +1,23 @@
+# A vendored copy of `block` 0.1.6, the last release of SSheldon/rust-block,
+# with one fix: the opaque `Class` behind `_NSConcreteStackBlock` is a
+# zero-sized struct instead of an empty enum, which rustc's
+# `uninhabited_static` lint rejects in a future release. The crate reaches
+# serialX through gpui-kit's macOS stack (cocoa, metal, core-video); the
+# `[patch.crates-io]` entry in the workspace manifest swaps this copy in.
+#
+# Nothing else is changed; the package's own tests are left out because the
+# helper crate they need is not part of the published sources.
+
+[package]
+name = "block"
+version = "0.1.6"
+authors = ["Steven Sheldon"]
+edition = "2015"
+
+description = "Rust interface for Apple's C language extension of blocks."
+keywords = ["blocks", "osx", "ios", "objective-c"]
+readme = "README.md"
+repository = "http://github.com/SSheldon/rust-block"
+documentation = "http://ssheldon.github.io/rust-objc/block/"
+license = "MIT"
+publish = false

@@ -28,3 +28,10 @@ embed-resource = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+# `block` 0.1.6 (via gpui-kit's macOS stack) declares an `extern` static of an
+# uninhabited type, which rustc warns will become a hard error. Upstream has
+# not released a fix, so `vendor/block` carries the one-line change; see its
+# README. Remove once the dependency chain no longer pulls the crate in.
+[patch.crates-io]
+block = { path = "vendor/block" }

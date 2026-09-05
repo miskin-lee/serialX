@@ -1,5 +1,5 @@
-//! The small controls the chrome is assembled from: segmented switches, choice
-//! chips and section eyebrows.
+//! The small controls the chrome is assembled from: segmented switches, tags
+//! and section eyebrows.
 //!
 //! They are plain elements rather than `gpui-component` widgets so the dialog,
 //! the composer and the title bar all pick from one drawer. Every control here
@@ -14,7 +14,7 @@ use crate::theme::{EYEBROW, TextToken, Typography, WorkbenchPalette, tint};
 /// What picking a [`Choice`] does.
 type OnChoose = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
-/// One option in a [`segmented`] switch or a [`chip_row`].
+/// One option in a [`segmented`] switch.
 pub(crate) struct Choice {
     label: SharedString,
     active: bool,
@@ -118,53 +118,7 @@ pub(crate) fn segmented(
         }))
 }
 
-/// A row of choice chips: free-standing pills that wrap when the row is full.
-/// For options too many, or too long, to share one segmented rail.
-pub(crate) fn chip_row(
-    id: impl Into<ElementId>,
-    palette: WorkbenchPalette,
-    text: ChoiceText,
-    choices: Vec<Choice>,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .gap_1p5()
-        .children(choices.into_iter().enumerate().map(|(index, choice)| {
-            text.apply(
-                div()
-                    .id(("chip", index))
-                    .h(px(26.))
-                    .px_2p5()
-                    .flex()
-                    .items_center()
-                    .rounded_full()
-                    .border_1()
-                    .cursor_pointer()
-                    .whitespace_nowrap(),
-            )
-            .when(choice.active, |chip| {
-                chip.bg(tint(palette.accent, 0.14))
-                    .border_color(tint(palette.accent, 0.55))
-                    .text_color(rgb(palette.accent))
-            })
-            .when(!choice.active, |chip| {
-                chip.bg(rgb(palette.card))
-                    .border_color(rgb(palette.border_subtle))
-                    .text_color(rgb(palette.foreground))
-                    .hover(|chip| {
-                        chip.bg(rgb(palette.hover))
-                            .border_color(rgb(palette.border))
-                    })
-            })
-            .on_click(choice.on_click)
-            .child(choice.label)
-        }))
-}
-
-/// A small tinted pill carrying one word: `Demo`, `Offline`, `3 / 40`.
+/// A small tinted pill carrying one word: `Custom`, `Offline`, `3 / 40`.
 pub(crate) fn tag(
     palette: WorkbenchPalette,
     color: u32,

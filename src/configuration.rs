@@ -3,11 +3,12 @@
 //!
 //! The form is laid out as a choice, not a settings sheet. The device is a
 //! list you pick from, because there are only ever a few and the one you want
-//! is named by what it is plugged into; the baud rate is a row of chips, since
-//! there are six and one of them is nearly always right; and the frame — data
-//! bits, parity, stop bits, flow control — is four segmented switches, since
-//! each has two to four values and the whole frame should be readable at a
-//! glance. A summary line at the foot restates the choice in the `115200 8N1`
+//! is named by what it is plugged into; the baud rate is a field with the
+//! standard rates in a list behind it, since one of them is nearly always
+//! right and the odd device wants one of its own; and the frame — data bits,
+//! parity, stop bits, flow control — is four segmented switches, since each
+//! has two to four values and the whole frame should be readable at a glance.
+//! A summary line at the foot restates the choice in the `115200 8N1`
 //! shorthand the rest of the workbench prints.
 
 use gpui_kit::component::{
@@ -15,15 +16,18 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::{Cancel, Confirm, DialogFooter},
     h_flex,
+    input::{Input, InputEvent, InputState},
     kbd::Kbd,
+    menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::controls::{Choice, ChoiceText, chip_row, eyebrow, segmented, tag};
+use crate::controls::{Choice, ChoiceText, eyebrow, segmented, tag};
 use crate::icons::{Glyph, icon_chip, port_glyph};
+use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
     BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TITLE, Typography, WorkbenchPalette, tint,
 };
@@ -32,8 +36,20 @@ use crate::{
     SerialConfiguration, SerialWorkspace, discover_ports, presets::StoredSession,
 };
 
-/// Width of the dialog: room for four baud chips and a two-column frame.
+/// Width of the dialog: room for a two-column frame, and for the baud field
+/// with a sentence beside it.
 const DIALOG_WIDTH: f32 = 540.;
+/// Width of the baud rate field: seven digits in the chrome's monospace, the
+/// caret that opens the list, and air around both.
+const BAUD_FIELD_WIDTH: f32 = 176.;
+/// Height of the baud rate field, a little over a chip so the caret has room.
+const BAUD_FIELD_HEIGHT: f32 = 30.;
+/// How tall the list of standard rates grows before it scrolls: every
+/// standard rate on a tall window, a scrollbar on a short one.
+const BAUD_LIST_MAX_HEIGHT: f32 = 320.;
+/// How far the caret's right edge sits in from the field's. The list hangs
+/// from the caret, so it is narrowed by this much to line up with the field.
+const BAUD_LIST_INSET: f32 = 8.;
 /// Height of one device row.
 const PORT_ROW_HEIGHT: f32 = 44.;
 /// The most device rows the list shows before it scrolls.
@@ -45,7 +61,7 @@ const PORT_ROWS_MIN: usize = 2;
 const DIALOG_MAX_HEIGHT_FRACTION: f32 = 0.82;
 /// What the dialog stands at with an empty device list: padding, header, the
 /// other three sections, the summary and the footer.
-const DIALOG_FIXED_HEIGHT: f32 = 430.;
+const DIALOG_FIXED_HEIGHT: f32 = 434.;
 
 /// The height the device list is given, so it scrolls instead of growing.
 ///
@@ -70,9 +86,10 @@ enum ConfigurationTarget {
     SavedSession(u64),
 }
 
+/// The frame parameters: the ones picked from a fixed list. The baud rate is
+/// typed or chosen and is handled on its own.
 #[derive(Clone, Copy)]
 enum ConfigurationField {
-    BaudRate,
     DataBits,
     StopBits,
     Parity,
@@ -85,6 +102,14 @@ struct SerialConfigurationEditor {
     ports: Vec<PortItem>,
     selected_port: usize,
     configuration: SerialConfiguration,
+    /// The baud rate as typed. Picking from the list writes into it too, so
+    /// the field always shows the rate the session will open at.
+    baud_input: Entity<InputState>,
+    _baud_subscription: Subscription,
+    /// Why the field's text is not a rate, while it is not one. The
+    /// configuration keeps the last rate that was, and the dialog will not
+    /// confirm until the text is one again.
+    baud_error: Option<BaudRateError>,
 }
 
 impl SerialConfigurationEditor {
@@ -92,6 +117,8 @@ impl SerialConfigurationEditor {
         target: ConfigurationTarget,
         theme: InterfaceTheme,
         saved: Option<&StoredSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> Self {
         let mut ports = discover_ports();
         let mut selected_port = 0;
@@ -111,17 +138,67 @@ impl SerialConfigurationEditor {
             }
         }
 
+        let baud_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(DEFAULT_BAUD_RATE.to_string())
+                .default_value(configuration.baud_rate().to_string())
+        });
+        let baud_subscription = cx.subscribe_in(
+            &baud_input,
+            window,
+            |editor, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value();
+                    editor.set_baud_text(&text, cx);
+                }
+            },
+        );
+
         Self {
             target,
             theme,
             ports,
             selected_port,
             configuration,
+            baud_input,
+            _baud_subscription: baud_subscription,
+            baud_error: None,
         }
     }
 
-    fn selected_port(&self) -> &PortItem {
-        &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
+    /// Reads the field. A rate goes into the configuration; anything else
+    /// leaves the configuration alone and marks the field.
+    fn set_baud_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        match parse_baud_rate(text) {
+            Ok(rate) => {
+                self.configuration.baud_rate = rate;
+                self.baud_error = None;
+            }
+            Err(error) => self.baud_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// A rate picked from the list: into the configuration, and into the
+    /// field, replacing whatever was typed.
+    fn choose_baud_rate(&mut self, rate: u32, window: &mut Window, cx: &mut Context<Self>) {
+        self.configuration.baud_rate = rate;
+        self.baud_error = None;
+        self.baud_input.update(cx, |input, cx| {
+            input.set_value(rate.to_string(), window, cx);
+        });
+        cx.notify();
+    }
+
+    fn focus_baud_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.baud_input
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    /// The chosen device, or none when the scan found nothing.
+    fn selected_port(&self) -> Option<&PortItem> {
+        self.ports
+            .get(self.selected_port.min(self.ports.len().saturating_sub(1)))
     }
 
     fn select_port(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -133,16 +210,17 @@ impl SerialConfigurationEditor {
     /// there — and keeping an absent saved device listed, so editing a saved
     /// session never silently retargets it.
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        let current = self.selected_port().clone();
+        let current = self.selected_port().cloned();
         let mut ports = discover_ports();
-        if current.kind == PortKind::Unavailable
-            && !ports.iter().any(|port| port.name == current.name)
-        {
-            ports.push(current.clone());
+        if let Some(current) = &current {
+            if current.kind == PortKind::Unavailable
+                && !ports.iter().any(|port| port.name == current.name)
+            {
+                ports.push(current.clone());
+            }
         }
-        self.selected_port = ports
-            .iter()
-            .position(|port| port.name == current.name)
+        self.selected_port = current
+            .and_then(|current| ports.iter().position(|port| port.name == current.name))
             .unwrap_or(0);
         self.ports = ports;
         cx.notify();
@@ -150,9 +228,6 @@ impl SerialConfigurationEditor {
 
     fn select(&mut self, field: ConfigurationField, selected_index: usize, cx: &mut Context<Self>) {
         match field {
-            ConfigurationField::BaudRate => {
-                self.configuration.baud_index = selected_index.min(BAUD_RATES.len() - 1);
-            }
             ConfigurationField::DataBits => {
                 self.configuration.data_bits_index = selected_index.min(DATA_BITS.len() - 1);
             }
@@ -227,6 +302,28 @@ impl SerialConfigurationEditor {
             .child(control)
     }
 
+    /// What the list shows when the scan found nothing: the fact, and what to
+    /// do about it.
+    fn no_devices_row(palette: WorkbenchPalette) -> impl IntoElement {
+        h_flex()
+            .h(px(PORT_ROW_HEIGHT))
+            .px_3()
+            .gap_2()
+            .items_center()
+            .child(
+                div()
+                    .text_token(LABEL)
+                    .text_color(rgb(palette.muted))
+                    .child("No serial devices found"),
+            )
+            .child(
+                div()
+                    .text_token(CAPTION)
+                    .text_color(rgb(palette.faint))
+                    .child("Plug one in and rescan"),
+            )
+    }
+
     /// The mark at the end of a device row: a filled disc with a check when it
     /// is the chosen one, an empty ring when it is not.
     fn radio_mark(palette: WorkbenchPalette, selected: bool) -> impl IntoElement {
@@ -257,13 +354,12 @@ impl SerialConfigurationEditor {
     ) -> AnyElement {
         let selected_index = self.selected_port;
         let list_height = port_list_height(self.ports.len(), viewport_height);
-        let rows = self
+        let mut rows = self
             .ports
             .iter()
             .enumerate()
             .map(|(index, port)| {
                 let selected = index == selected_index;
-                let (glyph, hue) = port_glyph(port.kind, palette);
                 let name_color = if port.kind == PortKind::Unavailable {
                     palette.muted
                 } else {
@@ -286,7 +382,6 @@ impl SerialConfigurationEditor {
                     .on_click(cx.listener(move |editor, _, _, cx| {
                         editor.select_port(index, cx);
                     }))
-                    .child(icon_chip(glyph, hue, 26.))
                     .child(
                         v_flex()
                             .flex_1()
@@ -306,15 +401,16 @@ impl SerialConfigurationEditor {
                                     .child(port.subtitle.clone()),
                             ),
                     )
-                    .when(port.is_demo(), |row| {
-                        row.child(tag(palette, palette.category_signal, MICRO, "Demo"))
-                    })
                     .when(port.kind == PortKind::Unavailable, |row| {
                         row.child(tag(palette, palette.warning, MICRO, "Offline"))
                     })
                     .child(Self::radio_mark(palette, selected))
+                    .into_any_element()
             })
             .collect::<Vec<_>>();
+        if rows.is_empty() {
+            rows.push(Self::no_devices_row(palette).into_any_element());
+        }
 
         let count = self.ports.len();
         let aside = h_flex()
@@ -360,23 +456,103 @@ impl SerialConfigurationEditor {
         .into_any_element()
     }
 
+    /// The baud rate: a field you type into, with the standard rates in a
+    /// list behind the caret at its end. Beside it, what the field holds — a
+    /// hint while it is a listed rate, a `Custom` tag when it is one the list
+    /// does not have, and the reason when it is not a rate at all.
     fn render_baud_rate(
         &mut self,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let labels = BAUD_RATES.iter().map(u32::to_string).collect::<Vec<_>>();
-        let choices = self.choices(
-            ConfigurationField::BaudRate,
-            labels.iter().map(String::as_str),
-            self.configuration.baud_index,
-            cx,
-        );
+        let rate = self.configuration.baud_rate();
+        let error = self.baud_error;
+        let editor = cx.weak_entity();
+
+        let list = Button::new("config-baud-list")
+            .ghost()
+            .with_size(px(22.))
+            .icon(
+                Icon::new(IconName::ChevronDown)
+                    .size(px(12.))
+                    .text_color(rgb(palette.muted)),
+            )
+            .tooltip("Standard rates")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                menu = menu
+                    .min_w(px(BAUD_FIELD_WIDTH - BAUD_LIST_INSET))
+                    .max_h(px(BAUD_LIST_MAX_HEIGHT))
+                    .scrollable(true);
+                for &listed in BAUD_RATES {
+                    let editor = editor.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(listed.to_string())
+                            .checked(listed == rate)
+                            .on_click(move |_, window, cx| {
+                                let _ = editor.update(cx, |editor, cx| {
+                                    editor.choose_baud_rate(listed, window, cx);
+                                });
+                            }),
+                    );
+                }
+                menu
+            });
+
+        let field = Input::new(&self.baud_input)
+            .small()
+            .w(px(BAUD_FIELD_WIDTH))
+            .h(px(BAUD_FIELD_HEIGHT))
+            .ui_mono_token(LABEL)
+            .bg(rgb(palette.input))
+            .border_color(rgb(if error.is_some() {
+                palette.danger
+            } else {
+                palette.input_border
+            }))
+            .rounded(px(8.))
+            .pl_2p5()
+            .pr_1()
+            .focus_bordered(error.is_none())
+            .suffix(list);
+
+        let caption = |color: u32, text: &'static str| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_token(CAPTION)
+                .text_color(rgb(color))
+                .child(text)
+        };
+        let aside = match error {
+            Some(error) => h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(tag(palette, palette.danger, MICRO, "Invalid"))
+                .child(caption(palette.danger, error.message())),
+            None if is_listed_baud_rate(rate) => h_flex().flex_1().min_w_0().child(caption(
+                palette.faint,
+                "Pick from the list, or type any rate",
+            )),
+            None => h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap_2()
+                .child(tag(palette, palette.category_signal, MICRO, "Custom"))
+                .child(caption(
+                    palette.muted,
+                    "Not a standard rate · needs device support",
+                )),
+        };
+
         Self::section(
             palette,
             "Baud rate",
             None,
-            chip_row("config-baud", palette, ChoiceText::mono(LABEL), choices),
+            h_flex().items_center().gap_3().child(field).child(aside),
         )
         .into_any_element()
     }
@@ -456,7 +632,10 @@ impl SerialConfigurationEditor {
     /// print, and under it the same thing in words.
     fn render_summary(&self, palette: WorkbenchPalette) -> AnyElement {
         let port = self.selected_port();
-        let (glyph, hue) = port_glyph(port.kind, palette);
+        let (glyph, hue) = port.map_or((Glyph::Port, palette.muted), |port| {
+            port_glyph(port.kind, palette)
+        });
+        let device = port.map_or("No device", |port| port.name.as_str());
         let configuration = self.configuration;
         let stop_bits = if STOP_BITS[configuration.stop_bits_index] == "1" {
             "1 stop bit"
@@ -492,7 +671,7 @@ impl SerialConfigurationEditor {
                             .truncate()
                             .ui_mono_token(BODY_STRONG)
                             .text_color(rgb(palette.strong_foreground))
-                            .child(format!("{} · {}", port.name, configuration.summary())),
+                            .child(format!("{device} · {}", configuration.summary())),
                     )
                     .child(
                         div()
@@ -554,7 +733,7 @@ impl SerialWorkspace {
                 .find(|saved| saved.id == saved_id),
         };
         let theme = self.interface_theme;
-        let editor = cx.new(|_| SerialConfigurationEditor::new(target, theme, saved));
+        let editor = cx.new(|cx| SerialConfigurationEditor::new(target, theme, saved, window, cx));
         let editor_for_dialog = editor.clone();
         let editor_for_submit = editor.clone();
         let workspace = cx.weak_entity();
@@ -637,8 +816,18 @@ impl SerialWorkspace {
                         ),
                 )
                 .on_ok(move |_, window, cx| {
+                    // A field that does not hold a rate keeps the dialog
+                    // open, with the field in focus, rather than opening the
+                    // port at the last rate that was one.
+                    if editor.read(cx).baud_error.is_some() {
+                        editor.update(cx, |editor, cx| editor.focus_baud_input(window, cx));
+                        return false;
+                    }
                     let editor = editor.read(cx);
-                    let port_name = editor.selected_port().name.clone();
+                    let Some(port_name) = editor.selected_port().map(|port| port.name.clone())
+                    else {
+                        return false;
+                    };
                     let configuration = editor.configuration.sanitized();
                     let target = editor.target;
 

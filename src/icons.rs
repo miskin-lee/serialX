@@ -37,7 +37,6 @@ pub(crate) enum Glyph {
     Sweep,
     Terminal,
     Usb,
-    Waveform,
 }
 
 impl Glyph {
@@ -58,7 +57,6 @@ impl Glyph {
             Self::Sweep => "icons/ui/sweep.svg",
             Self::Terminal => "icons/ui/terminal.svg",
             Self::Usb => "icons/ui/usb.svg",
-            Self::Waveform => "icons/ui/waveform.svg",
         }
     }
 }
@@ -131,10 +129,6 @@ const GLYPHS: &[(&str, &[u8])] = &[
         "icons/ui/usb.svg",
         include_bytes!("../assets/icons/ui/usb.svg"),
     ),
-    (
-        "icons/ui/waveform.svg",
-        include_bytes!("../assets/icons/ui/waveform.svg"),
-    ),
 ];
 
 /// Serves the app's glyphs and falls through to the ones `gpui-kit` ships.
@@ -164,12 +158,11 @@ impl AssetSource for WorkbenchAssets {
     }
 }
 
-/// The glyph and hue a port is drawn with, wherever one is listed: the demo
-/// device is a signal, a physical port is a device, and a port that is named
-/// but not attached is drawn in the muted ink so it reads as absent.
+/// The glyph and hue a port is drawn with, wherever one is listed: a physical
+/// port is a device, and a port that is named but not attached is drawn in
+/// the muted ink so it reads as absent.
 pub(crate) fn port_glyph(kind: PortKind, palette: WorkbenchPalette) -> (Glyph, u32) {
     match kind {
-        PortKind::Demo => (Glyph::Waveform, palette.category_signal),
         PortKind::Usb => (Glyph::Usb, palette.category_device),
         PortKind::Bluetooth | PortKind::Pci | PortKind::Unknown => {
             (Glyph::Port, palette.category_device)
@@ -218,7 +211,6 @@ mod tests {
         Glyph::Sweep,
         Glyph::Terminal,
         Glyph::Usb,
-        Glyph::Waveform,
     ];
 
     /// A glyph whose file is missing renders as nothing at all, with no error,

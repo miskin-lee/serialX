@@ -1,12 +1,13 @@
-//! The centre column: everything between the tab bar and the status bar.
+//! The centre column: everything between the title bar and the window's
+//! bottom edge.
 //!
-//! The workbench is laid out as four stacked bands — a device toolbar, the
-//! terminal log, the composer, and (owned by `main`) the status bar. Each band
-//! has a fixed height so the log is the only thing that grows, which keeps the
-//! composer parked under the cursor no matter how much traffic arrives.
+//! The workbench is laid out as three stacked bands — the tab strip, the
+//! terminal log, and the composer. The strip and the composer have fixed
+//! heights so the log is the only thing that grows, which keeps the composer
+//! parked under the cursor no matter how much traffic arrives.
 
 use gpui_kit::component::{
-    Disableable, Icon, Sizable,
+    Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
@@ -20,22 +21,28 @@ use gpui_kit::*;
 use crate::app_icon::application_icon_image;
 use crate::app_menu::NewSerialTab;
 use crate::controls::{Choice, ChoiceText, segmented};
-use crate::icons::{Glyph, icon_chip, port_glyph};
+use crate::icons::Glyph;
 use crate::theme::{
     BODY, CAPTION, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, Typography, WORDMARK,
     WorkbenchPalette, tint,
 };
 use crate::{LineKind, SerialTabSnapshot, SerialWorkspace, TerminalLine};
 
-/// Height of the device toolbar above the terminal.
-const TOOLBAR_HEIGHT: f32 = 46.;
+/// Height of the tab strip above the terminal: two under the title bar's,
+/// so the two bands read as one piece of chrome without repeating it.
+const TAB_STRIP_HEIGHT: f32 = 36.;
+/// Height of a tab, and of every control that shares the strip with it.
+const TAB_HEIGHT: f32 = 26.;
+/// The close mark inside a tab.
+const TAB_CLOSE: f32 = 18.;
+/// The widest a tab grows before its name truncates.
+const TAB_MAX_WIDTH: f32 = 260.;
+/// The narrowest a tab shrinks to when the strip is full.
+const TAB_MIN_WIDTH: f32 = 120.;
 /// Height of the composer below the terminal.
 const COMPOSER_HEIGHT: f32 = 52.;
 /// Width of the timestamp gutter, wide enough for `14:32:40.018`.
 const TIME_GUTTER: f32 = 82.;
-/// Square size of a toolbar icon button. `Button` derives the glyph from this
-/// at 75%, and the two-tone glyphs need the room to stay legible.
-const TOOL_BUTTON: f32 = 28.;
 
 impl SerialWorkspace {
     /// The direction tag, its colour, and the colour its payload prints in.
@@ -66,161 +73,258 @@ impl SerialWorkspace {
         }
     }
 
-    /// The device band: what is being talked to, and the controls that talk.
-    fn render_toolbar(&mut self, tab: &SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
+    /// The band above the terminal: one tab per session on the left, and on
+    /// the right the controls that act on the session in front of you —
+    /// connect, pause, clear, timestamps, follow. What the session *is* is
+    /// already named by its tab and by the title bar's context pill, so the
+    /// strip does not say it a third time.
+    pub(crate) fn render_tab_strip(
+        &mut self,
+        active: Option<&SerialTabSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let active = active?;
         let palette = self.interface_theme.palette();
-        let tab_id = tab.id;
-        let selected = tab.selected_port().clone();
-        let connected = tab.connected || tab.connecting;
-        let status_color = Self::connection_color(tab, palette);
-        let (glyph, category) = port_glyph(selected.kind, palette);
+        let active_index = self.active_tab;
+
+        let tabs = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let status = if tab.connected {
+                    palette.success
+                } else if tab.connecting {
+                    palette.warning
+                } else {
+                    palette.faint
+                };
+                Self::render_tab(
+                    index,
+                    tab.id,
+                    tab.selected_port().name.clone(),
+                    status,
+                    index == active_index,
+                    palette,
+                    cx,
+                )
+            })
+            .collect::<Vec<_>>();
+        let actions = self.render_session_actions(active, palette, cx);
+
+        Some(
+            h_flex()
+                .h(px(TAB_STRIP_HEIGHT))
+                .flex_none()
+                .px_2()
+                .gap_3()
+                .items_center()
+                .bg(rgb(palette.tab_bar))
+                .border_b_1()
+                .border_color(rgb(palette.border))
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .items_center()
+                        .children(tabs)
+                        .child(
+                            Button::new("new-tab")
+                                .ghost()
+                                .with_size(px(TAB_HEIGHT))
+                                .icon(IconName::Plus)
+                                .tooltip_with_action("New session", &NewSerialTab, None)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_new_serial_tab_dialog(window, cx);
+                                })),
+                        ),
+                )
+                .child(actions)
+                .into_any_element(),
+        )
+    }
+
+    /// One tab: a status dot, the port's name, and a close mark that shows on
+    /// the active tab and on hover. The active tab is a raised plate and the
+    /// others sit flat on the strip until pointed at — the rule the segmented
+    /// switches follow, so every exclusive choice in the workbench reads the
+    /// same way. Tabs share the strip: when it fills, they shrink together
+    /// and their names truncate, the way a browser's do.
+    fn render_tab(
+        index: usize,
+        tab_id: usize,
+        name: String,
+        status: u32,
+        active: bool,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group: SharedString = format!("session-tab-{tab_id}").into();
 
         h_flex()
-            .h(px(TOOLBAR_HEIGHT))
-            .flex_none()
-            .px_3()
-            .gap_3()
-            .justify_between()
-            .bg(rgb(palette.editor))
-            .border_b_1()
-            .border_color(rgb(palette.border))
+            .id(("session-tab", tab_id))
+            .group(group.clone())
+            .h(px(TAB_HEIGHT))
+            .min_w(px(TAB_MIN_WIDTH))
+            .max_w(px(TAB_MAX_WIDTH))
+            .pl_2p5()
+            .pr_1()
+            .gap_2()
+            .items_center()
+            .rounded(px(7.))
+            .border_1()
+            .cursor_pointer()
+            .when(active, |tab| {
+                tab.bg(rgb(palette.card))
+                    .border_color(tint(palette.strong_foreground, 0.08))
+            })
+            .when(!active, |tab| {
+                tab.border_color(transparent_black())
+                    .hover(|tab| tab.bg(rgb(palette.hover)))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if index < this.tabs.len() {
+                    this.active_tab = index;
+                    cx.notify();
+                }
+            }))
+            .child(Self::status_dot(6., status))
             .child(
-                h_flex()
+                div()
+                    .flex_1()
                     .min_w_0()
-                    .gap_2p5()
-                    .child(icon_chip(glyph, category, 28.))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_token(LABEL)
-                                    .text_color(rgb(palette.strong_foreground))
-                                    .child(selected.name.clone()),
-                            )
-                            .child(
-                                h_flex()
-                                    .min_w_0()
-                                    .gap_1p5()
-                                    .text_token(CAPTION)
-                                    .text_color(rgb(palette.muted))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .ui_mono_token(MONO_SMALL)
-                                            .child(tab.configuration.summary()),
-                                    )
-                                    .child(div().flex_none().child("·"))
-                                    .child(
-                                        h_flex()
-                                            .flex_none()
-                                            .gap_1p5()
-                                            .items_center()
-                                            .text_color(rgb(status_color))
-                                            .child(Self::status_dot(5., status_color))
-                                            .child(tab.status_label()),
-                                    )
-                                    .child(div().flex_none().child("·"))
-                                    .child(div().truncate().child(selected.subtitle.clone())),
-                            ),
-                    ),
+                    .truncate()
+                    .text_token(LABEL)
+                    .text_color(rgb(if active {
+                        palette.strong_foreground
+                    } else {
+                        palette.muted
+                    }))
+                    .child(name),
             )
             .child(
-                h_flex()
+                div()
                     .flex_none()
-                    .gap_1()
+                    .when(!active, |close| {
+                        close
+                            .opacity(0.)
+                            .group_hover(group, |close| close.opacity(1.))
+                    })
                     .child(
-                        Button::new(("toggle-connection", tab_id))
-                            .when(connected, |button| button.outline())
-                            .when(!connected, |button| button.primary())
-                            .small()
-                            .icon(if connected { Glyph::Cable } else { Glyph::Bolt })
-                            .label(if tab.connecting {
-                                "Connecting…"
-                            } else if tab.connected {
-                                "Disconnect"
-                            } else {
-                                "Connect"
-                            })
+                        Button::new(("close-tab", tab_id))
+                            .ghost()
+                            .with_size(px(TAB_CLOSE))
+                            .icon(IconName::Close)
+                            .tooltip("Close session")
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_connection(tab_id, cx);
-                            })),
-                    )
-                    .child(Self::toolbar_divider(palette))
-                    .child(
-                        Button::new(("refresh-ports", tab_id))
-                            .ghost()
-                            .with_size(px(TOOL_BUTTON))
-                            .icon(Glyph::Refresh)
-                            .tooltip("Rescan serial devices")
-                            .disabled(connected)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.refresh_ports(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("toggle-pause", tab_id))
-                            .ghost()
-                            .with_size(px(TOOL_BUTTON))
-                            .icon(if tab.paused {
-                                Glyph::Play
-                            } else {
-                                Glyph::Pause
-                            })
-                            .toggled(tab.paused)
-                            .tooltip(if tab.paused {
-                                "Resume receiving"
-                            } else {
-                                "Pause receiving"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_pause(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("clear-terminal", tab_id))
-                            .ghost()
-                            .with_size(px(TOOL_BUTTON))
-                            .icon(Glyph::Sweep)
-                            .tooltip("Clear the terminal")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_terminal(cx);
-                            })),
-                    )
-                    .child(Self::toolbar_divider(palette))
-                    .child(
-                        Button::new(("toggle-timestamps", tab_id))
-                            .ghost()
-                            .with_size(px(TOOL_BUTTON))
-                            .icon(Glyph::Clock)
-                            .toggled(tab.timestamps)
-                            .tooltip("Show timestamps")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_timestamps(cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("toggle-auto-scroll", tab_id))
-                            .ghost()
-                            .with_size(px(TOOL_BUTTON))
-                            .icon(Glyph::Scroll)
-                            .toggled(tab.auto_scroll)
-                            .tooltip("Follow new output")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_auto_scroll(cx);
+                                cx.stop_propagation();
+                                this.close_tab(tab_id, cx);
                             })),
                     ),
             )
             .into_any_element()
     }
 
-    fn toolbar_divider(palette: WorkbenchPalette) -> impl IntoElement {
+    /// The controls that act on the session in front of you, at the right
+    /// end of the strip: connect or disconnect, then pause and clear, then
+    /// the two switches that change how the log reads.
+    fn render_session_actions(
+        &mut self,
+        tab: &SerialTabSnapshot,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_id = tab.id;
+        let connected = tab.connected || tab.connecting;
+
+        h_flex()
+            .flex_none()
+            .gap_0p5()
+            .items_center()
+            .child(
+                Button::new(("toggle-connection", tab_id))
+                    .when(connected, |button| button.outline())
+                    .when(!connected, |button| button.primary())
+                    .small()
+                    .compact()
+                    .h(px(TAB_HEIGHT))
+                    .rounded(px(TAB_HEIGHT / 2.))
+                    .px_2p5()
+                    .icon(if connected { Glyph::Cable } else { Glyph::Bolt })
+                    .label(if tab.connecting {
+                        "Connecting…"
+                    } else if tab.connected {
+                        "Disconnect"
+                    } else {
+                        "Connect"
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_connection(tab_id, cx);
+                    })),
+            )
+            .child(Self::strip_divider(palette))
+            .child(
+                Button::new(("toggle-pause", tab_id))
+                    .ghost()
+                    .with_size(px(TAB_HEIGHT))
+                    .icon(if tab.paused {
+                        Glyph::Play
+                    } else {
+                        Glyph::Pause
+                    })
+                    .toggled(tab.paused)
+                    .tooltip(if tab.paused {
+                        "Resume receiving"
+                    } else {
+                        "Pause receiving"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_pause(cx);
+                    })),
+            )
+            .child(
+                Button::new(("clear-terminal", tab_id))
+                    .ghost()
+                    .with_size(px(TAB_HEIGHT))
+                    .icon(Glyph::Sweep)
+                    .tooltip("Clear the terminal")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_terminal(cx);
+                    })),
+            )
+            .child(Self::strip_divider(palette))
+            .child(
+                Button::new(("toggle-timestamps", tab_id))
+                    .ghost()
+                    .with_size(px(TAB_HEIGHT))
+                    .icon(Glyph::Clock)
+                    .toggled(tab.timestamps)
+                    .tooltip("Show timestamps")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_timestamps(cx);
+                    })),
+            )
+            .child(
+                Button::new(("toggle-auto-scroll", tab_id))
+                    .ghost()
+                    .with_size(px(TAB_HEIGHT))
+                    .icon(Glyph::Scroll)
+                    .toggled(tab.auto_scroll)
+                    .tooltip("Follow new output")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_auto_scroll(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn strip_divider(palette: WorkbenchPalette) -> impl IntoElement {
         div()
             .flex_none()
             .w(px(1.))
-            .h(px(16.))
-            .mx_1()
+            .h(px(14.))
+            .mx_1p5()
             .bg(rgb(palette.border))
     }
 
@@ -360,7 +464,6 @@ impl SerialWorkspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
-        let toolbar = self.render_toolbar(&tab, cx);
         let composer = self.render_composer(&tab, cx);
         let lines = tab
             .visible_lines()
@@ -373,7 +476,6 @@ impl SerialWorkspace {
             .min_h_0()
             .bg(rgb(palette.editor))
             .overflow_hidden()
-            .child(toolbar)
             .child(
                 v_flex()
                     .flex_1()

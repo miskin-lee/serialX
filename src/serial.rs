@@ -11,7 +11,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
 
-pub(crate) const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
+/// The rates the session dialog lists. Any other rate can be typed in; these
+/// are the ones a device is most likely to want.
+pub(crate) const BAUD_RATES: &[u32] = &[
+    1_200, 2_400, 4_800, 9_600, 19_200, 38_400, 57_600, 115_200, 230_400, 460_800, 921_600,
+    1_500_000, 2_000_000,
+];
+/// The rate a new session opens at: what nearly every module and board
+/// speaks out of the box.
+pub(crate) const DEFAULT_BAUD_RATE: u32 = 115_200;
+/// The list a saved session's `baud_index` pointed into before rates were
+/// stored as numbers. Kept so an older workspace file still opens its
+/// sessions at the rates they saved.
+const LEGACY_BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
 pub(crate) const DATA_BITS: &[&str] = &["5", "6", "7", "8"];
 pub(crate) const STOP_BITS: &[&str] = &["1", "2"];
 pub(crate) const PARITIES: &[&str] = &["None", "Odd", "Even"];
@@ -21,8 +33,6 @@ pub(crate) const FLOW_CONTROLS: &[&str] = &["None", "Software", "Hardware"];
 /// with, the way the subtitle picks its words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PortKind {
-    /// The built-in Loopback device.
-    Demo,
     Usb,
     Bluetooth,
     Pci,
@@ -39,10 +49,6 @@ pub(crate) struct PortItem {
 }
 
 impl PortItem {
-    pub(crate) fn is_demo(&self) -> bool {
-        self.kind == PortKind::Demo
-    }
-
     /// A port named by a saved session or a configured tab that is not attached now.
     pub(crate) fn unavailable(name: String, subtitle: &str) -> Self {
         Self {
@@ -101,9 +107,13 @@ pub(crate) enum SerialEvent {
     Closed,
 }
 
+/// The parameters a port is opened with. The baud rate is the number itself,
+/// since it can be any the device asks for; the frame is stored as indices
+/// into the fixed lists above.
 #[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(from = "StoredConfiguration")]
 pub(crate) struct SerialConfiguration {
-    pub(crate) baud_index: usize,
+    pub(crate) baud_rate: u32,
     pub(crate) data_bits_index: usize,
     pub(crate) stop_bits_index: usize,
     pub(crate) parity_index: usize,
@@ -113,7 +123,7 @@ pub(crate) struct SerialConfiguration {
 impl Default for SerialConfiguration {
     fn default() -> Self {
         Self {
-            baud_index: 4,
+            baud_rate: DEFAULT_BAUD_RATE,
             data_bits_index: 3,
             stop_bits_index: 0,
             parity_index: 0,
@@ -122,9 +132,86 @@ impl Default for SerialConfiguration {
     }
 }
 
+/// A configuration as the workspace file holds it, one release of history
+/// deep: a file written before custom rates carries `baud_index` instead of
+/// `baud_rate`, and is read back through the list that index pointed into.
+#[derive(Deserialize)]
+struct StoredConfiguration {
+    baud_rate: Option<u32>,
+    baud_index: Option<usize>,
+    data_bits_index: usize,
+    stop_bits_index: usize,
+    parity_index: usize,
+    flow_control_index: usize,
+}
+
+impl From<StoredConfiguration> for SerialConfiguration {
+    fn from(stored: StoredConfiguration) -> Self {
+        let baud_rate = stored
+            .baud_rate
+            .or_else(|| {
+                stored
+                    .baud_index
+                    .and_then(|index| LEGACY_BAUD_RATES.get(index).copied())
+            })
+            .unwrap_or(DEFAULT_BAUD_RATE);
+        Self {
+            baud_rate,
+            data_bits_index: stored.data_bits_index,
+            stop_bits_index: stored.stop_bits_index,
+            parity_index: stored.parity_index,
+            flow_control_index: stored.flow_control_index,
+        }
+    }
+}
+
+/// Why a typed baud rate cannot be used, worded for the dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BaudRateError {
+    Empty,
+    NotANumber,
+    Zero,
+    TooLarge,
+}
+
+impl BaudRateError {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "Enter a rate, or pick one from the list",
+            Self::NotANumber => "A rate is a whole number of bits per second",
+            Self::Zero => "A rate has to be greater than zero",
+            Self::TooLarge => "Too large for a serial port",
+        }
+    }
+}
+
+/// Reads a baud rate as typed: digits only, greater than zero, and no more
+/// than a port can be asked for. Surrounding whitespace is forgiven.
+pub(crate) fn parse_baud_rate(text: &str) -> Result<u32, BaudRateError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(BaudRateError::Empty);
+    }
+    if !text.chars().all(|character| character.is_ascii_digit()) {
+        return Err(BaudRateError::NotANumber);
+    }
+    match text.parse::<u32>() {
+        Ok(0) => Err(BaudRateError::Zero),
+        Ok(rate) => Ok(rate),
+        Err(_) => Err(BaudRateError::TooLarge),
+    }
+}
+
+/// Whether a rate is one of the standard ones the dialog lists.
+pub(crate) fn is_listed_baud_rate(rate: u32) -> bool {
+    BAUD_RATES.contains(&rate)
+}
+
 impl SerialConfiguration {
     pub(crate) fn sanitized(mut self) -> Self {
-        self.baud_index = self.baud_index.min(BAUD_RATES.len() - 1);
+        if self.baud_rate == 0 {
+            self.baud_rate = DEFAULT_BAUD_RATE;
+        }
         self.data_bits_index = self.data_bits_index.min(DATA_BITS.len() - 1);
         self.stop_bits_index = self.stop_bits_index.min(STOP_BITS.len() - 1);
         self.parity_index = self.parity_index.min(PARITIES.len() - 1);
@@ -133,7 +220,7 @@ impl SerialConfiguration {
     }
 
     pub(crate) fn baud_rate(self) -> u32 {
-        BAUD_RATES[self.baud_index]
+        self.baud_rate
     }
 
     fn data_bits(self) -> serialport::DataBits {
@@ -317,16 +404,6 @@ impl SerialTabSnapshot {
             })
     }
 
-    pub(crate) fn status_label(&self) -> &'static str {
-        if self.connecting {
-            "Connecting…"
-        } else if self.connected {
-            "Connected"
-        } else {
-            "Disconnected"
-        }
-    }
-
     pub(crate) fn selected_port(&self) -> &PortItem {
         &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
     }
@@ -353,12 +430,11 @@ impl From<&SerialTabState> for SerialTabSnapshot {
     }
 }
 
+/// The serial devices attached right now, in the order the system lists
+/// them. Empty when there are none: the dialog says so, and a tab keeps the
+/// port it was given.
 pub(crate) fn discover_ports() -> Vec<PortItem> {
-    let mut ports = vec![PortItem {
-        name: "Loopback".into(),
-        subtitle: "Built-in demo device".into(),
-        kind: PortKind::Demo,
-    }];
+    let mut ports = Vec::new();
 
     if let Ok(detected) = serialport::available_ports() {
         ports.extend(detected.into_iter().map(|port| {
@@ -452,19 +528,12 @@ pub(crate) fn parse_hex(value: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-pub(crate) fn demo_response(command: &str) -> Vec<u8> {
-    if command.trim().eq_ignore_ascii_case("AT+STATUS?") {
-        b"+STATUS:READY,RSSI=-48,TEMP=24.6\r\nOK\r\n".to_vec()
-    } else if command.trim().eq_ignore_ascii_case("AT+VERSION?") {
-        b"+VERSION:SerialX-Demo/1.4.2\r\nOK\r\n".to_vec()
-    } else {
-        format!("ECHO:{}\r\nOK\r\n", command.trim()).into_bytes()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::parse_hex;
+    use super::{
+        BAUD_RATES, BaudRateError, DEFAULT_BAUD_RATE, SerialConfiguration, is_listed_baud_rate,
+        parse_baud_rate, parse_hex,
+    };
 
     #[test]
     fn parses_hex_with_or_without_spaces() {
@@ -472,5 +541,65 @@ mod tests {
         assert_eq!(parse_hex("41540d0a"), Some(b"AT\r\n".to_vec()));
         assert_eq!(parse_hex("123"), None);
         assert_eq!(parse_hex("GG"), None);
+    }
+
+    #[test]
+    fn a_typed_rate_is_a_positive_whole_number() {
+        assert_eq!(parse_baud_rate("115200"), Ok(115_200));
+        assert_eq!(parse_baud_rate("  250000 "), Ok(250_000));
+        assert_eq!(parse_baud_rate(""), Err(BaudRateError::Empty));
+        assert_eq!(parse_baud_rate("   "), Err(BaudRateError::Empty));
+        assert_eq!(parse_baud_rate("115,200"), Err(BaudRateError::NotANumber));
+        assert_eq!(parse_baud_rate("-9600"), Err(BaudRateError::NotANumber));
+        assert_eq!(parse_baud_rate("0"), Err(BaudRateError::Zero));
+        assert_eq!(parse_baud_rate("99999999999"), Err(BaudRateError::TooLarge));
+    }
+
+    #[test]
+    fn the_list_holds_the_default_and_knows_its_own() {
+        assert!(BAUD_RATES.contains(&DEFAULT_BAUD_RATE));
+        assert!(is_listed_baud_rate(9_600));
+        assert!(!is_listed_baud_rate(250_000));
+        assert!(BAUD_RATES.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// A workspace written before custom rates stored the rate as an index
+    /// into a six-entry list; it reads back as the rate that index named.
+    #[test]
+    fn an_older_workspace_keeps_the_rate_its_index_named() {
+        let stored: SerialConfiguration = serde_json::from_str(
+            r#"{"baud_index":5,"data_bits_index":3,"stop_bits_index":0,"parity_index":0,"flow_control_index":0}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.baud_rate(), 230_400);
+
+        let out_of_range: SerialConfiguration = serde_json::from_str(
+            r#"{"baud_index":9,"data_bits_index":3,"stop_bits_index":0,"parity_index":0,"flow_control_index":0}"#,
+        )
+        .unwrap();
+        assert_eq!(out_of_range.baud_rate(), DEFAULT_BAUD_RATE);
+    }
+
+    #[test]
+    fn a_custom_rate_round_trips_through_the_workspace_file() {
+        let configuration = SerialConfiguration {
+            baud_rate: 250_000,
+            ..SerialConfiguration::default()
+        };
+        let json = serde_json::to_string(&configuration).unwrap();
+        assert!(json.contains("\"baud_rate\":250000"));
+        let restored: SerialConfiguration = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.baud_rate(), 250_000);
+        assert_eq!(restored.summary(), "250000 8N1");
+    }
+
+    #[test]
+    fn a_zero_rate_is_sanitized_to_the_default() {
+        let configuration = SerialConfiguration {
+            baud_rate: 0,
+            ..SerialConfiguration::default()
+        }
+        .sanitized();
+        assert_eq!(configuration.baud_rate(), DEFAULT_BAUD_RATE);
     }
 }

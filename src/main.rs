@@ -22,15 +22,13 @@ use std::{
 use app_icon::apply_application_icon;
 use app_menu::{bind_window_actions, configure_application_menus};
 use gpui_kit::component::{
-    Icon, IconName, Root, Sizable, TitleBar, WindowExt,
-    button::{Button, ButtonVariants},
+    Icon, IconName, Root, TitleBar, WindowExt,
     dialog::DialogButtonProps,
     h_flex,
     input::{InputEvent, InputState},
     menu::AppMenuBar,
     notification::Notification,
     resizable::{ResizableState, h_resizable, resizable_panel},
-    tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::*;
@@ -135,11 +133,7 @@ impl SerialWorkspace {
     }
 
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
-        let send_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Enter a command…")
-                .default_value("AT+STATUS?")
-        });
+        let send_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter a command…"));
         let send_subscription = cx.subscribe_in(
             &send_input,
             window,
@@ -256,17 +250,26 @@ impl SerialWorkspace {
         if tab.connected || tab.connecting {
             return;
         }
-        let current = tab.selected_port().name.clone();
-        tab.ports = discover_ports();
-        tab.selected_port = tab
-            .ports
+        // The tab stays bound to its port: one that the scan no longer finds
+        // is kept on the list as unavailable rather than silently swapped.
+        let current = tab.selected_port().clone();
+        let mut ports = discover_ports();
+        let found = ports.len();
+        if !ports.iter().any(|port| port.name == current.name) {
+            ports.push(PortItem::unavailable(
+                current.name.clone(),
+                "Configured device · currently unavailable",
+            ));
+        }
+        tab.selected_port = ports
             .iter()
-            .position(|port| port.name == current)
+            .position(|port| port.name == current.name)
             .unwrap_or(0);
+        tab.ports = ports;
         tab.push_line(
             LineKind::System,
             Vec::new(),
-            Some(format!("Scan complete · {} devices found", tab.ports.len())),
+            Some(format!("Scan complete · {found} devices found")),
         );
         cx.notify();
     }
@@ -289,20 +292,6 @@ impl SerialWorkspace {
         }
 
         let selected = tab.selected_port().clone();
-        if selected.is_demo() {
-            tab.connected = true;
-            tab.push_line(
-                LineKind::System,
-                Vec::new(),
-                Some(format!(
-                    "Loopback session ready · {}",
-                    tab.configuration.summary()
-                )),
-            );
-            cx.notify();
-            return;
-        }
-
         let (command_tx, command_rx) = mpsc::channel();
         tab.command_tx = Some(command_tx);
         tab.connecting = true;
@@ -350,9 +339,7 @@ impl SerialWorkspace {
         bytes.extend_from_slice(b"\r\n");
         tab.push_line(LineKind::Tx, bytes.clone(), None);
 
-        if tab.selected_port().is_demo() {
-            tab.push_line(LineKind::Rx, demo_response(&value), None);
-        } else if let Some(tx) = &tab.command_tx {
+        if let Some(tx) = &tab.command_tx {
             let _ = tx.send(SerialCommand::Write(bytes));
         }
 
@@ -644,61 +631,7 @@ impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
-
-        let mut tab_items = Vec::with_capacity(self.tabs.len());
-        for tab in &self.tabs {
-            let tab_id = tab.id;
-            let dot_color = if tab.connected {
-                palette.success
-            } else if tab.connecting {
-                palette.warning
-            } else {
-                palette.faint
-            };
-            tab_items.push(
-                Tab::new()
-                    .label(tab.selected_port().name.clone())
-                    .prefix(Self::status_dot(6., dot_color))
-                    .suffix(
-                        Button::new(("close-tab", tab_id))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(tab_id, cx);
-                            })),
-                    ),
-            );
-        }
-
-        let workspace = cx.weak_entity();
-        let tab_bar = (!self.tabs.is_empty()).then(|| {
-            TabBar::new("serial-tabs")
-                .children(tab_items)
-                .selected_index(self.active_tab)
-                .menu(true)
-                .suffix(
-                    Button::new("new-tab")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .tooltip("New serial session")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_new_serial_tab_dialog(window, cx);
-                        })),
-                )
-                .on_click(move |index, _, cx| {
-                    let index = *index;
-                    let _ = workspace.update(cx, |workspace, cx| {
-                        if index < workspace.tabs.len() {
-                            workspace.active_tab = index;
-                            cx.notify();
-                        }
-                    });
-                })
-        });
-
+        let tab_strip = self.render_tab_strip(active_snapshot.as_ref(), cx);
         let title_bar = self.render_title_bar(active_snapshot.as_ref(), cx);
         let content = match active_snapshot.clone() {
             Some(tab) => self.render_active_tab(tab, cx),
@@ -718,7 +651,7 @@ impl Render for SerialWorkspace {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .children(tab_bar)
+            .children(tab_strip)
             .child(content);
 
         // Expanded, the panel's left edge is a drag handle; collapsed, the

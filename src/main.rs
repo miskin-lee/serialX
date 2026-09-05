@@ -5,6 +5,7 @@ mod app_menu;
 mod configuration;
 mod controls;
 mod filter;
+mod highlight;
 mod icons;
 mod presets;
 mod serial;
@@ -587,6 +588,13 @@ impl SerialWorkspace {
     fn toggle_timestamps(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.timestamps = !tab.timestamps;
+            cx.notify();
+        }
+    }
+
+    fn toggle_highlight(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.highlight = !tab.highlight;
             cx.notify();
         }
     }

@@ -257,6 +257,9 @@ pub(crate) struct SerialTabState {
     pub(crate) paused: bool,
     pub(crate) hex_mode: bool,
     pub(crate) timestamps: bool,
+    /// Whether plain output is coloured by what it says — levels, times,
+    /// addresses — on top of any colour the device sent itself.
+    pub(crate) highlight: bool,
     pub(crate) auto_scroll: bool,
     pub(crate) terminal: Terminal,
     pub(crate) send_input: Entity<InputState>,
@@ -293,6 +296,7 @@ impl SerialTabState {
             paused: false,
             hex_mode: false,
             timestamps: true,
+            highlight: true,
             auto_scroll: true,
             terminal: {
                 let mut terminal = Terminal::default();

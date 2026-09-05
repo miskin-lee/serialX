@@ -517,7 +517,7 @@ impl SerialWorkspace {
                 let Some(content) = paint
                     .read(cx)
                     .tab(tab_id)
-                    .map(|tab| tab.terminal.render(&terminal_palette))
+                    .map(|tab| tab.terminal.render(&terminal_palette, tab.highlight))
                 else {
                     return;
                 };

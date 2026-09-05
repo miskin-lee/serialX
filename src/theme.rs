@@ -346,6 +346,9 @@ impl InterfaceTheme {
 /// device's colours and the chrome's agree.
 #[derive(Clone, Copy)]
 pub(crate) struct TerminalPalette {
+    /// Which theme this is, for the colours that are picked per role rather
+    /// than named by the device: see [`crate::highlight::Role::style`].
+    pub(crate) theme: InterfaceTheme,
     pub(crate) background: u32,
     pub(crate) foreground: u32,
     pub(crate) cursor: u32,
@@ -354,6 +357,7 @@ pub(crate) struct TerminalPalette {
 
 impl TerminalPalette {
     pub(crate) const DARK: Self = Self {
+        theme: InterfaceTheme::Dark,
         background: 0x0b0d11,
         foreground: 0xb2b8c4,
         cursor: 0x8b87ff,
@@ -366,6 +370,7 @@ impl TerminalPalette {
     /// On white, "bright" cannot mean lighter or it would vanish; the bright
     /// eight are the plain ones lifted a little instead.
     pub(crate) const LIGHT: Self = Self {
+        theme: InterfaceTheme::Light,
         background: 0xffffff,
         foreground: 0x3b3b42,
         cursor: 0x5b57d8,

@@ -18,6 +18,14 @@
 //! moves the cursor about instead of printing lines — a full-screen
 //! program — makes the times approximate, which is the most any line-based
 //! stamp can be for it.
+//!
+//! Colour is laid on at the same moment. Text the device left in the
+//! default colour is read for what it says — a level, a time, an address —
+//! and drawn in that role's colour (see [`crate::highlight`]) once its line
+//! is finished; the line the cursor is still on is left plain, so nothing
+//! shifts under a hand that is typing. Text the device coloured itself is
+//! drawn as it asked. The grid is never touched, so the filter, the copy
+//! and the scrollback all see the bytes as sent.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
@@ -30,7 +38,7 @@ use alacritty_terminal::{
 };
 use gpui_kit::Keystroke;
 
-use crate::theme::TerminalPalette;
+use crate::{highlight::Highlighter, theme::TerminalPalette};
 
 /// Lines kept above the screen to scroll back through.
 const SCROLLBACK: usize = 10_000;
@@ -226,7 +234,11 @@ impl Terminal {
     }
 
     /// The screen as it is to be drawn, colours resolved against the theme.
-    pub(crate) fn render(&self, palette: &TerminalPalette) -> RenderContent {
+    /// With `highlight`, text the device left in the default colour takes
+    /// the colour of what it says once its line is finished; the line the
+    /// cursor is still on stays plain, and what the device coloured itself
+    /// is kept either way.
+    pub(crate) fn render(&self, palette: &TerminalPalette, highlight: bool) -> RenderContent {
         let grid = self.term.grid();
         let content = self.term.renderable_content();
         let offset = content.display_offset as i32;
@@ -286,16 +298,26 @@ impl Terminal {
             })
             .collect();
 
+        // Every cell first, unstyled: a row's text has to be whole before
+        // the parts of it worth a colour can be found.
+        struct Pending {
+            column: usize,
+            width: usize,
+            text: String,
+            flags: Flags,
+            fg: Color,
+            bg: Color,
+        }
+        let mut pending: Vec<Vec<Pending>> = (0..lines).map(|_| Vec::new()).collect();
         for cell in content.display_iter {
             let flags = cell.flags;
             if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
-            let Some(row) = rows.get_mut((cell.point.line.0 + offset) as usize) else {
+            let index = (cell.point.line.0 + offset) as usize;
+            let (Some(row), Some(cells)) = (rows.get_mut(index), pending.get_mut(index)) else {
                 continue;
             };
-            let column = cell.point.column.0;
-            let width = if flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
             let mut text = String::new();
             if flags.contains(Flags::HIDDEN) {
                 text.push(' ');
@@ -306,42 +328,97 @@ impl Terminal {
                 }
             }
             row.text.push(cell.c);
+            cells.push(Pending {
+                column: cell.point.column.0,
+                width: if flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                },
+                text,
+                flags,
+                fg: cell.fg,
+                bg: cell.bg,
+            });
+        }
 
-            let (mut fg, mut bg) = (cell.fg, cell.bg);
-            if flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            let mut foreground = resolve(fg, content.colors, palette);
-            if flags.contains(Flags::DIM) {
-                foreground = blend(foreground, palette.background, 0.5);
-            }
-            let background = resolve(bg, content.colors, palette);
-            let background = (background != palette.background).then_some(background);
-            let style = RunStyle {
-                foreground,
-                background,
-                bold: flags.contains(Flags::BOLD),
-                italic: flags.contains(Flags::ITALIC),
-                underline: flags.intersects(
-                    Flags::UNDERLINE
-                        | Flags::DOUBLE_UNDERLINE
-                        | Flags::UNDERCURL
-                        | Flags::DOTTED_UNDERLINE
-                        | Flags::DASHED_UNDERLINE,
-                ),
-                strikeout: flags.contains(Flags::STRIKEOUT),
-            };
-            match row.runs.last_mut() {
-                Some(run) if run.column + run.width == column && run.style == style => {
-                    run.text.push_str(&text);
-                    run.width += width;
+        let highlighter = highlight.then(Highlighter::shared);
+        let plain = (
+            Color::Named(NamedColor::Foreground),
+            Color::Named(NamedColor::Background),
+        );
+        // The line the cursor is on is still being written — by the device,
+        // or by whoever is typing at its prompt — and stays in plain ink
+        // until it is done: colours shifting under the caret as each
+        // character lands are a distraction, not a reading. The whole
+        // logical line, wrapped rows included, waits together.
+        let mut unfinished = cursor_line..cursor_line + 1;
+        while is_continuation(Line(unfinished.start)) {
+            unfinished.start -= 1;
+        }
+        while unfinished.end < lines as i32 && is_continuation(Line(unfinished.end)) {
+            unfinished.end += 1;
+        }
+        for (index, (row, cells)) in rows.iter_mut().zip(pending).enumerate() {
+            // One character of the row's text per cell, so a role found at
+            // a position in the text belongs to the cell at that position.
+            let roles = highlighter
+                .filter(|_| !unfinished.contains(&(index as i32 - offset)))
+                .map(|highlighter| highlighter.roles(&row.text));
+            for (index, cell) in cells.into_iter().enumerate() {
+                let flags = cell.flags;
+                let (mut fg, mut bg) = (cell.fg, cell.bg);
+                if flags.contains(Flags::INVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
                 }
-                _ => row.runs.push(RenderRun {
-                    column,
-                    width,
-                    text,
-                    style,
-                }),
+                let background = resolve(bg, content.colors, palette);
+                let mut style = RunStyle {
+                    foreground: resolve(fg, content.colors, palette),
+                    background: (background != palette.background).then_some(background),
+                    bold: flags.contains(Flags::BOLD),
+                    italic: flags.contains(Flags::ITALIC),
+                    underline: flags.intersects(
+                        Flags::UNDERLINE
+                            | Flags::DOUBLE_UNDERLINE
+                            | Flags::UNDERCURL
+                            | Flags::DOTTED_UNDERLINE
+                            | Flags::DASHED_UNDERLINE,
+                    ),
+                    strikeout: flags.contains(Flags::STRIKEOUT),
+                };
+                // Only ink the device left plain takes a role's colour: what
+                // it coloured itself, it meant.
+                let role = roles
+                    .as_ref()
+                    .and_then(|roles| roles.get(index).copied().flatten());
+                if let Some(role) = role
+                    && (cell.fg, cell.bg) == plain
+                    && !flags.contains(Flags::INVERSE)
+                {
+                    let ink = role.style(palette.theme);
+                    style.foreground = ink.color;
+                    if let Some(ground) = ink.background {
+                        style.background = Some(ground);
+                    }
+                    style.bold |= ink.bold;
+                    style.italic |= ink.italic;
+                    style.underline |= ink.underline;
+                }
+                if flags.contains(Flags::DIM) {
+                    style.foreground = blend(style.foreground, palette.background, 0.5);
+                }
+                match row.runs.last_mut() {
+                    Some(run) if run.column + run.width == cell.column && run.style == style => {
+                        run.text.push_str(&cell.text);
+                        run.width += cell.width;
+                    }
+                    _ => row.runs.push(RenderRun {
+                        column: cell.column,
+                        width: cell.width,
+                        text: cell.text,
+                        style,
+                    }),
+                }
             }
         }
         for row in &mut rows {
@@ -599,8 +676,8 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
 
 #[cfg(test)]
 mod tests {
-    use super::{CaretShape, GridSize, Terminal, key_bytes};
-    use crate::theme::TerminalPalette;
+    use super::{CaretShape, GridSize, RenderContent, RenderRun, Terminal, key_bytes};
+    use crate::{highlight::Role, theme::TerminalPalette};
     use alacritty_terminal::term::TermMode;
     use gpui_kit::Keystroke;
 
@@ -610,7 +687,7 @@ mod tests {
 
     fn rows(terminal: &Terminal) -> Vec<(Option<String>, String)> {
         terminal
-            .render(&TerminalPalette::DARK)
+            .render(&TerminalPalette::DARK, true)
             .rows
             .into_iter()
             .map(|row| (row.stamp, row.text))
@@ -702,7 +779,7 @@ mod tests {
         terminal.receive(b"\x1b[1;32mroot@board\x1b[0m:~# lss\x08 -la\r\n", "1");
         terminal.receive(b"10%\r50%\r100%\r\n", "2");
         terminal.receive("温度 25°C".as_bytes(), "3");
-        let content = terminal.render(&TerminalPalette::DARK);
+        let content = terminal.render(&TerminalPalette::DARK, false);
         assert_eq!(content.rows[0].text, "root@board:~# ls -la");
         assert_eq!(content.rows[1].text, "100%");
         assert_eq!(content.rows[2].text, "温度 25°C");
@@ -718,6 +795,118 @@ mod tests {
         assert_eq!(temperature.column, 0);
         assert_eq!(temperature.text.trim_end(), "温度 25°C");
         assert!(temperature.width >= 9);
+    }
+
+    /// The run on `line` whose text is exactly `text`.
+    fn run<'a>(content: &'a RenderContent, line: usize, text: &str) -> &'a RenderRun {
+        content.rows[line]
+            .runs
+            .iter()
+            .find(|run| run.text == text)
+            .unwrap_or_else(|| panic!("a run {text:?} on row {line}"))
+    }
+
+    #[test]
+    fn plain_text_is_coloured_by_what_it_says() {
+        let mut terminal = terminal(60, 3);
+        terminal.receive(b"E (1234) wifi: lost 192.168.1.20 after 350ms\r\n", "1");
+        terminal.receive(b"GET /index.html\r\n", "2");
+        let palette = TerminalPalette::DARK;
+        let content = terminal.render(&palette, true);
+        let colour = |role: Role| role.style(palette.theme).color;
+        // A pill: the page's ink on a ground of the role's own.
+        let method = run(&content, 1, "GET");
+        assert_eq!(method.style.foreground, palette.background);
+        assert_eq!(method.style.background, Some(0x5be49b));
+        let level = run(&content, 0, "E");
+        assert_eq!(level.style.foreground, colour(Role::Error));
+        assert!(level.style.bold);
+        assert_eq!(
+            run(&content, 0, "1234").style.foreground,
+            colour(Role::Uptime)
+        );
+        assert_eq!(run(&content, 0, "wifi").style.foreground, colour(Role::Tag));
+        assert_eq!(
+            run(&content, 0, "lost").style.foreground,
+            colour(Role::Warning)
+        );
+        assert_eq!(
+            run(&content, 0, "192").style.foreground,
+            colour(Role::IpDigit)
+        );
+        let unit = run(&content, 0, "ms");
+        assert_eq!(unit.style.foreground, colour(Role::DurationUnit));
+        assert!(unit.style.italic);
+        // Words with no role keep the terminal's ink, and the text the
+        // filter reads is the text the device sent.
+        assert_eq!(
+            run(&content, 0, " after ").style.foreground,
+            palette.foreground
+        );
+        assert_eq!(
+            content.rows[0].text,
+            "E (1234) wifi: lost 192.168.1.20 after 350ms"
+        );
+        // The light theme picks the same roles in its own colours.
+        let light = terminal.render(&TerminalPalette::LIGHT, true);
+        assert_eq!(
+            run(&light, 0, "E").style.foreground,
+            Role::Error.style(TerminalPalette::LIGHT.theme).color
+        );
+        assert_ne!(run(&light, 0, "E").style.foreground, level.style.foreground);
+    }
+
+    #[test]
+    fn a_devices_own_colours_are_kept() {
+        let mut terminal = terminal(40, 2);
+        terminal.receive(b"\x1b[32mERROR\x1b[0m ERROR \x1b[7mERROR\x1b[0m\r\n", "1");
+        let palette = TerminalPalette::DARK;
+        let content = terminal.render(&palette, true);
+        // Blank stretches are not shaped, so the three words are the runs.
+        let runs = &content.rows[0].runs;
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].text, "ERROR");
+        assert_eq!(runs[0].style.foreground, palette.ansi[2]);
+        assert_eq!(runs[1].text, "ERROR");
+        assert_eq!(
+            runs[1].style.foreground,
+            Role::Error.style(palette.theme).color
+        );
+        // Inverse video is the device's colouring too.
+        assert_eq!(runs[2].text, "ERROR");
+        assert_eq!(runs[2].style.foreground, palette.background);
+        assert_eq!(runs[2].style.background, Some(palette.foreground));
+    }
+
+    #[test]
+    fn the_line_being_written_waits_for_its_colour() {
+        let mut terminal = terminal(10, 4);
+        let palette = TerminalPalette::DARK;
+        terminal.receive(b"ERROR one\r\n", "1");
+        // Seventeen characters wrap onto a second row; the cursor is on it.
+        terminal.receive(b"ERROR 1234 ERROR", "2");
+        let content = terminal.render(&palette, true);
+        assert_eq!(run(&content, 0, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
+        for row in 1..3 {
+            assert_eq!(content.rows[row].runs.len(), 1, "row {row} is one plain run");
+            assert_eq!(content.rows[row].runs[0].style.foreground, palette.foreground);
+        }
+        // Ending the line finishes it, and the colour arrives.
+        terminal.receive(b"\r\n", "3");
+        let content = terminal.render(&palette, true);
+        assert_eq!(run(&content, 1, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
+        assert_eq!(run(&content, 2, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
+    }
+
+    #[test]
+    fn colouring_can_be_switched_off() {
+        let mut terminal = terminal(40, 2);
+        terminal.receive(b"ERROR at 10:00:00\r\n", "1");
+        let palette = TerminalPalette::DARK;
+        let content = terminal.render(&palette, false);
+        assert_eq!(content.rows[0].runs.len(), 1);
+        assert_eq!(content.rows[0].runs[0].style.foreground, palette.foreground);
+        assert!(terminal.render(&palette, true).rows[0].runs.len() > 1);
     }
 
     #[test]

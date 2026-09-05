@@ -24,6 +24,7 @@ actions!(
         ClearTerminal,
         ToggleHex,
         ToggleTimestamps,
+        ToggleHighlight,
         ToggleAutoScroll,
         ToggleSidePanel,
         PreviousTab,
@@ -113,6 +114,7 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Toggle HEX Display", ToggleHex),
             MenuItem::action("Toggle Timestamps", ToggleTimestamps),
+            MenuItem::action("Toggle Semantic Colours", ToggleHighlight),
             MenuItem::action("Toggle Auto-scroll", ToggleAutoScroll),
             MenuItem::separator(),
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
@@ -210,6 +212,11 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &ToggleTimestamps, cx| {
         let _ = view.update(cx, |view, cx| view.toggle_timestamps(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleHighlight, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_highlight(cx));
     });
 
     let view = workspace.downgrade();

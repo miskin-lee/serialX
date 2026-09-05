@@ -1,6 +1,17 @@
-//! The title bar, laid out the way VS Code lays out its own: tab navigation
-//! and the output filter in the centre of the window, the side panel switch
-//! at the right, and the menu bar at the left on the platforms that draw one.
+//! The title bar: the workbench's menu bar, laid out in three groups.
+//!
+//! Left, the *context*: a pill naming the session in front of you, its port
+//! parameters and its connection state, which drops down into a switcher for
+//! every open and saved session. Centre, the *command centre*: tab arrows and
+//! the output filter, sized the way VS Code sizes its own. Right, one switch:
+//! the side panel. Everything else the bar could offer already lives in the
+//! platform's menu bar and its shortcuts, and a second copy would only be a
+//! second thing to look at.
+//!
+//! The bar is a little taller than the component default so its pills have
+//! room to be pills, and it is painted with a faint top light rather than a
+//! flat fill: the one gradient in the workbench, reserved for the edge that
+//! holds the window up.
 //!
 //! The centre group is centred on the *window*, not on the strip left over
 //! after the traffic lights: on macOS the right column starts with as much
@@ -12,30 +23,52 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::Input,
+    menu::{DropdownMenu, PopupMenuItem},
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_menu::{NextTab, PreviousTab, ToggleSidePanel};
-use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, tint};
+use crate::app_icon::application_icon_image;
+use crate::app_menu::{NewSerialTab, NextTab, PreviousTab, ToggleSidePanel};
+use crate::controls::tag;
+use crate::icons::{Glyph, port_glyph};
+use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, mix, tint};
 use crate::{SerialTabSnapshot, SerialWorkspace};
 
-/// Height of the filter box. VS Code's command centre is 22; two more keep
-/// the 12px label clear of its border.
-const FILTER_HEIGHT: f32 = 24.;
-/// Square size of a title bar icon button.
-const TITLE_BUTTON: f32 = 26.;
+/// Height of the bar. Four more than the component default: a 26px pill needs
+/// six of air above and below it to read as floating rather than wedged.
+pub(crate) const TITLE_BAR_HEIGHT: f32 = 38.;
+/// Diameter of a macOS traffic light, for centring them on the taller bar.
+const TRAFFIC_LIGHT_DIAMETER: f32 = 12.;
+/// Height of every pill and icon button in the bar.
+const CONTROL_HEIGHT: f32 = 26.;
+/// Height of the filter box. Two more than the pills either side of it, so the
+/// thing you type into is the biggest thing in the bar.
+const FILTER_HEIGHT: f32 = 28.;
+/// Square size of the tab arrows, a step smaller than the icon buttons.
+const NAV_BUTTON: f32 = 24.;
 /// The centre group's share of the bar, as VS Code sizes its command centre,
 /// clamped so it neither swallows a wide window nor collapses on a narrow one.
-const CENTER_FRACTION: f32 = 0.42;
-const CENTER_MAX_WIDTH: f32 = 660.;
-const CENTER_MIN_WIDTH: f32 = 300.;
+const CENTER_FRACTION: f32 = 0.38;
+const CENTER_MAX_WIDTH: f32 = 600.;
+const CENTER_MIN_WIDTH: f32 = 280.;
 /// What `TitleBar` pads on the left for the macOS traffic lights.
 const TRAFFIC_LIGHT_INSET: f32 = 80.;
 /// Width of the application menu bar on the platforms that draw it in the bar.
-const MENU_BAR_WIDTH: f32 = 310.;
+const MENU_BAR_WIDTH: f32 = 300.;
+/// The widest the session name in the context pill may grow before it is cut.
+const CONTEXT_NAME_MAX_WIDTH: f32 = 220.;
 /// Placeholder in the filter box, echoed by the inert box shown without a tab.
 pub(crate) const FILTER_PLACEHOLDER: &str = "Filter output";
+
+/// Where the macOS traffic lights sit so their centre line is the bar's.
+pub(crate) fn traffic_light_position() -> Point<Pixels> {
+    point(
+        px(12.),
+        px(((TITLE_BAR_HEIGHT - TRAFFIC_LIGHT_DIAMETER) / 2.).round()),
+    )
+}
 
 impl SerialWorkspace {
     pub(crate) fn render_title_bar(
@@ -50,21 +83,95 @@ impl SerialWorkspace {
             Some(tab) => self.render_filter_box(tab, cx),
             None => Self::render_idle_filter_box(palette),
         };
+        let context = self.render_context_pill(active, cx);
+
         // Empty on macOS, where the traffic lights are all the left end holds.
-        let menu_column = h_flex().flex_1().min_w_0().h_full().items_center().when(
-            cfg!(not(target_os = "macos")),
-            |column| {
+        let left_column = h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .gap_2()
+            .overflow_hidden()
+            .when(cfg!(not(target_os = "macos")), |column| {
+                // The menus never give way; the context pill is what gets
+                // clipped when the window is narrow.
                 column.min_w(px(MENU_BAR_WIDTH)).child(
                     div()
+                        .flex_none()
                         .w(px(MENU_BAR_WIDTH))
-                        .h_8()
+                        .h(px(CONTROL_HEIGHT))
                         .child(self.menu_bar.clone()),
                 )
-            },
-        );
+            })
+            .child(context);
+
+        let center_column = h_flex()
+            .flex_none()
+            .w(relative(CENTER_FRACTION))
+            .max_w(px(CENTER_MAX_WIDTH))
+            .min_w(px(CENTER_MIN_WIDTH))
+            .items_center()
+            .gap_0p5()
+            .child(
+                Button::new("previous-tab")
+                    .ghost()
+                    .with_size(px(NAV_BUTTON))
+                    .icon(IconName::ArrowLeft)
+                    .disabled(!has_previous)
+                    .tooltip_with_action("Previous session", &PreviousTab, None)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_previous_tab(cx);
+                    })),
+            )
+            .child(
+                Button::new("next-tab")
+                    .ghost()
+                    .with_size(px(NAV_BUTTON))
+                    .icon(IconName::ArrowRight)
+                    .disabled(!has_next)
+                    .tooltip_with_action("Next session", &NextTab, None)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.select_next_tab(cx);
+                    })),
+            )
+            .child(div().flex_1().min_w_0().ml_1p5().child(filter_box));
+
+        let right_column = h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_center()
+            .justify_end()
+            .gap_1()
+            .when(cfg!(target_os = "macos"), |column| {
+                column.flex_basis(px(TRAFFIC_LIGHT_INSET))
+            })
+            .child(
+                Button::new("title-side-panel")
+                    .ghost()
+                    .with_size(px(CONTROL_HEIGHT))
+                    .icon(if self.side_panel_collapsed {
+                        IconName::PanelRightOpen
+                    } else {
+                        IconName::PanelRightClose
+                    })
+                    .tooltip_with_action("Show / hide the side panel", &ToggleSidePanel, None)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_side_panel(cx);
+                    })),
+            );
+
+        // A faint light along the top edge, fading into the bar's own colour.
+        let top_light = mix(palette.title_bar, palette.strong_foreground, 0.035);
 
         TitleBar::new()
-            .bg(rgb(palette.title_bar))
+            .h(px(TITLE_BAR_HEIGHT))
+            .bg(linear_gradient(
+                180.,
+                linear_color_stop(rgb(top_light), 0.),
+                linear_color_stop(rgb(palette.title_bar), 1.),
+            ))
             .border_b_1()
             .border_color(rgb(palette.border))
             .child(
@@ -73,70 +180,163 @@ impl SerialWorkspace {
                     .h_full()
                     .items_center()
                     .pr_2()
-                    .child(menu_column)
+                    .gap_2()
+                    .child(left_column)
+                    .child(center_column)
+                    .child(right_column),
+            )
+            .into_any_element()
+    }
+
+    /// The accent-tinted pill a switched-on control wears: a wash of the
+    /// accent rather than a solid fill, so it reads as on without shouting.
+    fn accent_pill(palette: WorkbenchPalette, cx: &App) -> ButtonCustomVariant {
+        ButtonCustomVariant::new(cx)
+            .color(tint(palette.accent, 0.14).into())
+            .foreground(rgb(palette.accent).into())
+            .hover(tint(palette.accent, 0.22).into())
+            .active(tint(palette.accent, 0.3).into())
+    }
+
+    /// The neutral pill the context switcher wears: a breath lighter than the
+    /// bar, so it reads as an object on it rather than a hole in it.
+    fn neutral_pill(palette: WorkbenchPalette, cx: &App) -> ButtonCustomVariant {
+        ButtonCustomVariant::new(cx)
+            .color(tint(palette.strong_foreground, 0.07).into())
+            .foreground(rgb(palette.foreground).into())
+            .hover(tint(palette.strong_foreground, 0.11).into())
+            .active(tint(palette.strong_foreground, 0.15).into())
+    }
+
+    /// The left pill: which session this is, and a way to any other.
+    ///
+    /// With a tab open it names the port, its parameters and its state. With
+    /// none it carries the application mark, so the bar is never anonymous.
+    fn render_context_pill(
+        &mut self,
+        active: Option<&SerialTabSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let caret = Icon::new(IconName::ChevronDown)
+            .size(px(11.))
+            .text_color(rgb(palette.faint));
+
+        let content = match active {
+            Some(tab) => {
+                let port = tab.selected_port().clone();
+                let (glyph, hue) = port_glyph(port.kind, palette);
+                let status = Self::connection_color(tab, palette);
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(Icon::new(glyph).size(px(13.)).text_color(rgb(hue)))
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .w(relative(CENTER_FRACTION))
-                            .max_w(px(CENTER_MAX_WIDTH))
-                            .min_w(px(CENTER_MIN_WIDTH))
-                            .items_center()
-                            .gap_0p5()
-                            .child(
-                                Button::new("previous-tab")
-                                    .ghost()
-                                    .with_size(px(TITLE_BUTTON))
-                                    .icon(IconName::ArrowLeft)
-                                    .disabled(!has_previous)
-                                    .tooltip_with_action("Previous tab", &PreviousTab, None)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.select_previous_tab(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("next-tab")
-                                    .ghost()
-                                    .with_size(px(TITLE_BUTTON))
-                                    .icon(IconName::ArrowRight)
-                                    .disabled(!has_next)
-                                    .tooltip_with_action("Next tab", &NextTab, None)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.select_next_tab(cx);
-                                    })),
-                            )
-                            .child(div().flex_1().min_w_0().ml_1p5().child(filter_box)),
+                        div()
+                            .min_w_0()
+                            .max_w(px(CONTEXT_NAME_MAX_WIDTH))
+                            .truncate()
+                            .text_token(LABEL)
+                            .text_color(rgb(palette.strong_foreground))
+                            .child(port.name),
                     )
                     .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .items_center()
-                            .justify_end()
-                            .gap_0p5()
-                            .when(cfg!(target_os = "macos"), |column| {
-                                column.flex_basis(px(TRAFFIC_LIGHT_INSET))
-                            })
-                            .child(
-                                Button::new("title-side-panel")
-                                    .ghost()
-                                    .with_size(px(TITLE_BUTTON))
-                                    .icon(if self.side_panel_collapsed {
-                                        IconName::PanelRightOpen
-                                    } else {
-                                        IconName::PanelRightClose
-                                    })
-                                    .tooltip_with_action(
-                                        "Show / hide the side panel",
-                                        &ToggleSidePanel,
-                                        None,
-                                    )
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_side_panel(cx);
-                                    })),
-                            ),
-                    ),
-            )
+                        div()
+                            .flex_none()
+                            .ui_mono_token(MONO_SMALL)
+                            .text_color(rgb(palette.muted))
+                            .child(tab.configuration.summary()),
+                    )
+                    .child(Self::status_dot(6., status))
+                    .child(caret)
+                    .into_any_element()
+            }
+            None => h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(img(application_icon_image()).size(px(15.)))
+                .child(
+                    div()
+                        .text_token(LABEL)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(palette.strong_foreground))
+                        .child("serialX"),
+                )
+                .child(caret)
+                .into_any_element(),
+        };
+
+        let open_sessions = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                (
+                    index,
+                    tab.selected_port().name.clone(),
+                    tab.configuration.summary(),
+                    index == self.active_tab,
+                )
+            })
+            .collect::<Vec<_>>();
+        let saved_sessions = self
+            .presets
+            .sessions
+            .iter()
+            .map(|saved| (saved.id, saved.label.clone()))
+            .collect::<Vec<_>>();
+        let workspace = cx.weak_entity();
+
+        Button::new("title-context")
+            .custom(Self::neutral_pill(palette, cx))
+            .small()
+            .compact()
+            .rounded(px(CONTROL_HEIGHT / 2.))
+            .h(px(CONTROL_HEIGHT))
+            .px_2p5()
+            .tooltip("Switch session")
+            .child(content)
+            .dropdown_menu(move |mut menu, _, _| {
+                if !open_sessions.is_empty() {
+                    menu = menu.label("Open sessions");
+                    for (index, name, summary, is_active) in &open_sessions {
+                        let workspace = workspace.clone();
+                        let index = *index;
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("{name}  ·  {summary}"))
+                                .checked(*is_active)
+                                .on_click(move |_, _, cx| {
+                                    let _ = workspace.update(cx, |this, cx| {
+                                        if index < this.tabs.len() {
+                                            this.active_tab = index;
+                                            cx.notify();
+                                        }
+                                    });
+                                }),
+                        );
+                    }
+                    menu = menu.separator();
+                }
+                if !saved_sessions.is_empty() {
+                    menu = menu.label("Saved sessions");
+                    for (saved_id, label) in &saved_sessions {
+                        let workspace = workspace.clone();
+                        let saved_id = *saved_id;
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .icon(Glyph::Bookmark)
+                                .on_click(move |_, window, cx| {
+                                    let _ = workspace.update(cx, |this, cx| {
+                                        this.open_saved_session(saved_id, window, cx);
+                                    });
+                                }),
+                        );
+                    }
+                    menu = menu.separator();
+                }
+                menu.menu_with_icon("New Session…", IconName::Plus, Box::new(NewSerialTab))
+            })
             .into_any_element()
     }
 
@@ -164,11 +364,19 @@ impl SerialWorkspace {
                     .into_any_element(),
             ),
             (None, Some((visible, total))) => Some(
-                div()
+                v_flex()
                     .flex_none()
-                    .ui_mono_token(MONO_SMALL)
-                    .text_color(rgb(palette.muted))
-                    .child(format!("{visible} of {total}"))
+                    .ui_mono_font()
+                    .child(tag(
+                        palette,
+                        if visible == 0 {
+                            palette.warning
+                        } else {
+                            palette.muted
+                        },
+                        MONO_SMALL,
+                        format!("{visible} / {total}"),
+                    ))
                     .into_any_element(),
             ),
             (None, None) => None,
@@ -176,6 +384,7 @@ impl SerialWorkspace {
 
         Input::new(&tab.filter_input)
             .small()
+            .min_h(px(FILTER_HEIGHT))
             .text_token(LABEL)
             .font_weight(FontWeight::NORMAL)
             .bg(rgb(palette.input))
@@ -184,7 +393,8 @@ impl SerialWorkspace {
             } else {
                 palette.input_border
             }))
-            .rounded(px(6.))
+            .rounded(px(FILTER_HEIGHT / 2.))
+            .px_3()
             .focus_bordered(error.is_none())
             .prefix(
                 Icon::new(IconName::Search)
@@ -196,7 +406,7 @@ impl SerialWorkspace {
                 h_flex()
                     .flex_none()
                     .items_center()
-                    .gap_0p5()
+                    .gap_1()
                     .children(status)
                     .child(
                         Self::filter_switch(
@@ -242,20 +452,13 @@ impl SerialWorkspace {
         let button = Button::new(id)
             .xsmall()
             .compact()
+            .rounded(px(6.))
             .tab_stop(false)
             .label(glyph)
             .toggled(on)
             .tooltip(tooltip);
         if on {
-            button
-                .custom(
-                    ButtonCustomVariant::new(cx)
-                        .color(tint(palette.accent, 0.14).into())
-                        .foreground(rgb(palette.accent).into())
-                        .hover(tint(palette.accent, 0.22).into())
-                        .active(tint(palette.accent, 0.3).into()),
-                )
-                .selected(true)
+            button.custom(Self::accent_pill(palette, cx)).selected(true)
         } else {
             button.ghost()
         }
@@ -266,10 +469,10 @@ impl SerialWorkspace {
         h_flex()
             .h(px(FILTER_HEIGHT))
             .w_full()
-            .px_2()
+            .px_3()
             .gap_1p5()
             .items_center()
-            .rounded(px(6.))
+            .rounded(px(FILTER_HEIGHT / 2.))
             .bg(rgb(palette.input))
             .border_1()
             .border_color(rgb(palette.input_border))
@@ -287,5 +490,18 @@ impl SerialWorkspace {
                     .child(FILTER_PLACEHOLDER),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TITLE_BAR_HEIGHT, traffic_light_position};
+    use gpui_kit::px;
+
+    /// The lights are 12px tall; on a 38px bar their centre has to be 19px.
+    #[test]
+    fn traffic_lights_sit_on_the_bars_centre_line() {
+        let position = traffic_light_position();
+        assert_eq!(position.y + px(6.), px(TITLE_BAR_HEIGHT / 2.));
     }
 }

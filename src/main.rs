@@ -3,6 +3,7 @@
 mod app_icon;
 mod app_menu;
 mod configuration;
+mod controls;
 mod filter;
 mod icons;
 mod presets;
@@ -28,6 +29,7 @@ use gpui_kit::component::{
     input::{InputEvent, InputState},
     menu::AppMenuBar,
     notification::Notification,
+    resizable::{ResizableState, h_resizable, resizable_panel},
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -35,9 +37,10 @@ use gpui_kit::*;
 use icons::WorkbenchAssets;
 use presets::PresetStore;
 use serial::*;
+use sidebar::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
-use title_bar::FILTER_PLACEHOLDER;
+use title_bar::{FILTER_PLACEHOLDER, traffic_light_position};
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
@@ -67,12 +70,16 @@ pub struct SerialWorkspace {
     side_panel_collapsed: bool,
     sessions_collapsed: bool,
     commands_collapsed: bool,
+    /// The dragged width of the side panel. Owned here rather than by the
+    /// resizable group, so collapsing to the rail and back keeps the width.
+    panel_layout: Entity<ResizableState>,
 }
 
 impl SerialWorkspace {
     fn new(interface_theme: InterfaceTheme, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (update_tx, update_rx) = mpsc::channel();
         let menu_bar = AppMenuBar::new(cx);
+        let panel_layout = cx.new(|_| ResizableState::default());
 
         let workspace = Self {
             tabs: Vec::new(),
@@ -88,6 +95,7 @@ impl SerialWorkspace {
             side_panel_collapsed: false,
             sessions_collapsed: false,
             commands_collapsed: false,
+            panel_layout,
         };
 
         cx.spawn_in(window, async move |this, cx| {
@@ -281,7 +289,7 @@ impl SerialWorkspace {
         }
 
         let selected = tab.selected_port().clone();
-        if selected.is_demo {
+        if selected.is_demo() {
             tab.connected = true;
             tab.push_line(
                 LineKind::System,
@@ -342,7 +350,7 @@ impl SerialWorkspace {
         bytes.extend_from_slice(b"\r\n");
         tab.push_line(LineKind::Tx, bytes.clone(), None);
 
-        if tab.selected_port().is_demo {
+        if tab.selected_port().is_demo() {
             tab.push_line(LineKind::Rx, demo_response(&value), None);
         } else if let Some(tx) = &tab.command_tx {
             let _ = tx.send(SerialCommand::Write(bytes));
@@ -705,27 +713,50 @@ impl Render for SerialWorkspace {
         let dialog_layer = Root::render_dialog_layer(window, cx);
         let notification_layer = Root::render_notification_layer(window, cx);
 
+        let centre = v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .min_h_0()
+            .children(tab_bar)
+            .child(content);
+
+        // Expanded, the panel's left edge is a drag handle; collapsed, the
+        // rail is a fixed strip and there is nothing to drag.
+        let body = if self.side_panel_collapsed {
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(centre)
+                .child(sidebar)
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(
+                    h_resizable("workbench-panels")
+                        .with_state(&self.panel_layout)
+                        .child(resizable_panel().child(centre))
+                        .child(
+                            resizable_panel()
+                                .size(px(SIDEBAR_WIDTH))
+                                .size_range(px(SIDEBAR_MIN_WIDTH)..px(SIDEBAR_MAX_WIDTH))
+                                .flex_none()
+                                .child(sidebar),
+                        ),
+                )
+                .into_any_element()
+        };
+
         let workbench = v_flex()
             .size_full()
             .ui_font()
             .bg(rgb(palette.editor))
             .text_color(rgb(palette.foreground))
             .child(title_bar)
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .min_h_0()
-                            .children(tab_bar)
-                            .child(content),
-                    )
-                    .child(sidebar),
-            );
+            .child(body);
 
         div()
             .relative()
@@ -758,6 +789,12 @@ fn main() {
         configure_application_menus(cx);
 
         let mut options = TitleBar::window_options();
+        // The bar is taller than the component's default, so the traffic
+        // lights move down to stay on its centre line.
+        options.titlebar = Some(TitlebarOptions {
+            traffic_light_position: Some(traffic_light_position()),
+            ..TitleBar::title_bar_options()
+        });
         options.window_bounds = Some(WindowBounds::centered(size(px(1280.), px(800.)), cx));
         options.window_min_size = Some(size(px(960.), px(640.)));
 

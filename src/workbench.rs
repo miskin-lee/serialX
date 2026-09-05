@@ -19,7 +19,8 @@ use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
 use crate::app_menu::NewSerialTab;
-use crate::icons::{Glyph, icon_chip};
+use crate::controls::{Choice, ChoiceText, segmented};
+use crate::icons::{Glyph, icon_chip, port_glyph};
 use crate::theme::{
     BODY, CAPTION, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, Typography, WORDMARK,
     WorkbenchPalette, tint,
@@ -55,7 +56,7 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    fn connection_color(tab: &SerialTabSnapshot, palette: WorkbenchPalette) -> u32 {
+    pub(crate) fn connection_color(tab: &SerialTabSnapshot, palette: WorkbenchPalette) -> u32 {
         if tab.connected {
             palette.success
         } else if tab.connecting {
@@ -72,11 +73,7 @@ impl SerialWorkspace {
         let selected = tab.selected_port().clone();
         let connected = tab.connected || tab.connecting;
         let status_color = Self::connection_color(tab, palette);
-        let (glyph, category) = if selected.is_demo {
-            (Glyph::Waveform, palette.category_signal)
-        } else {
-            (Glyph::Usb, palette.category_device)
-        };
+        let (glyph, category) = port_glyph(selected.kind, palette);
 
         h_flex()
             .h(px(TOOLBAR_HEIGHT))
@@ -278,49 +275,28 @@ impl SerialWorkspace {
             )
     }
 
-    /// The ASCII / HEX switch, styled as one segmented pill.
+    /// The ASCII / HEX switch: the same segmented rail the session dialog
+    /// sets its framing with, so the two places a mode is picked look alike.
     fn render_mode_switch(&mut self, hex_mode: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
-        let segment = |label: &'static str, active: bool| {
-            div()
-                .id(label)
-                .px_2()
-                .py(px(3.))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .text_token(MICRO)
-                .when(active, |segment| {
-                    segment
-                        .bg(rgb(palette.editor))
-                        .text_color(rgb(palette.strong_foreground))
-                })
-                .when(!active, |segment| {
-                    segment
-                        .text_color(rgb(palette.muted))
-                        .hover(|segment| segment.text_color(rgb(palette.foreground)))
-                })
-                .child(label)
-        };
-
-        h_flex()
-            .flex_none()
-            .p(px(2.))
-            .gap(px(2.))
-            .rounded(px(8.))
-            .bg(rgb(palette.surface))
-            .border_1()
-            .border_color(rgb(palette.border_subtle))
-            .child(
-                segment("ASCII", !hex_mode).on_click(cx.listener(|this, _, _, cx| {
-                    this.set_hex_mode(false, cx);
-                })),
-            )
-            .child(
-                segment("HEX", hex_mode).on_click(cx.listener(|this, _, _, cx| {
-                    this.set_hex_mode(true, cx);
-                })),
-            )
-            .into_any_element()
+        segmented(
+            "mode-switch",
+            palette,
+            ChoiceText::ui(MICRO),
+            vec![
+                Choice::new(
+                    "ASCII",
+                    !hex_mode,
+                    cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
+                ),
+                Choice::new(
+                    "HEX",
+                    hex_mode,
+                    cx.listener(|this, _, _, cx| this.set_hex_mode(true, cx)),
+                ),
+            ],
+        )
+        .into_any_element()
     }
 
     /// The send band. Lives under the log rather than in the sidebar, so the

@@ -16,7 +16,8 @@ use gpui_kit::{
     AssetSource, IntoElement, ParentElement, Result, SharedString, Styled, div, px, rgb,
 };
 
-use crate::theme::tint;
+use crate::serial::PortKind;
+use crate::theme::{WorkbenchPalette, tint};
 
 /// The app's own glyphs, usable anywhere `gpui-component` takes an icon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +161,20 @@ impl AssetSource for WorkbenchAssets {
                 .map(|(name, _)| SharedString::from(*name)),
         );
         Ok(names)
+    }
+}
+
+/// The glyph and hue a port is drawn with, wherever one is listed: the demo
+/// device is a signal, a physical port is a device, and a port that is named
+/// but not attached is drawn in the muted ink so it reads as absent.
+pub(crate) fn port_glyph(kind: PortKind, palette: WorkbenchPalette) -> (Glyph, u32) {
+    match kind {
+        PortKind::Demo => (Glyph::Waveform, palette.category_signal),
+        PortKind::Usb => (Glyph::Usb, palette.category_device),
+        PortKind::Bluetooth | PortKind::Pci | PortKind::Unknown => {
+            (Glyph::Port, palette.category_device)
+        }
+        PortKind::Unavailable => (Glyph::Port, palette.muted),
     }
 }
 

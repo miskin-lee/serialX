@@ -27,9 +27,13 @@ use crate::theme::{
 };
 use crate::{SerialTabSnapshot, SerialWorkspace};
 
-/// Width of the expanded panel. Wide enough for a port path plus its baud
-/// summary on one line at the caption size.
-const SIDEBAR_WIDTH: f32 = 296.;
+/// Width the panel opens at. Wide enough for a port path plus its baud
+/// summary on one line at the caption size; the edge drags from there.
+pub(crate) const SIDEBAR_WIDTH: f32 = 296.;
+/// The narrowest the panel drags to: one card with its glyph and a name.
+pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 220.;
+/// The widest: past this the cards are mostly air.
+pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
 /// Width of the collapsed rail: one icon chip plus breathing room.
 const RAIL_WIDTH: f32 = 52.;
 const SECTION_HEADER_HEIGHT: f32 = 38.;
@@ -84,11 +88,10 @@ impl SerialWorkspace {
         {
             tab.selected_port = index;
         } else {
-            tab.ports.push(crate::PortItem {
-                name: saved.port_name.clone(),
-                subtitle: "Saved device · currently unavailable".into(),
-                is_demo: false,
-            });
+            tab.ports.push(crate::PortItem::unavailable(
+                saved.port_name.clone(),
+                "Saved device · currently unavailable",
+            ));
             tab.selected_port = tab.ports.len() - 1;
         }
         tab.push_line(
@@ -665,10 +668,10 @@ impl SerialWorkspace {
         let sessions = self.render_saved_sessions(has_active_tab, cx);
         let commands = self.render_quick_send(has_active_tab, cx);
 
+        // The width is the resizable panel's to set; the column fills it.
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
-            .flex_none()
+            .size_full()
+            .min_w_0()
             .border_l_1()
             .border_color(rgb(palette.border))
             .bg(rgb(palette.panel))

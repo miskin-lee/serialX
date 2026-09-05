@@ -17,11 +17,40 @@ pub(crate) const STOP_BITS: &[&str] = &["1", "2"];
 pub(crate) const PARITIES: &[&str] = &["None", "Odd", "Even"];
 pub(crate) const FLOW_CONTROLS: &[&str] = &["None", "Software", "Hardware"];
 
+/// What kind of device sits behind a port. Picks the glyph a port is drawn
+/// with, the way the subtitle picks its words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PortKind {
+    /// The built-in Loopback device.
+    Demo,
+    Usb,
+    Bluetooth,
+    Pci,
+    Unknown,
+    /// A port a saved or configured session names that is not attached now.
+    Unavailable,
+}
+
 #[derive(Clone)]
 pub(crate) struct PortItem {
     pub(crate) name: String,
     pub(crate) subtitle: String,
-    pub(crate) is_demo: bool,
+    pub(crate) kind: PortKind,
+}
+
+impl PortItem {
+    pub(crate) fn is_demo(&self) -> bool {
+        self.kind == PortKind::Demo
+    }
+
+    /// A port named by a saved session or a configured tab that is not attached now.
+    pub(crate) fn unavailable(name: String, subtitle: &str) -> Self {
+        Self {
+            name,
+            subtitle: subtitle.into(),
+            kind: PortKind::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -328,21 +357,27 @@ pub(crate) fn discover_ports() -> Vec<PortItem> {
     let mut ports = vec![PortItem {
         name: "Loopback".into(),
         subtitle: "Built-in demo device".into(),
-        is_demo: true,
+        kind: PortKind::Demo,
     }];
 
     if let Ok(detected) = serialport::available_ports() {
-        ports.extend(detected.into_iter().map(|port| PortItem {
-            subtitle: match port.port_type {
-                serialport::SerialPortType::UsbPort(info) => {
-                    info.product.unwrap_or_else(|| "USB Serial".into())
+        ports.extend(detected.into_iter().map(|port| {
+            let (subtitle, kind) = match port.port_type {
+                serialport::SerialPortType::UsbPort(info) => (
+                    info.product.unwrap_or_else(|| "USB Serial".into()),
+                    PortKind::Usb,
+                ),
+                serialport::SerialPortType::BluetoothPort => {
+                    ("Bluetooth Serial".into(), PortKind::Bluetooth)
                 }
-                serialport::SerialPortType::BluetoothPort => "Bluetooth Serial".into(),
-                serialport::SerialPortType::PciPort => "PCI Serial".into(),
-                serialport::SerialPortType::Unknown => "Serial Device".into(),
-            },
-            name: port.port_name,
-            is_demo: false,
+                serialport::SerialPortType::PciPort => ("PCI Serial".into(), PortKind::Pci),
+                serialport::SerialPortType::Unknown => ("Serial Device".into(), PortKind::Unknown),
+            };
+            PortItem {
+                name: port.port_name,
+                subtitle,
+                kind,
+            }
         }));
     }
     ports

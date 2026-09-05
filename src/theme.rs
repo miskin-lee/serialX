@@ -80,6 +80,14 @@ impl Default for InterfaceTheme {
 }
 
 impl InterfaceTheme {
+    /// The other theme, for the one-key switch.
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            Self::Light => Self::Dark,
+            Self::Dark => Self::Light,
+        }
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Light => "Light",
@@ -187,6 +195,21 @@ pub(crate) fn tint(color: u32, alpha: f32) -> Rgba {
     let mut color = rgb(color);
     color.a = alpha;
     color
+}
+
+/// The colour `amount` of the way from `from` to `to`, per channel.
+///
+/// For the places a translucent tint will not do: a gradient stop has to be
+/// opaque to paint the same on every frame, and an outline drawn over a
+/// gradient has to be a single colour or it bands with it.
+pub(crate) fn mix(from: u32, to: u32, amount: f32) -> u32 {
+    let amount = amount.clamp(0., 1.);
+    let channel = |shift: u32| {
+        let a = ((from >> shift) & 0xff) as f32;
+        let b = ((to >> shift) & 0xff) as f32;
+        ((a + (b - a) * amount).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -528,7 +551,9 @@ impl TextToken {
 /// the README's size, the same numeric weight would read thinner than the mark
 /// standing next to it.
 pub(crate) const WORDMARK: TextToken = TextToken::new(34., 42., FontWeight(800.));
-/// Card and dialog titles.
+/// Dialog titles: one step above the body, so a sheet opens with a headline
+/// rather than a bold sentence.
+pub(crate) const TITLE: TextToken = TextToken::new(15., 20., FontWeight::SEMIBOLD);
 /// Panel and section headings.
 pub(crate) const HEADING: TextToken = TextToken::new(12.5, 18., FontWeight::SEMIBOLD);
 /// Default running text.
@@ -541,6 +566,9 @@ pub(crate) const LABEL: TextToken = TextToken::new(12., 17., FontWeight::MEDIUM)
 pub(crate) const CAPTION: TextToken = TextToken::new(11.5, 16., FontWeight::NORMAL);
 /// Status bar and other chrome that should recede.
 pub(crate) const MICRO: TextToken = TextToken::new(10.5, 14., FontWeight::MEDIUM);
+/// Section labels set in small caps: `DEVICE`, `BAUD RATE`. The tracking is
+/// carried by the letters themselves, since GPUI has no letter-spacing.
+pub(crate) const EYEBROW: TextToken = TextToken::new(10.5, 14., FontWeight::SEMIBOLD);
 /// Terminal payloads.
 pub(crate) const MONO: TextToken = TextToken::new(12.5, 20., FontWeight::NORMAL);
 /// Timestamps, byte counts, inline command previews.
@@ -727,7 +755,7 @@ pub(crate) fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, 
 mod tests {
     use super::{
         BODY, CjkLanguage, FontStack, InterfaceTheme, LINUX_FONTS, MAC_FONTS, MICRO, MONO,
-        WINDOWS_FONTS, WORDMARK, cjk_fallbacks, pick_family, tint,
+        WINDOWS_FONTS, WORDMARK, cjk_fallbacks, mix, pick_family, tint,
     };
 
     fn installed(names: &[&str]) -> Vec<String> {
@@ -944,6 +972,15 @@ mod tests {
             logo_wordmark_inks(include_str!("../docs/logo-dark.svg")),
             vec![dark.wordmark_body, dark.wordmark_lead, dark.wordmark_tail],
         );
+    }
+
+    #[test]
+    fn mix_walks_each_channel_from_one_colour_to_the_other() {
+        assert_eq!(mix(0x000000, 0xffffff, 0.), 0x000000);
+        assert_eq!(mix(0x000000, 0xffffff, 1.), 0xffffff);
+        assert_eq!(mix(0x000000, 0xffffff, 0.5), 0x808080);
+        assert_eq!(mix(0x0b0d11, 0xffffff, 0.06), 0x1a1c1f);
+        assert_eq!(mix(0x102030, 0x304050, 2.), 0x304050, "amount is clamped");
     }
 
     #[test]

@@ -13,6 +13,7 @@ use gpui_kit::component::{
     input::Input,
     kbd::Kbd,
     scroll::ScrollableElement,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -26,7 +27,7 @@ use crate::theme::{
     BODY, CAPTION, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, Typography, WORDMARK,
     WorkbenchPalette, tint,
 };
-use crate::{LineKind, SerialTabSnapshot, SerialWorkspace, TerminalLine};
+use crate::{LineKind, SerialTabSnapshot, SerialTabState, SerialWorkspace, TerminalLine};
 
 /// Height of the tab strip above the terminal: two under the title bar's,
 /// so the two bands read as one piece of chrome without repeating it.
@@ -39,6 +40,13 @@ const TAB_CLOSE: f32 = 18.;
 const TAB_MAX_WIDTH: f32 = 260.;
 /// The narrowest a tab shrinks to when the strip is full.
 const TAB_MIN_WIDTH: f32 = 120.;
+/// How strongly a tag's hue washes the active tab's plate, and its ring.
+const TAG_PLATE_ACTIVE: f32 = 0.18;
+const TAG_RING_ACTIVE: f32 = 0.45;
+/// The wash on a tab that is not in front, at rest and under the pointer:
+/// faint enough to sit nearly flat, strong enough to read as the tag.
+const TAG_PLATE_REST: f32 = 0.1;
+const TAG_PLATE_HOVER: f32 = 0.18;
 /// Height of the composer below the terminal.
 const COMPOSER_HEIGHT: f32 = 52.;
 /// Width of the timestamp gutter, wide enough for `14:32:40.018`.
@@ -63,21 +71,10 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    pub(crate) fn connection_color(tab: &SerialTabSnapshot, palette: WorkbenchPalette) -> u32 {
-        if tab.connected {
-            palette.success
-        } else if tab.connecting {
-            palette.warning
-        } else {
-            palette.muted
-        }
-    }
-
     /// The band above the terminal: one tab per session on the left, and on
     /// the right the controls that act on the session in front of you —
     /// connect, pause, clear, timestamps, follow. What the session *is* is
-    /// already named by its tab and by the title bar's context pill, so the
-    /// strip does not say it a third time.
+    /// already named by its tab, so the strip does not say it twice.
     pub(crate) fn render_tab_strip(
         &mut self,
         active: Option<&SerialTabSnapshot>,
@@ -91,24 +88,7 @@ impl SerialWorkspace {
             .tabs
             .iter()
             .enumerate()
-            .map(|(index, tab)| {
-                let status = if tab.connected {
-                    palette.success
-                } else if tab.connecting {
-                    palette.warning
-                } else {
-                    palette.faint
-                };
-                Self::render_tab(
-                    index,
-                    tab.id,
-                    tab.selected_port().name.clone(),
-                    status,
-                    index == active_index,
-                    palette,
-                    cx,
-                )
-            })
+            .map(|(index, tab)| Self::render_tab(index, tab, index == active_index, palette, cx))
             .collect::<Vec<_>>();
         let actions = self.render_session_actions(active, palette, cx);
 
@@ -145,21 +125,42 @@ impl SerialWorkspace {
         )
     }
 
-    /// One tab: a status dot, the port's name, and a close mark that shows on
-    /// the active tab and on hover. The active tab is a raised plate and the
-    /// others sit flat on the strip until pointed at — the rule the segmented
-    /// switches follow, so every exclusive choice in the workbench reads the
-    /// same way. Tabs share the strip: when it fills, they shrink together
-    /// and their names truncate, the way a browser's do.
+    /// One tab: a status dot, its name — the alias it was given, else the
+    /// port's path — and a close mark that shows on the active tab and on
+    /// hover; the port and its parameters are in the tooltip, so a named tab
+    /// still tells you what it is plugged into. The active tab is a raised plate and the
+    /// others sit nearly flat on the strip until pointed at — the rule the
+    /// segmented switches follow, so every exclusive choice in the workbench
+    /// reads the same way. Tabs share the strip: when it fills, they shrink
+    /// together and their names truncate, the way a browser's do.
+    ///
+    /// The plate is the tag's: a wash of the hue with a ring of it when
+    /// active, a fainter wash when not, so the tag shows in both states
+    /// without the name changing colour. The dot keeps saying whether the
+    /// port is open.
     fn render_tab(
         index: usize,
-        tab_id: usize,
-        name: String,
-        status: u32,
+        tab: &SerialTabState,
         active: bool,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let tab_id = tab.id;
+        let name = tab.title().to_string();
+        let detail: SharedString = format!(
+            "{} · {}",
+            tab.selected_port().name,
+            tab.configuration.summary()
+        )
+        .into();
+        let status = if tab.connected {
+            palette.success
+        } else if tab.connecting {
+            palette.warning
+        } else {
+            palette.faint
+        };
+        let hue = palette.tag(tab.color);
         let group: SharedString = format!("session-tab-{tab_id}").into();
 
         h_flex()
@@ -175,13 +176,15 @@ impl SerialWorkspace {
             .rounded(px(7.))
             .border_1()
             .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
             .when(active, |tab| {
-                tab.bg(rgb(palette.card))
-                    .border_color(tint(palette.strong_foreground, 0.08))
+                tab.bg(tint(hue, TAG_PLATE_ACTIVE))
+                    .border_color(tint(hue, TAG_RING_ACTIVE))
             })
             .when(!active, |tab| {
-                tab.border_color(transparent_black())
-                    .hover(|tab| tab.bg(rgb(palette.hover)))
+                tab.bg(tint(hue, TAG_PLATE_REST))
+                    .border_color(transparent_black())
+                    .hover(move |tab| tab.bg(tint(hue, TAG_PLATE_HOVER)))
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 if index < this.tabs.len() {

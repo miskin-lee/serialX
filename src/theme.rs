@@ -13,6 +13,7 @@ use gpui_kit::{
     App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Rgba, SharedString, Styled,
     Window, WindowAppearance, px, rgb,
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InterfaceTheme {
@@ -69,6 +70,135 @@ pub(crate) struct WorkbenchPalette {
     pub(crate) wordmark_lead: u32,
     pub(crate) wordmark_body: u32,
     pub(crate) wordmark_tail: u32,
+    /// The hues a session can be tagged with, in [`TagColor::HUES`] order.
+    /// Ink-strength on paper and pastel on ink, like the category hues, so a
+    /// tag paints the same fills and glyphs in both themes.
+    pub(crate) tags: [u32; TAG_HUE_COUNT],
+}
+
+/// How many colours a session can be tagged with.
+pub(crate) const TAG_HUE_COUNT: usize = 24;
+
+/// The colour a session is tagged with. Every session has one.
+///
+/// The tag is a label, not a state: the dot on a tab says whether the port
+/// is open, and the tag colours the plate under it, so the sessions to three
+/// boards on the same bench can be told apart without reading their names —
+/// the way iTerm2, Windows Terminal and Firefox's containers colour a tab.
+/// The colours come in two dozens, as Google Calendar's grid does: a bright
+/// dozen around the wheel, then a deep dozen — crimson, rust, cocoa, mustard,
+/// olive, emerald and on — that sit between the bright hues and a step darker
+/// and more saturated, so no two cells of the grid read as the same colour.
+///
+/// A new session is offered the first colour no open tab is using; a session
+/// saved before there were tags loads as the neutral grey.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TagColor {
+    // The bright dozen, around the wheel.
+    Red,
+    Orange,
+    Amber,
+    Yellow,
+    Lime,
+    Green,
+    Teal,
+    Sky,
+    Blue,
+    Purple,
+    Pink,
+    #[default]
+    Gray,
+    // The deep dozen, around it again.
+    Crimson,
+    Rust,
+    Cocoa,
+    Mustard,
+    Olive,
+    Emerald,
+    Cyan,
+    Cobalt,
+    Navy,
+    Grape,
+    Magenta,
+    Graphite,
+}
+
+impl TagColor {
+    /// The colours in the order the picker lays them out: the bright dozen
+    /// from red to pink and a cool grey, then the deep dozen from crimson to
+    /// magenta and graphite.
+    pub(crate) const HUES: [Self; TAG_HUE_COUNT] = [
+        Self::Red,
+        Self::Orange,
+        Self::Amber,
+        Self::Yellow,
+        Self::Lime,
+        Self::Green,
+        Self::Teal,
+        Self::Sky,
+        Self::Blue,
+        Self::Purple,
+        Self::Pink,
+        Self::Gray,
+        Self::Crimson,
+        Self::Rust,
+        Self::Cocoa,
+        Self::Mustard,
+        Self::Olive,
+        Self::Emerald,
+        Self::Cyan,
+        Self::Cobalt,
+        Self::Navy,
+        Self::Grape,
+        Self::Magenta,
+        Self::Graphite,
+    ];
+
+    /// The tag's name, for the swatch tooltip.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Amber => "Amber",
+            Self::Yellow => "Yellow",
+            Self::Lime => "Lime",
+            Self::Green => "Green",
+            Self::Teal => "Teal",
+            Self::Sky => "Sky",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+            Self::Pink => "Pink",
+            Self::Gray => "Gray",
+            Self::Crimson => "Crimson",
+            Self::Rust => "Rust",
+            Self::Cocoa => "Cocoa",
+            Self::Mustard => "Mustard",
+            Self::Olive => "Olive",
+            Self::Emerald => "Emerald",
+            Self::Cyan => "Cyan",
+            Self::Cobalt => "Cobalt",
+            Self::Navy => "Navy",
+            Self::Grape => "Grape",
+            Self::Magenta => "Magenta",
+            Self::Graphite => "Graphite",
+        }
+    }
+
+    /// Where the tag's colour sits in [`WorkbenchPalette::tags`].
+    fn hue_index(self) -> usize {
+        Self::HUES
+            .iter()
+            .position(|hue| *hue == self)
+            .expect("every tag is listed in HUES")
+    }
+}
+
+impl WorkbenchPalette {
+    /// The colour a tag paints with in this theme.
+    pub(crate) fn tag(self, color: TagColor) -> u32 {
+        self.tags[color.hue_index()]
+    }
 }
 
 /// The workbench opens dark, whatever the system is set to; the terminal is
@@ -146,6 +276,11 @@ impl InterfaceTheme {
                 wordmark_lead: 0xff754c,
                 wordmark_body: 0x4d75ff,
                 wordmark_tail: 0x35b873,
+                tags: [
+                    0xdc3d3d, 0xe5661d, 0xd68a08, 0xbfa10a, 0x6ea41a, 0x28994f, 0x149487, 0x0f88c0,
+                    0x2f6fe0, 0x8a3ee0, 0xd6338f, 0x737b8a, 0xb01a41, 0xa8431a, 0x6f4a33, 0x967810,
+                    0x62701a, 0x116a40, 0x076a7d, 0x194fa8, 0x2a3c8f, 0x5a2287, 0x8a1c75, 0x4a505b,
+                ],
             },
             // Ink: a near-black canvas lifted by a hint of blue, so the panels
             // separate from the terminal without a single hard grey.
@@ -182,6 +317,11 @@ impl InterfaceTheme {
                 wordmark_lead: 0xff754c,
                 wordmark_body: 0xf4f3ef,
                 wordmark_tail: 0x35b873,
+                tags: [
+                    0xf27171, 0xfb9a4a, 0xf5b93a, 0xecd23a, 0xa9e04a, 0x5ad487, 0x3fd1bd, 0x4ac2f5,
+                    0x6b9cf8, 0xb98af5, 0xf07ac2, 0x9aa3b2, 0xdb3a5e, 0xd0602a, 0xa06c48, 0xc9a21e,
+                    0x8fa321, 0x22a866, 0x13a5bf, 0x2f7fe6, 0x4157c9, 0x9143c9, 0xcc3ab0, 0x646c7a,
+                ],
             },
         }
     }
@@ -755,7 +895,7 @@ pub(crate) fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, 
 mod tests {
     use super::{
         BODY, CjkLanguage, FontStack, InterfaceTheme, LINUX_FONTS, MAC_FONTS, MICRO, MONO,
-        WINDOWS_FONTS, WORDMARK, cjk_fallbacks, mix, pick_family, tint,
+        TagColor, WINDOWS_FONTS, WORDMARK, cjk_fallbacks, mix, pick_family, tint,
     };
 
     fn installed(names: &[&str]) -> Vec<String> {
@@ -817,6 +957,77 @@ mod tests {
             hues.dedup();
             assert_eq!(hues.len(), total, "{} reuses a category hue", theme.name());
         }
+    }
+
+    /// Every tag needs its own colour, none of them the accent, or a tagged
+    /// tab looks selected rather than labelled.
+    #[test]
+    fn tag_hues_are_distinct_and_none_is_the_accent() {
+        for theme in [InterfaceTheme::Light, InterfaceTheme::Dark] {
+            let palette = theme.palette();
+            let mut hues = TagColor::HUES
+                .iter()
+                .map(|&tag| palette.tag(tag))
+                .collect::<Vec<_>>();
+            assert!(
+                !hues.contains(&palette.accent),
+                "{} paints a tag in the accent",
+                theme.name()
+            );
+            let total = hues.len();
+            hues.sort_unstable();
+            hues.dedup();
+            assert_eq!(hues.len(), total, "{} reuses a tag hue", theme.name());
+        }
+    }
+
+    /// The deep row has to be darker than the bright row in both themes, in
+    /// every column, or the two rows of the picker read as one palette
+    /// printed twice. On paper the bright row is already ink, so the gap
+    /// there is narrower than on the dark canvas.
+    #[test]
+    fn the_deep_dozen_is_darker_than_the_bright_dozen() {
+        fn luminance(color: u32) -> f32 {
+            let channel = |shift: u32| ((color >> shift) & 0xff) as f32;
+            0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+        }
+        for theme in [InterfaceTheme::Light, InterfaceTheme::Dark] {
+            let palette = theme.palette();
+            let (bright, deep) = TagColor::HUES.split_at(TagColor::HUES.len() / 2);
+            let mut gaps = bright
+                .iter()
+                .zip(deep)
+                .map(|(&bright, &deep)| {
+                    luminance(palette.tag(bright)) - luminance(palette.tag(deep))
+                })
+                .collect::<Vec<_>>();
+            let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
+            gaps.sort_by(f32::total_cmp);
+            assert!(
+                mean > 30. && gaps[0] > 20.,
+                "{}: the deep row is not clearly darker (mean gap {mean:.0}, smallest {:.0})",
+                theme.name(),
+                gaps[0]
+            );
+        }
+    }
+
+    /// The tag is stored by name, so a workspace file reads back by hand and
+    /// a session saved before tags loads as the neutral grey.
+    #[test]
+    fn tags_are_stored_by_name() {
+        assert_eq!(serde_json::to_string(&TagColor::Sky).unwrap(), "\"sky\"");
+        assert_eq!(
+            serde_json::from_str::<TagColor>("\"purple\"").unwrap(),
+            TagColor::Purple
+        );
+        assert_eq!(TagColor::default(), TagColor::Gray);
+        assert_eq!(
+            serde_json::from_str::<TagColor>("\"magenta\"")
+                .unwrap()
+                .name(),
+            "Magenta"
+        );
     }
 
     #[test]

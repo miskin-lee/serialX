@@ -3,6 +3,7 @@ use std::{env, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::SerialConfiguration;
+use crate::theme::TagColor;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSession {
@@ -10,6 +11,12 @@ pub(crate) struct StoredSession {
     pub(crate) label: String,
     pub(crate) port_name: String,
     pub(crate) configuration: SerialConfiguration,
+    /// Absent in files written before sessions could be tagged.
+    #[serde(default)]
+    pub(crate) color: TagColor,
+    /// The name the session was given, shown in place of the port's path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) alias: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -55,10 +62,14 @@ impl PresetStore {
         label: String,
         port_name: String,
         configuration: SerialConfiguration,
+        color: TagColor,
+        alias: Option<String>,
     ) {
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.label == label) {
             saved.port_name = port_name;
             saved.configuration = configuration;
+            saved.color = color;
+            saved.alias = alias;
         } else {
             let id = self.take_id();
             self.sessions.push(StoredSession {
@@ -66,6 +77,8 @@ impl PresetStore {
                 label,
                 port_name,
                 configuration,
+                color,
+                alias,
             });
         }
         self.persist();
@@ -81,11 +94,15 @@ impl PresetStore {
         id: u64,
         port_name: String,
         configuration: SerialConfiguration,
+        color: TagColor,
+        alias: Option<String>,
     ) {
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
             saved.label = format!("{} · {}", port_name, configuration.summary());
             saved.port_name = port_name;
             saved.configuration = configuration;
+            saved.color = color;
+            saved.alias = alias;
             self.persist();
         }
     }
@@ -152,7 +169,14 @@ fn default_commands() -> Vec<StoredCommand> {
     .collect()
 }
 
+/// Where the workspace file lives, per platform. None under `cargo test`, so
+/// a test that saves a preset exercises the store without touching the file
+/// the developer's own workbench reads.
 fn store_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+
     #[cfg(target_os = "macos")]
     {
         env::var_os("HOME")
@@ -180,7 +204,7 @@ fn store_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::PresetStore;
+    use super::{PresetStore, TagColor};
 
     #[test]
     fn default_presets_round_trip() {
@@ -188,5 +212,40 @@ mod tests {
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.commands.len(), 3);
         assert_eq!(restored.commands[0].command, "AT+STATUS?");
+    }
+
+    /// A session saved before tags existed has no `color` field and has to
+    /// load as the neutral grey rather than fail the whole store.
+    #[test]
+    fn sessions_saved_without_a_tag_load_untagged() {
+        let json = r#"{"sessions":[{"id":7,"label":"/dev/tty.usb · 115200 8N1",
+            "port_name":"/dev/tty.usb","configuration":{"baud_rate":115200,
+            "data_bits_index":3,"stop_bits_index":0,"parity_index":0,
+            "flow_control_index":0}}],"commands":[],"next_id":8}"#;
+        let store: PresetStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.sessions[0].color, TagColor::Gray);
+        assert_eq!(store.sessions[0].alias, None);
+
+        let mut store = store;
+        store.update_session(
+            7,
+            "/dev/tty.usb".into(),
+            store.sessions[0].configuration,
+            TagColor::Teal,
+            Some("Motor board".into()),
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains(r#""color":"teal""#));
+        assert!(json.contains(r#""alias":"Motor board""#));
+
+        // A session without a name does not write an empty field.
+        store.update_session(
+            7,
+            "/dev/tty.usb".into(),
+            store.sessions[0].configuration,
+            TagColor::Teal,
+            None,
+        );
+        assert!(!serde_json::to_string(&store).unwrap().contains("alias"));
     }
 }

@@ -10,6 +10,7 @@ use gpui_kit::{Entity, Subscription};
 use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
+use crate::theme::TagColor;
 
 /// The rates the session dialog lists. Any other rate can be typed in; these
 /// are the ones a device is most likely to want.
@@ -276,6 +277,10 @@ pub(crate) struct SerialTabState {
     pub(crate) ports: Vec<PortItem>,
     pub(crate) selected_port: usize,
     pub(crate) configuration: SerialConfiguration,
+    /// The colour the tab is tagged with, chosen in the session dialog.
+    pub(crate) color: TagColor,
+    /// The name the tab was given, if any; the port's path stands in for it.
+    pub(crate) alias: Option<String>,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
@@ -309,6 +314,8 @@ impl SerialTabState {
             ports: discover_ports(),
             selected_port: 0,
             configuration: SerialConfiguration::default(),
+            color: TagColor::default(),
+            alias: None,
             connected: false,
             connecting: false,
             paused: false,
@@ -335,6 +342,11 @@ impl SerialTabState {
 
     pub(crate) fn selected_port(&self) -> &PortItem {
         &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
+    }
+
+    /// What the tab is called: the alias it was given, else the port's path.
+    pub(crate) fn title(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.selected_port().name)
     }
 
     fn now(&mut self) -> String {
@@ -373,12 +385,11 @@ impl Drop for SerialTabState {
     }
 }
 
+/// What the render pass reads of a tab: the log and the switches over it.
+/// The port and its tag are drawn from the tab itself, in the strip.
 #[derive(Clone)]
 pub(crate) struct SerialTabSnapshot {
     pub(crate) id: usize,
-    pub(crate) ports: Vec<PortItem>,
-    pub(crate) selected_port: usize,
-    pub(crate) configuration: SerialConfiguration,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
@@ -403,19 +414,12 @@ impl SerialTabSnapshot {
                 !active || self.filter.matches(&line.display_text(self.hex_mode))
             })
     }
-
-    pub(crate) fn selected_port(&self) -> &PortItem {
-        &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
-    }
 }
 
 impl From<&SerialTabState> for SerialTabSnapshot {
     fn from(tab: &SerialTabState) -> Self {
         Self {
             id: tab.id,
-            ports: tab.ports.clone(),
-            selected_port: tab.selected_port,
-            configuration: tab.configuration,
             connected: tab.connected,
             connecting: tab.connecting,
             paused: tab.paused,

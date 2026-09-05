@@ -16,8 +16,7 @@ use gpui_kit::{
     AssetSource, IntoElement, ParentElement, Result, SharedString, Styled, div, px, rgb,
 };
 
-use crate::serial::PortKind;
-use crate::theme::{WorkbenchPalette, tint};
+use crate::theme::tint;
 
 /// The app's own glyphs, usable anywhere `gpui-component` takes an icon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,8 +34,8 @@ pub(crate) enum Glyph {
     Scroll,
     Send,
     Sweep,
+    Tag,
     Terminal,
-    Usb,
 }
 
 impl Glyph {
@@ -55,8 +54,8 @@ impl Glyph {
             Self::Scroll => "icons/ui/scroll.svg",
             Self::Send => "icons/ui/send.svg",
             Self::Sweep => "icons/ui/sweep.svg",
+            Self::Tag => "icons/ui/tag.svg",
             Self::Terminal => "icons/ui/terminal.svg",
-            Self::Usb => "icons/ui/usb.svg",
         }
     }
 }
@@ -122,12 +121,12 @@ const GLYPHS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/ui/sweep.svg"),
     ),
     (
-        "icons/ui/terminal.svg",
-        include_bytes!("../assets/icons/ui/terminal.svg"),
+        "icons/ui/tag.svg",
+        include_bytes!("../assets/icons/ui/tag.svg"),
     ),
     (
-        "icons/ui/usb.svg",
-        include_bytes!("../assets/icons/ui/usb.svg"),
+        "icons/ui/terminal.svg",
+        include_bytes!("../assets/icons/ui/terminal.svg"),
     ),
 ];
 
@@ -155,19 +154,6 @@ impl AssetSource for WorkbenchAssets {
                 .map(|(name, _)| SharedString::from(*name)),
         );
         Ok(names)
-    }
-}
-
-/// The glyph and hue a port is drawn with, wherever one is listed: a physical
-/// port is a device, and a port that is named but not attached is drawn in
-/// the muted ink so it reads as absent.
-pub(crate) fn port_glyph(kind: PortKind, palette: WorkbenchPalette) -> (Glyph, u32) {
-    match kind {
-        PortKind::Usb => (Glyph::Usb, palette.category_device),
-        PortKind::Bluetooth | PortKind::Pci | PortKind::Unknown => {
-            (Glyph::Port, palette.category_device)
-        }
-        PortKind::Unavailable => (Glyph::Port, palette.muted),
     }
 }
 
@@ -209,8 +195,8 @@ mod tests {
         Glyph::Scroll,
         Glyph::Send,
         Glyph::Sweep,
+        Glyph::Tag,
         Glyph::Terminal,
-        Glyph::Usb,
     ];
 
     /// A glyph whose file is missing renders as nothing at all, with no error,

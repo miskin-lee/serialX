@@ -3,7 +3,8 @@
 //! Two stacked sections, each a header over a scrolling list of cards. Rows are
 //! cards rather than table lines so a saved item reads as an object you can act
 //! on, and every one is anchored by a coloured glyph in the manner of VS Code's
-//! Material Icon Theme — session amber, command green.
+//! Material Icon Theme: a command is green, and a session wears its own tag
+//! colour, so the card and the tab it opens match.
 //!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
@@ -56,7 +57,13 @@ impl SerialWorkspace {
         let port_name = tab.selected_port().name.clone();
         let configuration = tab.configuration;
         let label = format!("{} · {}", port_name, configuration.summary());
-        self.presets.add_session(label, port_name, configuration);
+        self.presets.add_session(
+            label,
+            port_name,
+            configuration,
+            tab.color,
+            tab.alias.clone(),
+        );
         self.sessions_collapsed = false;
         cx.notify();
     }
@@ -81,6 +88,8 @@ impl SerialWorkspace {
         self.next_tab_id += 1;
         let mut tab = Self::build_tab(id, window, cx);
         tab.configuration = saved.configuration.sanitized();
+        tab.color = saved.color;
+        tab.alias = saved.alias.clone();
         if let Some(index) = tab
             .ports
             .iter()
@@ -401,6 +410,15 @@ impl SerialWorkspace {
                                 let edit_workspace = workspace.clone();
                                 let remove_workspace = workspace.clone();
                                 let saved_id = saved.id;
+                                // A named session shows its name, and keeps
+                                // the port on the line below beside the rate.
+                                let summary = saved.configuration.summary();
+                                let (title, detail) = match &saved.alias {
+                                    Some(alias) => {
+                                        (alias.clone(), format!("{} · {summary}", saved.port_name))
+                                    }
+                                    None => (saved.port_name.clone(), summary),
+                                };
 
                                 Self::row_card(
                                     palette,
@@ -418,7 +436,7 @@ impl SerialWorkspace {
                                         this.open_saved_session_editor(saved_id, window, cx);
                                     });
                                 })
-                                .child(icon_chip(Glyph::Bookmark, palette.category_session, 28.))
+                                .child(icon_chip(Glyph::Bookmark, palette.tag(saved.color), 28.))
                                 .child(
                                     v_flex()
                                         .min_w_0()
@@ -433,7 +451,7 @@ impl SerialWorkspace {
                                                         .truncate()
                                                         .text_token(LABEL)
                                                         .text_color(rgb(palette.strong_foreground))
-                                                        .child(saved.port_name.clone()),
+                                                        .child(title),
                                                 )
                                                 .when(is_open, |row| {
                                                     row.child(Self::status_dot(5., palette.success))
@@ -444,7 +462,7 @@ impl SerialWorkspace {
                                                 .truncate()
                                                 .ui_mono_token(MONO_SMALL)
                                                 .text_color(rgb(palette.faint))
-                                                .child(saved.configuration.summary()),
+                                                .child(detail),
                                         ),
                                 )
                                 .child(Self::row_remove_button(

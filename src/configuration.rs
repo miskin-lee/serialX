@@ -8,8 +8,12 @@
 //! right and the odd device wants one of its own; and the frame — data bits,
 //! parity, stop bits, flow control — is four segmented switches, since each
 //! has two to four values and the whole frame should be readable at a glance.
-//! A summary line at the foot restates the choice in the `115200 8N1`
-//! shorthand the rest of the workbench prints.
+//! Last, the tab itself: a name, which stands in for the port's path wherever
+//! the session is listed, and two rows of colour swatches, twenty-four in all,
+//! for telling this session's tab from the others; a new session is offered
+//! the first colour no open tab wears. A summary line at the foot restates the
+//! choice in the `115200 8N1` shorthand the rest of the workbench prints,
+//! behind a tag glyph in the chosen colour.
 
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
@@ -20,16 +24,18 @@ use gpui_kit::component::{
     kbd::Kbd,
     menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
+    tooltip::Tooltip,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::controls::{Choice, ChoiceText, eyebrow, segmented, tag};
-use crate::icons::{Glyph, icon_chip, port_glyph};
+use crate::icons::{Glyph, icon_chip};
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
-    BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TITLE, Typography, WorkbenchPalette, tint,
+    BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TAG_HUE_COUNT, TITLE, TagColor, Typography,
+    WorkbenchPalette, tint,
 };
 use crate::{
     BAUD_RATES, DATA_BITS, FLOW_CONTROLS, LineKind, PARITIES, PortItem, PortKind, STOP_BITS,
@@ -58,10 +64,25 @@ const PORT_ROWS_MAX: usize = 4;
 const PORT_ROWS_MIN: usize = 2;
 /// The dialog's share of the window height, so the footer stays reachable on
 /// the smallest window the workbench allows.
-const DIALOG_MAX_HEIGHT_FRACTION: f32 = 0.82;
+const DIALOG_MAX_HEIGHT_FRACTION: f32 = 0.9;
 /// What the dialog stands at with an empty device list: padding, header, the
-/// other three sections, the summary and the footer.
-const DIALOG_FIXED_HEIGHT: f32 = 434.;
+/// other four sections, the summary and the footer.
+const DIALOG_FIXED_HEIGHT: f32 = 510.;
+/// What the name field says while it is empty and no device is chosen.
+const NAME_FALLBACK: &str = "Name";
+/// A tag swatch: the disc, the hit target around it that also carries the
+/// ring when the swatch is the chosen one, and the gap between targets.
+const SWATCH_SIZE: f32 = 16.;
+const SWATCH_TARGET: f32 = 22.;
+const SWATCH_GAP: f32 = 2.;
+/// How many swatches to a row. The two dozen hues make two rows, the vivid
+/// dozen over the soft one.
+const SWATCH_COLUMNS: usize = 12;
+const SWATCH_ROWS: usize = TAG_HUE_COUNT / SWATCH_COLUMNS;
+/// The tag grid's height: its rows of targets and the gaps between them. The
+/// name field beside it is shorter, so this is the Tab section's body height.
+const TAG_BLOCK_HEIGHT: f32 =
+    SWATCH_ROWS as f32 * SWATCH_TARGET + (SWATCH_ROWS as f32 - 1.) * SWATCH_GAP;
 
 /// The height the device list is given, so it scrolls instead of growing.
 ///
@@ -86,6 +107,18 @@ enum ConfigurationTarget {
     SavedSession(u64),
 }
 
+/// The colour to offer a new session, given the colours of the open tabs:
+/// the first in picker order that none of them wears, and once every colour
+/// is taken, the picker wraps around by how many tabs there are.
+fn suggest_tag(used: impl Iterator<Item = TagColor>) -> TagColor {
+    let used = used.collect::<Vec<_>>();
+    TagColor::HUES
+        .iter()
+        .copied()
+        .find(|color| !used.contains(color))
+        .unwrap_or(TagColor::HUES[used.len() % TagColor::HUES.len()])
+}
+
 /// The frame parameters: the ones picked from a fixed list. The baud rate is
 /// typed or chosen and is handled on its own.
 #[derive(Clone, Copy)]
@@ -102,6 +135,12 @@ struct SerialConfigurationEditor {
     ports: Vec<PortItem>,
     selected_port: usize,
     configuration: SerialConfiguration,
+    /// The colour the session's tab will be tagged with.
+    color: TagColor,
+    /// The name the tab will carry. Its placeholder is the chosen device, so
+    /// an empty field shows what the tab will say instead.
+    alias_input: Entity<InputState>,
+    _alias_subscription: Subscription,
     /// The baud rate as typed. Picking from the list writes into it too, so
     /// the field always shows the rate the session will open at.
     baud_input: Entity<InputState>,
@@ -117,6 +156,7 @@ impl SerialConfigurationEditor {
         target: ConfigurationTarget,
         theme: InterfaceTheme,
         saved: Option<&StoredSession>,
+        color: TagColor,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -137,6 +177,25 @@ impl SerialConfigurationEditor {
                 selected_port = ports.len() - 1;
             }
         }
+
+        let placeholder = ports
+            .get(selected_port)
+            .map_or_else(|| NAME_FALLBACK.to_string(), |port| port.name.clone());
+        let alias = saved.and_then(|saved| saved.alias.clone());
+        let alias_input = cx.new(|cx| {
+            let input = InputState::new(window, cx).placeholder(placeholder);
+            match alias {
+                Some(alias) => input.default_value(alias),
+                None => input,
+            }
+        });
+        // The summary strip echoes the name as it is typed.
+        let alias_subscription =
+            cx.subscribe_in(&alias_input, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
 
         let baud_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -160,10 +219,31 @@ impl SerialConfigurationEditor {
             ports,
             selected_port,
             configuration,
+            color,
+            alias_input,
+            _alias_subscription: alias_subscription,
             baud_input,
             _baud_subscription: baud_subscription,
             baud_error: None,
         }
+    }
+
+    /// The name as typed, or none when the field is empty or only spaces.
+    fn alias(&self, cx: &App) -> Option<String> {
+        let text = self.alias_input.read(cx).value();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// Keeps the empty name field saying which device the tab would be named
+    /// after, as the device changes under it.
+    fn sync_name_placeholder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self
+            .selected_port()
+            .map_or_else(|| NAME_FALLBACK.to_string(), |port| port.name.clone());
+        self.alias_input.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx);
+        });
     }
 
     /// Reads the field. A rate goes into the configuration; anything else
@@ -201,15 +281,16 @@ impl SerialConfigurationEditor {
             .get(self.selected_port.min(self.ports.len().saturating_sub(1)))
     }
 
-    fn select_port(&mut self, index: usize, cx: &mut Context<Self>) {
+    fn select_port(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_port = index.min(self.ports.len().saturating_sub(1));
+        self.sync_name_placeholder(window, cx);
         cx.notify();
     }
 
     /// Looks for devices again, keeping the current choice if it is still
     /// there — and keeping an absent saved device listed, so editing a saved
     /// session never silently retargets it.
-    fn rescan(&mut self, cx: &mut Context<Self>) {
+    fn rescan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.selected_port().cloned();
         let mut ports = discover_ports();
         if let Some(current) = &current {
@@ -223,6 +304,12 @@ impl SerialConfigurationEditor {
             .and_then(|current| ports.iter().position(|port| port.name == current.name))
             .unwrap_or(0);
         self.ports = ports;
+        self.sync_name_placeholder(window, cx);
+        cx.notify();
+    }
+
+    fn select_color(&mut self, color: TagColor, cx: &mut Context<Self>) {
+        self.color = color;
         cx.notify();
     }
 
@@ -379,8 +466,8 @@ impl SerialConfigurationEditor {
                     })
                     .when(selected, |row| row.bg(tint(palette.accent, 0.1)))
                     .when(!selected, |row| row.hover(|row| row.bg(rgb(palette.hover))))
-                    .on_click(cx.listener(move |editor, _, _, cx| {
-                        editor.select_port(index, cx);
+                    .on_click(cx.listener(move |editor, _, window, cx| {
+                        editor.select_port(index, window, cx);
                     }))
                     .child(
                         v_flex()
@@ -432,7 +519,7 @@ impl SerialConfigurationEditor {
                     .xsmall()
                     .icon(Glyph::Refresh)
                     .label("Rescan")
-                    .on_click(cx.listener(|editor, _, _, cx| editor.rescan(cx))),
+                    .on_click(cx.listener(|editor, _, window, cx| editor.rescan(window, cx))),
             )
             .into_any_element();
 
@@ -628,14 +715,106 @@ impl SerialConfigurationEditor {
         .into_any_element()
     }
 
-    /// The choice restated: the shorthand the tab bar and saved sessions
-    /// print, and under it the same thing in words.
-    fn render_summary(&self, palette: WorkbenchPalette) -> AnyElement {
+    /// One swatch: a disc of the colour in a round target, ringed in the
+    /// colour when it is the chosen one.
+    fn render_swatch(
+        &self,
+        index: usize,
+        color: TagColor,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hue = palette.tag(color);
+        let selected = color == self.color;
+        let name = color.name();
+
+        div()
+            .id(("config-tag", index))
+            .flex_none()
+            .size(px(SWATCH_TARGET))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(tint(hue, if selected { 1. } else { 0. }))
+            .when(!selected, |target| {
+                target.hover(move |target| target.border_color(tint(hue, 0.5)))
+            })
+            .cursor_pointer()
+            .tooltip(move |window, cx| Tooltip::new(name).build(window, cx))
+            .on_click(cx.listener(move |editor, _, _, cx| editor.select_color(color, cx)))
+            .child(div().size(px(SWATCH_SIZE)).rounded_full().bg(rgb(hue)))
+            .into_any_element()
+    }
+
+    /// The tab: its name and its colour, side by side under one eyebrow. The
+    /// name field takes what the swatches leave; the swatches are the bright
+    /// dozen over the deep dozen, so a column holds two colours that read as
+    /// kin. Two rows beside the field, rather than under it, keep the footer
+    /// on screen at the smallest window.
+    fn render_tab_section(
+        &mut self,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = Input::new(&self.alias_input)
+            .small()
+            .h(px(BAUD_FIELD_HEIGHT))
+            .text_token(LABEL)
+            .font_weight(FontWeight::NORMAL)
+            .bg(rgb(palette.input))
+            .border_color(rgb(palette.input_border))
+            .rounded(px(8.))
+            .px_2p5()
+            .cleanable(true);
+
+        let mut rows = Vec::with_capacity(SWATCH_ROWS);
+        for (row, hues) in TagColor::HUES.chunks(SWATCH_COLUMNS).enumerate() {
+            let mut swatches = Vec::with_capacity(SWATCH_COLUMNS);
+            for (column, &color) in hues.iter().enumerate() {
+                let index = row * SWATCH_COLUMNS + column;
+                swatches.push(self.render_swatch(index, color, palette, cx));
+            }
+            rows.push(
+                h_flex()
+                    .items_center()
+                    .gap(px(SWATCH_GAP))
+                    .children(swatches),
+            );
+        }
+
+        let aside = div()
+            .text_token(CAPTION)
+            .text_color(rgb(palette.faint))
+            .child("Name is optional · the device stands in")
+            .into_any_element();
+
+        Self::section(
+            palette,
+            "Tab",
+            Some(aside),
+            h_flex()
+                .h(px(TAG_BLOCK_HEIGHT))
+                .items_center()
+                .gap_3()
+                .child(div().flex_1().min_w_0().child(name))
+                .child(v_flex().gap(px(SWATCH_GAP)).children(rows)),
+        )
+        .into_any_element()
+    }
+
+    /// The choice restated the way the tab will state it: the name or the
+    /// device, then the shorthand the tab bar and saved sessions print, and
+    /// under it the same thing in words — with the device first when a name
+    /// has taken its place above. All behind a tag glyph in the chosen
+    /// colour, the one place the tag is named as a tag.
+    fn render_summary(&self, palette: WorkbenchPalette, cx: &App) -> AnyElement {
         let port = self.selected_port();
-        let (glyph, hue) = port.map_or((Glyph::Port, palette.muted), |port| {
-            port_glyph(port.kind, palette)
-        });
+        let hue = palette.tag(self.color);
         let device = port.map_or("No device", |port| port.name.as_str());
+        let alias = self.alias(cx);
+        let title = alias.as_deref().unwrap_or(device);
         let configuration = self.configuration;
         let stop_bits = if STOP_BITS[configuration.stop_bits_index] == "1" {
             "1 stop bit"
@@ -646,11 +825,14 @@ impl SerialConfigurationEditor {
             0 => "no flow control".to_string(),
             index => format!("{} flow control", FLOW_CONTROLS[index].to_lowercase()),
         };
-        let spelled_out = format!(
+        let mut spelled_out = format!(
             "{} data bits · {} parity · {stop_bits} · {flow_control}",
             DATA_BITS[configuration.data_bits_index],
             PARITIES[configuration.parity_index].to_lowercase(),
         );
+        if alias.is_some() {
+            spelled_out = format!("{device} · {spelled_out}");
+        }
 
         h_flex()
             .items_center()
@@ -661,7 +843,7 @@ impl SerialConfigurationEditor {
             .bg(rgb(palette.surface))
             .border_1()
             .border_color(rgb(palette.border_subtle))
-            .child(icon_chip(glyph, hue, 28.))
+            .child(icon_chip(Glyph::Tag, hue, 28.))
             .child(
                 v_flex()
                     .flex_1()
@@ -671,7 +853,7 @@ impl SerialConfigurationEditor {
                             .truncate()
                             .ui_mono_token(BODY_STRONG)
                             .text_color(rgb(palette.strong_foreground))
-                            .child(format!("{device} · {}", configuration.summary())),
+                            .child(format!("{title} · {}", configuration.summary())),
                     )
                     .child(
                         div()
@@ -696,7 +878,8 @@ impl Render for SerialConfigurationEditor {
             .child(self.render_devices(palette, viewport_height, cx))
             .child(self.render_baud_rate(palette, cx))
             .child(self.render_framing(palette, cx))
-            .child(self.render_summary(palette))
+            .child(self.render_tab_section(palette, cx))
+            .child(self.render_summary(palette, cx))
     }
 }
 
@@ -733,7 +916,14 @@ impl SerialWorkspace {
                 .find(|saved| saved.id == saved_id),
         };
         let theme = self.interface_theme;
-        let editor = cx.new(|cx| SerialConfigurationEditor::new(target, theme, saved, window, cx));
+        // A saved session keeps its colour; a new one is offered a colour no
+        // open tab wears, so the strip tells its sessions apart from the start.
+        let color = match (target, saved) {
+            (ConfigurationTarget::SavedSession(_), Some(saved)) => saved.color,
+            _ => suggest_tag(self.tabs.iter().map(|tab| tab.color)),
+        };
+        let editor =
+            cx.new(|cx| SerialConfigurationEditor::new(target, theme, saved, color, window, cx));
         let editor_for_dialog = editor.clone();
         let editor_for_submit = editor.clone();
         let workspace = cx.weak_entity();
@@ -829,16 +1019,27 @@ impl SerialWorkspace {
                         return false;
                     };
                     let configuration = editor.configuration.sanitized();
+                    let color = editor.color;
+                    let alias = editor.alias(cx);
                     let target = editor.target;
 
                     let _ = workspace.update(cx, |workspace, cx| match target {
-                        ConfigurationTarget::NewTab => {
-                            workspace.create_configured_tab(port_name, configuration, window, cx)
-                        }
+                        ConfigurationTarget::NewTab => workspace.create_configured_tab(
+                            port_name,
+                            configuration,
+                            color,
+                            alias,
+                            window,
+                            cx,
+                        ),
                         ConfigurationTarget::SavedSession(saved_id) => {
-                            workspace
-                                .presets
-                                .update_session(saved_id, port_name, configuration);
+                            workspace.presets.update_session(
+                                saved_id,
+                                port_name,
+                                configuration,
+                                color,
+                                alias,
+                            );
                             cx.notify();
                         }
                     });
@@ -851,6 +1052,8 @@ impl SerialWorkspace {
         &mut self,
         port_name: String,
         configuration: SerialConfiguration,
+        color: TagColor,
+        alias: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -858,6 +1061,8 @@ impl SerialWorkspace {
         self.next_tab_id += 1;
         let mut tab = Self::build_tab(id, window, cx);
         tab.configuration = configuration.sanitized();
+        tab.color = color;
+        tab.alias = alias;
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {
@@ -884,7 +1089,11 @@ impl SerialWorkspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIALOG_FIXED_HEIGHT, PORT_ROW_HEIGHT, port_list_height};
+    use super::{
+        DIALOG_FIXED_HEIGHT, DIALOG_MAX_HEIGHT_FRACTION, PORT_ROW_HEIGHT, SWATCH_COLUMNS,
+        SWATCH_GAP, SWATCH_ROWS, SWATCH_TARGET, TAG_BLOCK_HEIGHT, TAG_HUE_COUNT, TagColor,
+        port_list_height, suggest_tag,
+    };
 
     /// A tall window shows up to four rows, and a list that fits is exactly
     /// as tall as its rows.
@@ -900,11 +1109,34 @@ mod tests {
     fn a_short_window_keeps_two_rows_and_a_reachable_footer() {
         let height = port_list_height(9, 640.);
         assert_eq!(height, 1.5 * PORT_ROW_HEIGHT);
-        assert!(DIALOG_FIXED_HEIGHT + height <= 640. * 0.82);
+        assert!(DIALOG_FIXED_HEIGHT + height <= 640. * DIALOG_MAX_HEIGHT_FRACTION);
     }
 
     #[test]
     fn an_empty_scan_still_draws_one_row_of_list() {
         assert_eq!(port_list_height(0, 800.), PORT_ROW_HEIGHT);
+    }
+
+    /// The hues have to fill their rows, or the grid ends in a ragged line.
+    #[test]
+    fn tag_hues_fill_two_whole_rows() {
+        assert_eq!(TAG_HUE_COUNT % SWATCH_COLUMNS, 0);
+        assert_eq!(SWATCH_ROWS, 2);
+        assert_eq!(TAG_BLOCK_HEIGHT, 2. * SWATCH_TARGET + SWATCH_GAP);
+    }
+
+    /// A new session takes the first free colour, and never a used one while
+    /// a free one is left.
+    #[test]
+    fn a_new_session_is_offered_a_colour_no_tab_wears() {
+        assert_eq!(suggest_tag([].into_iter()), TagColor::Red);
+        assert_eq!(
+            suggest_tag([TagColor::Red, TagColor::Amber].into_iter()),
+            TagColor::Orange
+        );
+        let all = TagColor::HUES.into_iter();
+        assert_eq!(suggest_tag(all), TagColor::Red);
+        let all_and_one = TagColor::HUES.into_iter().chain([TagColor::Red]);
+        assert_eq!(suggest_tag(all_and_one), TagColor::Orange);
     }
 }

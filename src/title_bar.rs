@@ -1,11 +1,12 @@
-//! The title bar: the workbench's menu bar, laid out in three groups.
+//! The title bar: the workbench's menu bar, laid out as VS Code lays out its
+//! own.
 //!
-//! Left, the *context*: a pill naming the session in front of you, its port
-//! parameters and its connection state, which drops down into a switcher for
-//! every open and saved session. Centre, the *command centre*: tab arrows and
-//! the output filter, sized the way VS Code sizes its own. Right, one switch:
-//! the side panel. Everything else the bar could offer already lives in the
-//! platform's menu bar and its shortcuts, and a second copy would only be a
+//! Centre, the *command centre*: tab arrows and the output filter, sized the
+//! way VS Code sizes its own. Right, one switch: the side panel. Left, only
+//! what the platform puts there — the traffic lights on macOS, the
+//! application menus elsewhere. Which session is in front of you is said by
+//! its tab, and the ways to any other session are the tab strip, the side
+//! panel and the Session menu; a pill here saying it again would only be a
 //! second thing to look at.
 //!
 //! The bar is a little taller than the component default so its pills have
@@ -23,16 +24,13 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::Input,
-    menu::{DropdownMenu, PopupMenuItem},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_icon::application_icon_image;
-use crate::app_menu::{NewSerialTab, NextTab, PreviousTab, ToggleSidePanel};
+use crate::app_menu::{NextTab, PreviousTab, ToggleSidePanel};
 use crate::controls::tag;
-use crate::icons::{Glyph, port_glyph};
 use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, mix, tint};
 use crate::{SerialTabSnapshot, SerialWorkspace};
 
@@ -57,8 +55,6 @@ const CENTER_MIN_WIDTH: f32 = 280.;
 const TRAFFIC_LIGHT_INSET: f32 = 80.;
 /// Width of the application menu bar on the platforms that draw it in the bar.
 const MENU_BAR_WIDTH: f32 = 300.;
-/// The widest the session name in the context pill may grow before it is cut.
-const CONTEXT_NAME_MAX_WIDTH: f32 = 220.;
 /// Placeholder in the filter box, echoed by the inert box shown without a tab.
 pub(crate) const FILTER_PLACEHOLDER: &str = "Filter output";
 
@@ -83,7 +79,6 @@ impl SerialWorkspace {
             Some(tab) => self.render_filter_box(tab, cx),
             None => Self::render_idle_filter_box(palette),
         };
-        let context = self.render_context_pill(active, cx);
 
         // Empty on macOS, where the traffic lights are all the left end holds.
         let left_column = h_flex()
@@ -91,11 +86,8 @@ impl SerialWorkspace {
             .min_w_0()
             .h_full()
             .items_center()
-            .gap_2()
             .overflow_hidden()
             .when(cfg!(not(target_os = "macos")), |column| {
-                // The menus never give way; the context pill is what gets
-                // clipped when the window is narrow.
                 column.min_w(px(MENU_BAR_WIDTH)).child(
                     div()
                         .flex_none()
@@ -103,8 +95,7 @@ impl SerialWorkspace {
                         .h(px(CONTROL_HEIGHT))
                         .child(self.menu_bar.clone()),
                 )
-            })
-            .child(context);
+            });
 
         let center_column = h_flex()
             .flex_none()
@@ -196,148 +187,6 @@ impl SerialWorkspace {
             .foreground(rgb(palette.accent).into())
             .hover(tint(palette.accent, 0.22).into())
             .active(tint(palette.accent, 0.3).into())
-    }
-
-    /// The neutral pill the context switcher wears: a breath lighter than the
-    /// bar, so it reads as an object on it rather than a hole in it.
-    fn neutral_pill(palette: WorkbenchPalette, cx: &App) -> ButtonCustomVariant {
-        ButtonCustomVariant::new(cx)
-            .color(tint(palette.strong_foreground, 0.07).into())
-            .foreground(rgb(palette.foreground).into())
-            .hover(tint(palette.strong_foreground, 0.11).into())
-            .active(tint(palette.strong_foreground, 0.15).into())
-    }
-
-    /// The left pill: which session this is, and a way to any other.
-    ///
-    /// With a tab open it names the port, its parameters and its state. With
-    /// none it carries the application mark, so the bar is never anonymous.
-    fn render_context_pill(
-        &mut self,
-        active: Option<&SerialTabSnapshot>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let palette = self.interface_theme.palette();
-        let caret = Icon::new(IconName::ChevronDown)
-            .size(px(11.))
-            .text_color(rgb(palette.faint));
-
-        let content = match active {
-            Some(tab) => {
-                let port = tab.selected_port().clone();
-                let (glyph, hue) = port_glyph(port.kind, palette);
-                let status = Self::connection_color(tab, palette);
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1p5()
-                    .child(Icon::new(glyph).size(px(13.)).text_color(rgb(hue)))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .max_w(px(CONTEXT_NAME_MAX_WIDTH))
-                            .truncate()
-                            .text_token(LABEL)
-                            .text_color(rgb(palette.strong_foreground))
-                            .child(port.name),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .ui_mono_token(MONO_SMALL)
-                            .text_color(rgb(palette.muted))
-                            .child(tab.configuration.summary()),
-                    )
-                    .child(Self::status_dot(6., status))
-                    .child(caret)
-                    .into_any_element()
-            }
-            None => h_flex()
-                .items_center()
-                .gap_1p5()
-                .child(img(application_icon_image()).size(px(15.)))
-                .child(
-                    div()
-                        .text_token(LABEL)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.strong_foreground))
-                        .child("serialX"),
-                )
-                .child(caret)
-                .into_any_element(),
-        };
-
-        let open_sessions = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(index, tab)| {
-                (
-                    index,
-                    tab.selected_port().name.clone(),
-                    tab.configuration.summary(),
-                    index == self.active_tab,
-                )
-            })
-            .collect::<Vec<_>>();
-        let saved_sessions = self
-            .presets
-            .sessions
-            .iter()
-            .map(|saved| (saved.id, saved.label.clone()))
-            .collect::<Vec<_>>();
-        let workspace = cx.weak_entity();
-
-        Button::new("title-context")
-            .custom(Self::neutral_pill(palette, cx))
-            .small()
-            .compact()
-            .rounded(px(CONTROL_HEIGHT / 2.))
-            .h(px(CONTROL_HEIGHT))
-            .px_2p5()
-            .tooltip("Switch session")
-            .child(content)
-            .dropdown_menu(move |mut menu, _, _| {
-                if !open_sessions.is_empty() {
-                    menu = menu.label("Open sessions");
-                    for (index, name, summary, is_active) in &open_sessions {
-                        let workspace = workspace.clone();
-                        let index = *index;
-                        menu = menu.item(
-                            PopupMenuItem::new(format!("{name}  ·  {summary}"))
-                                .checked(*is_active)
-                                .on_click(move |_, _, cx| {
-                                    let _ = workspace.update(cx, |this, cx| {
-                                        if index < this.tabs.len() {
-                                            this.active_tab = index;
-                                            cx.notify();
-                                        }
-                                    });
-                                }),
-                        );
-                    }
-                    menu = menu.separator();
-                }
-                if !saved_sessions.is_empty() {
-                    menu = menu.label("Saved sessions");
-                    for (saved_id, label) in &saved_sessions {
-                        let workspace = workspace.clone();
-                        let saved_id = *saved_id;
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone())
-                                .icon(Glyph::Bookmark)
-                                .on_click(move |_, window, cx| {
-                                    let _ = workspace.update(cx, |this, cx| {
-                                        this.open_saved_session(saved_id, window, cx);
-                                    });
-                                }),
-                        );
-                    }
-                    menu = menu.separator();
-                }
-                menu.menu_with_icon("New Session…", IconName::Plus, Box::new(NewSerialTab))
-            })
-            .into_any_element()
     }
 
     /// The command-centre box, wired to the active tab's filter. Its right

@@ -6,6 +6,8 @@ description = "A polished serial port workspace built with GPUI"
 license = "GPL-3.0-only"
 
 [dependencies]
+alacritty_terminal = "0.26"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "0.6"
 regex = "1"
 reqwest = { package = "gpui-pre-reqwest", version = "0.12.15", default-features = false, features = ["blocking", "json", "rustls-tls"] }

@@ -197,9 +197,7 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let filter = &tab.filter;
         let error = filter.error().map(str::to_owned);
-        let showing = filter
-            .is_active()
-            .then(|| (tab.visible_lines().count(), tab.terminal_lines.len()));
+        let showing = tab.filter_counts;
 
         let status = match (&error, showing) {
             (Some(message), _) => Some(

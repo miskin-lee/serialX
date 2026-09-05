@@ -12,7 +12,6 @@ use gpui_kit::component::{
     h_flex,
     input::Input,
     kbd::Kbd,
-    scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
 };
@@ -23,11 +22,13 @@ use crate::app_icon::application_icon_image;
 use crate::app_menu::NewSerialTab;
 use crate::controls::{Choice, ChoiceText, segmented};
 use crate::icons::Glyph;
+use crate::filter::OutputFilter;
+use crate::terminal::{CaretShape, RenderContent};
 use crate::theme::{
-    BODY, CAPTION, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, Typography, WORDMARK,
-    WorkbenchPalette, tint,
+    BODY, CAPTION, LABEL, MICRO, MONO_SMALL, TerminalPalette, Typography, WORDMARK,
+    WorkbenchPalette, fonts, tint,
 };
-use crate::{LineKind, SerialTabSnapshot, SerialTabState, SerialWorkspace, TerminalLine};
+use crate::{SerialTabSnapshot, SerialTabState, SerialWorkspace};
 
 /// Height of the tab strip above the terminal: two under the title bar's,
 /// so the two bands read as one piece of chrome without repeating it.
@@ -51,16 +52,29 @@ const TAG_PLATE_HOVER: f32 = 0.18;
 const COMPOSER_HEIGHT: f32 = 52.;
 /// Width of the timestamp gutter, wide enough for `14:32:40.018`.
 const TIME_GUTTER: f32 = 82.;
+/// Side padding of a log row, and the gap between its gutter and its text.
+const ROW_INSET: f32 = 16.;
+const ROW_GAP: f32 = 12.;
+/// The terminal's type: the mono family at this size, on lines this tall.
+const TERMINAL_FONT_SIZE: f32 = 12.5;
+const TERMINAL_LINE_HEIGHT: f32 = 18.;
+/// The cursor when it is drawn as a bar or an underline.
+const CARET_THICKNESS: f32 = 2.;
+/// Breathing room between the tab strip and the first line.
+const TERMINAL_TOP_INSET: f32 = 8.;
+
+/// How the terminal's cells map to pixels, measured each frame from the
+/// mono font. Kept on the workspace so the input method's candidate window
+/// can be put under the cursor.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TerminalMetrics {
+    pub(crate) cell_width: f32,
+    pub(crate) line_height: f32,
+    /// Where the cells start, from the terminal's left edge.
+    pub(crate) text_left: f32,
+}
 
 impl SerialWorkspace {
-    /// The direction tag, its colour, and the colour its payload prints in.
-    fn line_colors(kind: LineKind, palette: WorkbenchPalette) -> (&'static str, u32, u32) {
-        match kind {
-            LineKind::Rx => ("RX", palette.success, palette.foreground),
-            LineKind::Tx => ("TX", palette.accent, palette.foreground),
-            LineKind::System => ("SYS", palette.muted, palette.muted),
-        }
-    }
 
     /// A small filled dot in the colour of the current connection state.
     pub(crate) fn status_dot(size: f32, color: u32) -> impl IntoElement {
@@ -331,58 +345,7 @@ impl SerialWorkspace {
             .bg(rgb(palette.border))
     }
 
-    /// One line of traffic: timestamp gutter, direction tag, payload.
-    fn render_terminal_line(
-        index: usize,
-        line: &TerminalLine,
-        tab: &SerialTabSnapshot,
-        palette: WorkbenchPalette,
-    ) -> impl IntoElement {
-        let (tag, tag_color, text_color) = Self::line_colors(line.kind, palette);
-
-        h_flex()
-            .id(("terminal-line", index))
-            .items_start()
-            .w_full()
-            .px_4()
-            .py(px(2.))
-            .gap_3()
-            .hover(|row| row.bg(tint(palette.foreground, 0.04)))
-            .when(tab.timestamps, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .w(px(TIME_GUTTER))
-                        .mono_token(MONO_SMALL)
-                        .py(px(2.))
-                        .text_color(rgb(palette.faint))
-                        .child(line.time.clone()),
-                )
-            })
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(30.))
-                    .py(px(1.))
-                    .my(px(2.))
-                    .rounded(px(5.))
-                    .bg(tint(tag_color, 0.14))
-                    .mono_token(MONO_TAG)
-                    .text_color(rgb(tag_color))
-                    .text_center()
-                    .child(tag),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .mono_token(MONO)
-                    .text_color(rgb(text_color))
-                    .child(line.display_text(tab.hex_mode)),
-            )
-    }
-
-    /// The ASCII / HEX switch: the same segmented rail the session dialog
+    /// The UTF-8 / HEX switch: the same segmented rail the session dialog
     /// sets its framing with, so the two places a mode is picked look alike.
     fn render_mode_switch(&mut self, hex_mode: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
@@ -392,7 +355,7 @@ impl SerialWorkspace {
             ChoiceText::ui(MICRO),
             vec![
                 Choice::new(
-                    "ASCII",
+                    "UTF-8",
                     !hex_mode,
                     cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
                 ),
@@ -461,18 +424,22 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
+    /// The terminal and the composer. The terminal is a place to type as
+    /// well as to read: a click gives it focus, and from then on keys go to
+    /// the port of this tab; the wheel moves through the scrollback.
     pub(crate) fn render_active_tab(
         &mut self,
         tab: SerialTabSnapshot,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let composer = self.render_composer(&tab, cx);
-        let lines = tab
-            .visible_lines()
-            .map(|(index, line)| Self::render_terminal_line(index, line, &tab, palette))
-            .collect::<Vec<_>>();
-        let nothing_matches = lines.is_empty() && tab.filter.is_active();
+        let focused = self.terminal_focus.is_focused(window) && window.is_window_active();
+        if focused {
+            self.start_blinking(window, cx);
+        }
+        let terminal = self.render_terminal(&tab, focused, cx);
 
         v_flex()
             .flex_1()
@@ -480,26 +447,102 @@ impl SerialWorkspace {
             .bg(rgb(palette.editor))
             .overflow_hidden()
             .child(
-                v_flex()
+                div()
+                    .id("terminal")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .py_2()
-                    .overflow_y_scrollbar()
-                    .children(lines)
-                    .when(nothing_matches, |log| {
-                        log.child(
-                            div()
-                                .w_full()
-                                .py_6()
-                                .text_center()
-                                .text_token(CAPTION)
-                                .text_color(rgb(palette.faint))
-                                .child("No lines match the filter"),
-                        )
-                    }),
+                    .w_full()
+                    .track_focus(&self.terminal_focus)
+                    .cursor(CursorStyle::IBeam)
+                    .on_key_down(cx.listener(|this, event, window, cx| {
+                        this.terminal_key(event, window, cx)
+                    }))
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        let line_height = px(TERMINAL_LINE_HEIGHT);
+                        let delta = event.delta.pixel_delta(line_height).y / line_height;
+                        this.scroll_terminal(delta, cx);
+                    }))
+                    .child(terminal),
             )
             .child(composer)
             .into_any_element()
+    }
+
+    /// The terminal itself: a canvas that fits alacritty's grid to its
+    /// bounds before painting, and paints the cells straight from it. The
+    /// platform's text input is wired to it while it holds focus, so an
+    /// input method can compose before anything is sent.
+    fn render_terminal(
+        &mut self,
+        tab: &SerialTabSnapshot,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let terminal_palette = self.interface_theme.terminal_palette();
+        let tab_id = tab.id;
+        let filter = tab.filter.clone();
+        let gutter = if tab.timestamps {
+            ROW_INSET + TIME_GUTTER + ROW_GAP
+        } else {
+            ROW_INSET
+        };
+        let focus = self.terminal_focus.clone();
+        let composing = self.composing.clone();
+        let cursor_shown = self.cursor_shown;
+        let fit = cx.entity();
+        let paint = cx.entity();
+
+        canvas(
+            move |bounds, window, cx| {
+                let cell_width = measure_cell(window);
+                let columns = (bounds.size.width - px(gutter + ROW_INSET)) / cell_width;
+                let lines = bounds.size.height / px(TERMINAL_LINE_HEIGHT);
+                fit.update(cx, |this, _| {
+                    this.terminal_metrics = TerminalMetrics {
+                        cell_width: f32::from(cell_width),
+                        line_height: TERMINAL_LINE_HEIGHT,
+                        text_left: gutter,
+                    };
+                    if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.terminal
+                            .resize(columns.floor().max(0.) as usize, lines.floor().max(0.) as usize);
+                    }
+                });
+                cell_width
+            },
+            move |bounds, cell_width, window, cx| {
+                window.handle_input(&focus, ElementInputHandler::new(bounds, paint.clone()), cx);
+                let Some(content) = paint
+                    .read(cx)
+                    .tab(tab_id)
+                    .map(|tab| tab.terminal.render(&terminal_palette))
+                else {
+                    return;
+                };
+                paint_terminal(
+                    bounds,
+                    cell_width,
+                    px(gutter),
+                    &content,
+                    focused,
+                    cursor_shown,
+                    composing.as_deref(),
+                    &filter,
+                    palette,
+                    terminal_palette,
+                    window,
+                    cx,
+                );
+            },
+        )
+        .absolute()
+        .top(px(TERMINAL_TOP_INSET))
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .into_any_element()
     }
 
     /// The `serialX` wordmark, inked like the logo: an orange `s`, the body in
@@ -584,5 +627,194 @@ impl SerialWorkspace {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// The mono family as the terminal sets it, in one of its four faces.
+fn terminal_font(bold: bool, italic: bool) -> Font {
+    Font {
+        family: fonts().mono.clone(),
+        features: FontFeatures::default(),
+        fallbacks: fonts().cjk.clone(),
+        weight: if bold {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        },
+        style: if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        },
+    }
+}
+
+/// A cell's width: the advance of `m` in the terminal's font.
+fn measure_cell(window: &Window) -> Pixels {
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&terminal_font(false, false));
+    text_system
+        .advance(font_id, px(TERMINAL_FONT_SIZE), 'm')
+        .map(|advance| advance.width)
+        .unwrap_or(px(7.5))
+}
+
+/// Paints the screen: a filled cursor first so its glyph stays readable on
+/// it, then row by row the filter's tint, the timestamp, each run's
+/// background and text, and last the cursor when it is an outline. With
+/// focus the cursor blinks — it is left out in the off half — and without
+/// focus it stands as a steady outline.
+#[allow(clippy::too_many_arguments)]
+fn paint_terminal(
+    bounds: Bounds<Pixels>,
+    cell_width: Pixels,
+    gutter: Pixels,
+    content: &RenderContent,
+    focused: bool,
+    cursor_shown: bool,
+    composing: Option<&str>,
+    filter: &OutputFilter,
+    palette: WorkbenchPalette,
+    terminal_palette: TerminalPalette,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let line_height = px(TERMINAL_LINE_HEIGHT);
+    let font_size = px(TERMINAL_FONT_SIZE);
+    let text_left = bounds.origin.x + gutter;
+    let text_system = window.text_system().clone();
+    let stamp_font = terminal_font(false, false);
+    let cursor_color = rgb(terminal_palette.cursor);
+
+    let cursor_cell = content.cursor.as_ref().map(|cursor| {
+        Bounds::new(
+            point(
+                text_left + cell_width * cursor.column as f32,
+                bounds.origin.y + line_height * cursor.line as f32,
+            ),
+            size(cell_width * if cursor.wide { 2. } else { 1. }, line_height),
+        )
+    });
+    if let (Some(cursor), Some(cell)) = (&content.cursor, cursor_cell)
+        && focused
+        && cursor_shown
+        && cursor.shape == CaretShape::Block
+    {
+        window.paint_quad(fill(cell, cursor_color));
+    }
+
+    for (index, row) in content.rows.iter().enumerate() {
+        let y = bounds.origin.y + line_height * index as f32;
+        if filter.is_active() && filter.matches(&row.text) {
+            window.paint_quad(fill(
+                Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, line_height)),
+                tint(palette.accent, 0.12),
+            ));
+        }
+        if let Some(stamp) = &row.stamp {
+            let run = TextRun {
+                len: stamp.len(),
+                font: stamp_font.clone(),
+                color: rgb(palette.faint).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let line = text_system.shape_line(
+                SharedString::from(stamp.clone()),
+                px(MONO_SMALL.size),
+                &[run],
+                None,
+            );
+            let _ = line.paint(
+                point(bounds.origin.x + px(ROW_INSET), y),
+                line_height,
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
+        }
+        for run in &row.runs {
+            let x = text_left + cell_width * run.column as f32;
+            if let Some(background) = run.style.background {
+                window.paint_quad(fill(
+                    Bounds::new(point(x, y), size(cell_width * run.width as f32, line_height)),
+                    rgb(background),
+                ));
+            }
+            let text_run = TextRun {
+                len: run.text.len(),
+                font: terminal_font(run.style.bold, run.style.italic),
+                color: rgb(run.style.foreground).into(),
+                background_color: None,
+                underline: run.style.underline.then(|| UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                strikethrough: run.style.strikeout.then(|| StrikethroughStyle {
+                    thickness: px(1.),
+                    color: None,
+                }),
+            };
+            let line = text_system.shape_line(
+                SharedString::from(run.text.clone()),
+                font_size,
+                &[text_run],
+                None,
+            );
+            let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
+        }
+    }
+
+    // Text an input method is still composing sits at the cursor, underlined,
+    // until it is committed and sent.
+    if let (Some(text), Some(cell)) = (composing, cursor_cell)
+        && !text.is_empty()
+    {
+        let run = TextRun {
+            len: text.len(),
+            font: terminal_font(false, false),
+            color: rgb(palette.strong_foreground).into(),
+            background_color: Some(rgb(palette.editor).into()),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                color: Some(rgb(palette.accent).into()),
+                wavy: false,
+            }),
+            strikethrough: None,
+        };
+        let line = text_system.shape_line(SharedString::from(text.to_owned()), font_size, &[run], None);
+        window.paint_quad(fill(
+            Bounds::new(cell.origin, size(line.width, line_height)),
+            rgb(palette.editor),
+        ));
+        let _ = line.paint(cell.origin, line_height, TextAlign::Left, None, window, cx);
+    }
+
+    if let (Some(cursor), Some(cell)) = (&content.cursor, cursor_cell) {
+        let outline = || {
+            fill(cell, transparent_black())
+                .border_widths(Edges::all(px(1.)))
+                .border_color(cursor_color)
+        };
+        match cursor.shape {
+            _ if !focused => window.paint_quad(outline()),
+            _ if !cursor_shown => {}
+            CaretShape::Block => {}
+            CaretShape::Hollow => window.paint_quad(outline()),
+            CaretShape::Underline => window.paint_quad(fill(
+                Bounds::new(
+                    point(cell.origin.x, cell.bottom() - px(CARET_THICKNESS)),
+                    size(cell.size.width, px(CARET_THICKNESS)),
+                ),
+                cursor_color,
+            )),
+            CaretShape::Beam => window.paint_quad(fill(
+                Bounds::new(cell.origin, size(px(CARET_THICKNESS), cell.size.height)),
+                cursor_color,
+            )),
+        }
     }
 }

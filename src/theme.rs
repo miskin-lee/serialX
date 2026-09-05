@@ -239,6 +239,14 @@ impl InterfaceTheme {
         }
     }
 
+    /// The colours the terminal draws with in this theme.
+    pub(crate) fn terminal_palette(self) -> TerminalPalette {
+        match self {
+            Self::Light => TerminalPalette::LIGHT,
+            Self::Dark => TerminalPalette::DARK,
+        }
+    }
+
     pub(crate) fn palette(self) -> WorkbenchPalette {
         match self {
             // Paper: a pure white canvas with warm-neutral chrome, so the
@@ -331,6 +339,43 @@ impl InterfaceTheme {
 ///
 /// GPUI blends this over whatever is painted underneath, so one tint works on
 /// every surface elevation instead of needing a pre-blended constant each.
+/// What the terminal paints with: the page it sits on, its default ink,
+/// its cursor, and the sixteen ANSI colours a device names by number — the
+/// eight plain ones, then their bright twins. The plain red, green and
+/// yellow are the workbench's own danger, success and warning, so a
+/// device's colours and the chrome's agree.
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalPalette {
+    pub(crate) background: u32,
+    pub(crate) foreground: u32,
+    pub(crate) cursor: u32,
+    pub(crate) ansi: [u32; 16],
+}
+
+impl TerminalPalette {
+    pub(crate) const DARK: Self = Self {
+        background: 0x0b0d11,
+        foreground: 0xb2b8c4,
+        cursor: 0x8b87ff,
+        ansi: [
+            0x1b1f27, 0xef8a83, 0x4fc38a, 0xe0b070, 0x7aa2f7, 0xc792ea, 0x5fd1d8, 0xb2b8c4, //
+            0x767d8c, 0xff9f98, 0x6ee0a2, 0xf0c88a, 0x99b8ff, 0xd8aaff, 0x7fe6ec, 0xedf0f5,
+        ],
+    };
+
+    /// On white, "bright" cannot mean lighter or it would vanish; the bright
+    /// eight are the plain ones lifted a little instead.
+    pub(crate) const LIGHT: Self = Self {
+        background: 0xffffff,
+        foreground: 0x3b3b42,
+        cursor: 0x5b57d8,
+        ansi: [
+            0x17171b, 0xcb4b40, 0x2f8a5b, 0xa8730f, 0x2f6fd6, 0x8e44ad, 0x1a8a96, 0x3b3b42, //
+            0x86868f, 0xe0665b, 0x3aa66f, 0xc08a2a, 0x4f89e8, 0xa85ec8, 0x2aa3b1, 0x5c5c66,
+        ],
+    };
+}
+
 pub(crate) fn tint(color: u32, alpha: f32) -> Rgba {
     let mut color = rgb(color);
     color.a = alpha;
@@ -671,7 +716,7 @@ pub(crate) fn fonts() -> &'static WorkbenchFonts {
 /// call site cannot set an 11px label on 20px leading by accident.
 #[derive(Clone, Copy)]
 pub(crate) struct TextToken {
-    size: f32,
+    pub(crate) size: f32,
     line_height: f32,
     weight: FontWeight,
 }
@@ -713,8 +758,6 @@ pub(crate) const EYEBROW: TextToken = TextToken::new(10.5, 14., FontWeight::SEMI
 pub(crate) const MONO: TextToken = TextToken::new(12.5, 20., FontWeight::NORMAL);
 /// Timestamps, byte counts, inline command previews.
 pub(crate) const MONO_SMALL: TextToken = TextToken::new(11., 16., FontWeight::NORMAL);
-/// The RX / TX / SYS direction tags.
-pub(crate) const MONO_TAG: TextToken = TextToken::new(10., 14., FontWeight::BOLD);
 
 /// Applies the type scale to any styled element.
 pub(crate) trait Typography: Styled + Sized {
@@ -745,11 +788,6 @@ pub(crate) trait Typography: Styled + Sized {
         self.family_with_fallbacks(fonts().ui.clone())
     }
 
-    /// The editor family: the terminal, and anything else printing what a
-    /// device said.
-    fn mono_font(self) -> Self {
-        self.family_with_fallbacks(fonts().mono.clone())
-    }
 
     /// The chrome family: monospace that labels the interface rather than
     /// carrying traffic — a port's parameters, a saved command.
@@ -757,10 +795,6 @@ pub(crate) trait Typography: Styled + Sized {
         self.family_with_fallbacks(fonts().ui_mono.clone())
     }
 
-    /// The type scale plus the monospace family, for terminal-shaped text.
-    fn mono_token(self, token: TextToken) -> Self {
-        self.mono_font().text_token(token)
-    }
 
     /// The type scale plus the chrome's monospace family.
     fn ui_mono_token(self, token: TextToken) -> Self {

@@ -38,7 +38,7 @@ use crate::theme::{
     WorkbenchPalette, tint,
 };
 use crate::{
-    BAUD_RATES, DATA_BITS, FLOW_CONTROLS, LineKind, PARITIES, PortItem, PortKind, STOP_BITS,
+    BAUD_RATES, DATA_BITS, FLOW_CONTROLS, PARITIES, PortItem, PortKind, STOP_BITS,
     SerialConfiguration, SerialWorkspace, discover_ports, presets::StoredSession,
 };
 
@@ -1072,15 +1072,11 @@ impl SerialWorkspace {
             ));
             tab.selected_port = tab.ports.len() - 1;
         }
-        tab.push_line(
-            LineKind::System,
-            Vec::new(),
-            Some(format!(
-                "Session created for {} · {}",
-                port_name,
-                configuration.summary()
-            )),
-        );
+        tab.note(format!(
+            "Session created for {} · {}",
+            port_name,
+            configuration.summary()
+        ));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         cx.notify();

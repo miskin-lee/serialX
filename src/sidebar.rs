@@ -103,11 +103,7 @@ impl SerialWorkspace {
             ));
             tab.selected_port = tab.ports.len() - 1;
         }
-        tab.push_line(
-            crate::LineKind::System,
-            Vec::new(),
-            Some(format!("Restored saved session: {}", saved.label)),
-        );
+        tab.note(format!("Restored saved session: {}", saved.label));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         cx.notify();

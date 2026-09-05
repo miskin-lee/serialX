@@ -9,12 +9,14 @@ mod icons;
 mod presets;
 mod serial;
 mod sidebar;
+mod terminal;
 mod theme;
 mod title_bar;
 mod updater;
 mod workbench;
 
 use std::{
+    ops::Range,
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
@@ -38,10 +40,14 @@ use serial::*;
 use sidebar::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
+use terminal::key_bytes;
 use title_bar::{FILTER_PLACEHOLDER, traffic_light_position};
+use workbench::TerminalMetrics;
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
+/// Half a period of the cursor's blink: this long on, this long off.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 enum UpdateStatus {
     Checking,
@@ -71,6 +77,23 @@ pub struct SerialWorkspace {
     /// The dragged width of the side panel. Owned here rather than by the
     /// resizable group, so collapsing to the rail and back keeps the width.
     panel_layout: Entity<ResizableState>,
+    /// The terminal log as a place to type: while it holds focus, keys go to
+    /// the port of the tab in front.
+    terminal_focus: FocusHandle,
+    /// Text an input method is still composing over the terminal. Nothing
+    /// is sent until the composition is committed.
+    composing: Option<String>,
+    /// The terminal's cell size as last laid out, for placing the input
+    /// method's candidate window under the cursor.
+    terminal_metrics: TerminalMetrics,
+    /// Wheel travel short of a whole line, carried to the next event.
+    scroll_remainder: f32,
+    /// The cursor's blink: whether it is in its visible half, whether a
+    /// timer is running it, and which timer — a keystroke starts a new one
+    /// and the old one, when it fires, sees it is stale and does nothing.
+    cursor_shown: bool,
+    blinking: bool,
+    blink_epoch: usize,
 }
 
 impl SerialWorkspace {
@@ -94,15 +117,26 @@ impl SerialWorkspace {
             sessions_collapsed: false,
             commands_collapsed: false,
             panel_layout,
+            terminal_focus: cx.focus_handle(),
+            composing: None,
+            terminal_metrics: TerminalMetrics::default(),
+            scroll_remainder: 0.,
+            cursor_shown: true,
+            blinking: false,
+            blink_epoch: 0,
         };
+
+        // The cursor is drawn hollow while another window is in front, so
+        // the terminal has to redraw when this one comes and goes.
+        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+            .detach();
 
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 Timer::after(Duration::from_millis(80)).await;
                 if this
                     .update_in(cx, |this, window, cx| {
-                        let changed = this.drain_serial_events();
-                        if this.drain_update_events(window, cx) || changed {
+                        if this.drain_update_events(window, cx) {
                             cx.notify();
                         }
                     })
@@ -158,13 +192,44 @@ impl SerialWorkspace {
                 }
             },
         );
-        SerialTabState::new(
+        let mut tab = SerialTabState::new(
             id,
             send_input,
             send_subscription,
             filter_input,
             filter_subscription,
-        )
+        );
+        Self::listen_to_port(id, tab.take_events(), cx);
+        tab
+    }
+
+    /// Keeps a tab's terminal fed: a task that sleeps until the port's
+    /// threads report something, then hands it over at once — together with
+    /// whatever else has arrived meanwhile, so a burst is one update and
+    /// one frame rather than many. It ends when the tab is gone.
+    fn listen_to_port(
+        id: usize,
+        events: Option<smol::channel::Receiver<SerialEvent>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(events) = events else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
+                if this
+                    .update(cx, |this, cx| this.handle_serial_events(id, batch, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn active_tab(&self) -> Option<&SerialTabState> {
@@ -173,6 +238,14 @@ impl SerialWorkspace {
 
     fn tab_index(&self, id: usize) -> Option<usize> {
         self.tabs.iter().position(|tab| tab.id == id)
+    }
+
+    pub(crate) fn tab(&self, id: usize) -> Option<&SerialTabState> {
+        self.tabs.iter().find(|tab| tab.id == id)
+    }
+
+    pub(crate) fn tab_mut(&mut self, id: usize) -> Option<&mut SerialTabState> {
+        self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
     fn close_tab(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -266,11 +339,7 @@ impl SerialWorkspace {
             .position(|port| port.name == current.name)
             .unwrap_or(0);
         tab.ports = ports;
-        tab.push_line(
-            LineKind::System,
-            Vec::new(),
-            Some(format!("Scan complete · {found} devices found")),
-        );
+        tab.note(format!("Scan complete · {found} devices found"));
         cx.notify();
     }
 
@@ -282,11 +351,7 @@ impl SerialWorkspace {
         if tab.connected || tab.connecting {
             let device = tab.selected_port().name.clone();
             tab.disconnect();
-            tab.push_line(
-                LineKind::System,
-                Vec::new(),
-                Some(format!("Disconnected from {device}")),
-            );
+            tab.note(format!("Disconnected from {device}"));
             cx.notify();
             return;
         }
@@ -322,11 +387,7 @@ impl SerialWorkspace {
 
         let tab = &mut self.tabs[index];
         if !tab.connected {
-            tab.push_line(
-                LineKind::System,
-                Vec::new(),
-                Some("Connect a serial port before sending data.".into()),
-            );
+            tab.note("Connect a serial port before sending data.");
             cx.notify();
             return;
         }
@@ -337,48 +398,158 @@ impl SerialWorkspace {
             value.as_bytes().to_vec()
         };
         bytes.extend_from_slice(b"\r\n");
-        tab.push_line(LineKind::Tx, bytes.clone(), None);
-
-        if let Some(tx) = &tab.command_tx {
-            let _ = tx.send(SerialCommand::Write(bytes));
+        tab.write(bytes);
+        if tab.auto_scroll {
+            tab.terminal.scroll_to_bottom();
         }
 
         input.update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 
-    fn drain_serial_events(&mut self) -> bool {
-        let mut changed = false;
-        for tab in &mut self.tabs {
-            let events: Vec<_> = tab.event_rx.try_iter().collect();
-            if !events.is_empty() {
-                changed = true;
-            }
-            for event in events {
-                match event {
-                    SerialEvent::Connected => {
-                        tab.connecting = false;
-                        tab.connected = true;
-                        tab.push_line(
-                            LineKind::System,
-                            Vec::new(),
-                            Some("Serial port opened; receiving data.".into()),
-                        );
+    /// Text typed into the terminal goes to the port as it is typed, the
+    /// way a serial console works: what shows on screen is what the device
+    /// echoes back.
+    fn type_into_terminal(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if !tab.connected || text.is_empty() {
+            return;
+        }
+        tab.write(text.as_bytes().to_vec());
+        if tab.auto_scroll {
+            tab.terminal.scroll_to_bottom();
+        }
+        self.wake_cursor(window, cx);
+        cx.notify();
+    }
+
+    /// Starts the cursor blinking, if it is not already. Called from the
+    /// terminal's render while it holds focus, so the blink runs exactly
+    /// while there is a cursor to blink.
+    pub(crate) fn start_blinking(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.blinking || !self.cursor_blinks() {
+            return;
+        }
+        self.blinking = true;
+        self.cursor_shown = true;
+        self.schedule_blink(window, cx);
+    }
+
+    /// Shows the cursor at once and starts its blink over, so it never
+    /// vanishes under the finger.
+    fn wake_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor_shown = true;
+        if self.blinking {
+            self.schedule_blink(window, cx);
+        }
+    }
+
+    fn schedule_blink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.blink_epoch = self.blink_epoch.wrapping_add(1);
+        let epoch = self.blink_epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            Timer::after(CURSOR_BLINK_INTERVAL).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.blink_epoch != epoch {
+                    return;
+                }
+                let focused =
+                    this.terminal_focus.is_focused(window) && window.is_window_active();
+                if !focused || !this.cursor_blinks() {
+                    this.blinking = false;
+                    this.cursor_shown = true;
+                    cx.notify();
+                    return;
+                }
+                this.cursor_shown = !this.cursor_shown;
+                cx.notify();
+                this.schedule_blink(window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Whether the terminal in front wants its cursor to blink at all.
+    fn cursor_blinks(&self) -> bool {
+        self.active_tab()
+            .is_none_or(|tab| tab.terminal.cursor_blinks())
+    }
+
+    /// A key pressed with the terminal focused: editing and control keys
+    /// go out as the bytes a terminal sends for them. Plain text does not
+    /// come this way but through the input handler, so an input method can
+    /// compose it first; keys the terminal has no meaning for, and every
+    /// command shortcut, pass on to the menus.
+    fn terminal_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if !tab.connected {
+            return;
+        }
+        let Some(bytes) = key_bytes(&event.keystroke, tab.terminal.mode()) else {
+            return;
+        };
+        tab.write(bytes);
+        if tab.auto_scroll {
+            tab.terminal.scroll_to_bottom();
+        }
+        self.wake_cursor(window, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The wheel over the terminal moves through its scrollback. Scrolling
+    /// up stops the view following new output, which would otherwise pull
+    /// it straight back down; reaching the bottom again resumes following.
+    fn scroll_terminal(&mut self, delta_lines: f32, cx: &mut Context<Self>) {
+        self.scroll_remainder += delta_lines;
+        let lines = self.scroll_remainder.trunc() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_remainder -= lines as f32;
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.terminal.scroll(lines);
+        tab.auto_scroll = tab.terminal.is_at_bottom();
+        cx.notify();
+    }
+
+    fn handle_serial_events(
+        &mut self,
+        tab_id: usize,
+        events: Vec<SerialEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        for event in events {
+            match event {
+                SerialEvent::Connected => {
+                    tab.connecting = false;
+                    tab.connected = true;
+                    tab.note("Serial port opened; receiving data.");
+                }
+                SerialEvent::Data(bytes) => {
+                    if !tab.paused {
+                        tab.receive(&bytes);
                     }
-                    SerialEvent::Data(bytes) => {
-                        if !tab.paused {
-                            tab.push_line(LineKind::Rx, bytes, None);
-                        }
-                    }
-                    SerialEvent::Error(message) => {
-                        tab.disconnect();
-                        tab.push_line(LineKind::System, Vec::new(), Some(message));
-                    }
-                    SerialEvent::Closed => tab.disconnect(),
+                }
+                SerialEvent::Error(message) => {
+                    tab.disconnect();
+                    tab.note(message);
                 }
             }
         }
-        changed
+        if tab.auto_scroll {
+            tab.terminal.scroll_to_bottom();
+        }
+        cx.notify();
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -390,7 +561,7 @@ impl SerialWorkspace {
 
     fn clear_terminal(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.terminal_lines.clear();
+            tab.terminal.clear();
             cx.notify();
         }
     }
@@ -402,7 +573,7 @@ impl SerialWorkspace {
         }
     }
 
-    /// Selects a payload mode outright, for the segmented ASCII / HEX switch
+    /// Selects a payload mode outright, for the segmented UTF-8 / HEX switch
     /// where each half names the mode it turns on rather than flipping it.
     fn set_hex_mode(&mut self, hex_mode: bool, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab)
@@ -423,6 +594,9 @@ impl SerialWorkspace {
     fn toggle_auto_scroll(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.auto_scroll = !tab.auto_scroll;
+            if tab.auto_scroll {
+                tab.terminal.scroll_to_bottom();
+            }
             cx.notify();
         }
     }
@@ -627,6 +801,114 @@ impl SerialWorkspace {
         });
     }
 }
+/// The terminal as a text input, so that typing into it goes through the
+/// platform's text system: an input method composes Chinese or Japanese
+/// before anything is sent, and dead keys and option-combinations yield the
+/// character they name. There is no text to edit, so ranges are moot: every
+/// insertion is sent as it comes, and only the composition in progress is
+/// held.
+impl EntityInputHandler for SerialWorkspace {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let end = self.marked_text_len();
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.composing.as_ref().map(|_| 0..self.marked_text_len())
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.composing = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composing = None;
+        self.type_into_terminal(text, window, cx);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composing = (!new_text.is_empty()).then(|| new_text.to_string());
+        cx.notify();
+    }
+
+    /// Where the input method puts its candidate window: the terminal's
+    /// cursor cell.
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let metrics = self.terminal_metrics;
+        let (line, column) = self
+            .active_tab()
+            .and_then(|tab| tab.terminal.cursor_position())
+            .unwrap_or((0, 0));
+        Some(Bounds {
+            origin: point(
+                element_bounds.left() + px(metrics.text_left + metrics.cell_width * column as f32),
+                element_bounds.top() + px(metrics.line_height * line as f32),
+            ),
+            size: size(px(metrics.cell_width.max(1.)), px(metrics.line_height.max(1.))),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        self.active_tab().is_some_and(|tab| tab.connected)
+    }
+}
+
+impl SerialWorkspace {
+    fn marked_text_len(&self) -> usize {
+        self.composing
+            .as_ref()
+            .map_or(0, |text| text.encode_utf16().count())
+    }
+}
+
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
@@ -634,7 +916,7 @@ impl Render for SerialWorkspace {
         let tab_strip = self.render_tab_strip(active_snapshot.as_ref(), cx);
         let title_bar = self.render_title_bar(active_snapshot.as_ref(), cx);
         let content = match active_snapshot.clone() {
-            Some(tab) => self.render_active_tab(tab, cx),
+            Some(tab) => self.render_active_tab(tab, window, cx),
             None => self.render_empty_state(window, cx),
         };
         let sidebar = self.render_right_sidebar(active_snapshot, cx);

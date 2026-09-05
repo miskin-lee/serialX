@@ -1,6 +1,10 @@
 use std::{
     io::{Read, Write},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender},
+    },
     thread,
     time::Duration,
 };
@@ -10,6 +14,7 @@ use gpui_kit::{Entity, Subscription};
 use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
+use crate::terminal::Terminal;
 use crate::theme::TagColor;
 
 /// The rates the session dialog lists. Any other rate can be typed in; these
@@ -60,42 +65,6 @@ impl PortItem {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LineKind {
-    Rx,
-    Tx,
-    System,
-}
-
-#[derive(Clone)]
-pub(crate) struct TerminalLine {
-    pub(crate) time: String,
-    pub(crate) kind: LineKind,
-    pub(crate) payload: Vec<u8>,
-    pub(crate) note: Option<String>,
-}
-
-impl TerminalLine {
-    /// The text the line prints as: its note, or the payload in the tab's
-    /// mode. The filter matches against this, so what it reads is what you see.
-    pub(crate) fn display_text(&self, hex_mode: bool) -> String {
-        if let Some(note) = &self.note {
-            return note.clone();
-        }
-        if hex_mode {
-            self.payload
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            String::from_utf8_lossy(&self.payload)
-                .trim_end_matches(['\r', '\n'])
-                .to_string()
-        }
-    }
-}
-
 pub(crate) enum SerialCommand {
     Write(Vec<u8>),
     Stop,
@@ -105,8 +74,10 @@ pub(crate) enum SerialEvent {
     Connected,
     Data(Vec<u8>),
     Error(String),
-    Closed,
 }
+
+/// How long a read waits for bytes before checking whether it should stop.
+const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// The parameters a port is opened with. The baud rate is the number itself,
 /// since it can be any the device asks for; the frame is stored as indices
@@ -287,15 +258,16 @@ pub(crate) struct SerialTabState {
     pub(crate) hex_mode: bool,
     pub(crate) timestamps: bool,
     pub(crate) auto_scroll: bool,
-    pub(crate) terminal_lines: Vec<TerminalLine>,
-    clock_tick: usize,
+    pub(crate) terminal: Terminal,
     pub(crate) send_input: Entity<InputState>,
     /// The title bar filter box and what it currently holds back.
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
     pub(crate) command_tx: Option<Sender<SerialCommand>>,
-    pub(crate) event_tx: Sender<SerialEvent>,
-    pub(crate) event_rx: Receiver<SerialEvent>,
+    /// Where the port's threads report to. The receiving end is taken by
+    /// the task that feeds the terminal, the moment the tab is built.
+    pub(crate) event_tx: smol::channel::Sender<SerialEvent>,
+    event_rx: Option<smol::channel::Receiver<SerialEvent>>,
     _input_subscription: Subscription,
     _filter_subscription: Subscription,
 }
@@ -308,7 +280,7 @@ impl SerialTabState {
         filter_input: Entity<InputState>,
         filter_subscription: Subscription,
     ) -> Self {
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = smol::channel::unbounded();
         Self {
             id,
             ports: discover_ports(),
@@ -322,19 +294,17 @@ impl SerialTabState {
             hex_mode: false,
             timestamps: true,
             auto_scroll: true,
-            terminal_lines: vec![TerminalLine {
-                time: "14:32:40.018".into(),
-                kind: LineKind::System,
-                payload: Vec::new(),
-                note: Some("Configure the serial port, then connect.".into()),
-            }],
-            clock_tick: 0,
+            terminal: {
+                let mut terminal = Terminal::default();
+                terminal.note("Configure the serial port, then connect.", &now());
+                terminal
+            },
             send_input,
             filter_input,
             filter: OutputFilter::default(),
             command_tx: None,
             event_tx,
-            event_rx,
+            event_rx: Some(event_rx),
             _input_subscription: input_subscription,
             _filter_subscription: filter_subscription,
         }
@@ -349,22 +319,28 @@ impl SerialTabState {
         self.alias.as_deref().unwrap_or(&self.selected_port().name)
     }
 
-    fn now(&mut self) -> String {
-        self.clock_tick = self.clock_tick.wrapping_add(1);
-        let seconds = 40 + (self.clock_tick % 19);
-        format!("14:32:{seconds:02}.{:03}", (self.clock_tick * 73) % 1000)
+    pub(crate) fn take_events(&mut self) -> Option<smol::channel::Receiver<SerialEvent>> {
+        self.event_rx.take()
     }
 
-    pub(crate) fn push_line(&mut self, kind: LineKind, payload: Vec<u8>, note: Option<String>) {
-        let time = self.now();
-        self.terminal_lines.push(TerminalLine {
-            time,
-            kind,
-            payload,
-            note,
-        });
-        if self.terminal_lines.len() > 400 {
-            self.terminal_lines.drain(..80);
+    /// Prints a line of the workbench's own in the terminal.
+    pub(crate) fn note(&mut self, text: impl AsRef<str>) {
+        self.terminal.note(text.as_ref(), &now());
+    }
+
+    /// Hands what the port read to the terminal, and sends back whatever
+    /// the terminal answers with.
+    pub(crate) fn receive(&mut self, bytes: &[u8]) {
+        let answer = self.terminal.receive(bytes, &now());
+        if !answer.is_empty() {
+            self.write(answer);
+        }
+    }
+
+    /// Hands bytes to the port. Nothing happens when the tab is not open.
+    pub(crate) fn write(&self, bytes: Vec<u8>) {
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(SerialCommand::Write(bytes));
         }
     }
 
@@ -377,6 +353,11 @@ impl SerialTabState {
     }
 }
 
+/// The wall clock, to the millisecond, as a line's timestamp reads.
+fn now() -> String {
+    chrono::Local::now().format("%H:%M:%S%.3f").to_string()
+}
+
 impl Drop for SerialTabState {
     fn drop(&mut self) {
         if let Some(tx) = self.command_tx.take() {
@@ -385,7 +366,7 @@ impl Drop for SerialTabState {
     }
 }
 
-/// What the render pass reads of a tab: the log and the switches over it.
+/// What the render pass reads of a tab: the switches over the terminal.
 /// The port and its tag are drawn from the tab itself, in the strip.
 #[derive(Clone)]
 pub(crate) struct SerialTabSnapshot {
@@ -396,24 +377,12 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) hex_mode: bool,
     pub(crate) timestamps: bool,
     pub(crate) auto_scroll: bool,
-    pub(crate) terminal_lines: Vec<TerminalLine>,
+    /// How many rows on screen the title bar filter matches, out of how
+    /// many there are, while a filter is set.
+    pub(crate) filter_counts: Option<(usize, usize)>,
     pub(crate) send_input: Entity<InputState>,
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
-}
-
-impl SerialTabSnapshot {
-    /// The lines the title bar filter lets through, with their positions in
-    /// the log. An idle filter skips the text formatting altogether.
-    pub(crate) fn visible_lines(&self) -> impl Iterator<Item = (usize, &TerminalLine)> {
-        let active = self.filter.is_active();
-        self.terminal_lines
-            .iter()
-            .enumerate()
-            .filter(move |(_, line)| {
-                !active || self.filter.matches(&line.display_text(self.hex_mode))
-            })
-    }
 }
 
 impl From<&SerialTabState> for SerialTabSnapshot {
@@ -426,7 +395,11 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             hex_mode: tab.hex_mode,
             timestamps: tab.timestamps,
             auto_scroll: tab.auto_scroll,
-            terminal_lines: tab.terminal_lines.clone(),
+            filter_counts: tab.filter.is_active().then(|| {
+                let texts = tab.terminal.visible_texts();
+                let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
+                (matching, texts.len())
+            }),
             send_input: tab.send_input.clone(),
             filter_input: tab.filter_input.clone(),
             filter: tab.filter.clone(),
@@ -463,58 +436,75 @@ pub(crate) fn discover_ports() -> Vec<PortItem> {
     ports
 }
 
+/// Opens the port and runs it on two threads: one reading, one writing.
+///
+/// A read blocks for up to its timeout, so a write that had to wait its
+/// turn behind one would go out late by that much — a keystroke visibly
+/// behind the finger. With a thread each, what you type goes out the moment
+/// it is typed, and what arrives is passed on the moment it is read. The
+/// writer stops when it is told to or when its channel closes with the tab;
+/// the reader notices on its next timeout and follows.
 pub(crate) fn spawn_serial_worker(
     port_name: String,
     configuration: SerialConfiguration,
     commands: Receiver<SerialCommand>,
-    events: Sender<SerialEvent>,
+    events: smol::channel::Sender<SerialEvent>,
 ) {
     thread::spawn(move || {
-        let mut port = match serialport::new(&port_name, configuration.baud_rate())
+        let opened = serialport::new(&port_name, configuration.baud_rate())
             .data_bits(configuration.data_bits())
             .stop_bits(configuration.stop_bits())
             .parity(configuration.parity())
             .flow_control(configuration.flow_control())
-            .timeout(Duration::from_millis(24))
+            .timeout(READ_TIMEOUT)
             .open()
-        {
-            Ok(port) => port,
+            .and_then(|reader| reader.try_clone().map(|writer| (reader, writer)));
+        let (mut reader, mut writer) = match opened {
+            Ok(ports) => ports,
             Err(error) => {
-                let _ = events.send(SerialEvent::Error(format!(
+                let _ = events.send_blocking(SerialEvent::Error(format!(
                     "Unable to open {port_name}: {error}"
                 )));
                 return;
             }
         };
+        let _ = events.send_blocking(SerialEvent::Connected);
 
-        let _ = events.send(SerialEvent::Connected);
-        let mut buffer = [0_u8; 2048];
-        loop {
-            while let Ok(command) = commands.try_recv() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let writer_events = events.clone();
+        let writer_stopped = stopped.clone();
+        thread::spawn(move || {
+            for command in commands {
                 match command {
                     SerialCommand::Write(bytes) => {
-                        if let Err(error) = port.write_all(&bytes) {
-                            let _ =
-                                events.send(SerialEvent::Error(format!("Send failed: {error}")));
-                            return;
+                        if let Err(error) = writer.write_all(&bytes) {
+                            let _ = writer_events
+                                .send_blocking(SerialEvent::Error(format!("Send failed: {error}")));
+                            break;
                         }
                     }
-                    SerialCommand::Stop => {
-                        let _ = events.send(SerialEvent::Closed);
-                        return;
-                    }
+                    SerialCommand::Stop => break,
                 }
             }
+            writer_stopped.store(true, Ordering::Relaxed);
+        });
 
-            match port.read(&mut buffer) {
+        let mut buffer = [0_u8; 4096];
+        while !stopped.load(Ordering::Relaxed) {
+            match reader.read(&mut buffer) {
                 Ok(count) if count > 0 => {
-                    let _ = events.send(SerialEvent::Data(buffer[..count].to_vec()));
+                    if events
+                        .send_blocking(SerialEvent::Data(buffer[..count].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(error) => {
-                    let _ = events.send(SerialEvent::Error(format!("Read failed: {error}")));
-                    return;
+                    let _ = events.send_blocking(SerialEvent::Error(format!("Read failed: {error}")));
+                    break;
                 }
             }
         }

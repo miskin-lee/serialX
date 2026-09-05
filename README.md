@@ -21,8 +21,12 @@
 - 内置 Loopback 演示设备，没有硬件也能直接体验完整界面
 - 自定义 macOS 标题栏与紧凑、低干扰的编辑器式工作台布局
 - 参考 Material Icon Theme 的双色圆角图标集：设备、会话、命令、终端、信号各有专属色相
-- 统一的排版比例与字体解析：启动时在 Inter / SF Pro / Segoe UI 与 JetBrains Mono / SF Mono / Menlo
-  等候选中挑选本机已安装的最佳字族
+- 统一的排版比例，字体选择与 VS Code 对齐：不打包字库，按平台复用 VS Code 的字族栈，启动时取本机
+  第一款已安装的字族。终端沿用编辑器字族（macOS Menlo、Windows Consolas、Linux Droid Sans Mono），
+  界面里的等宽文本沿用 VS Code 的 `--monaco-monospace-font`（macOS SF Mono / Monaco），界面字体则是
+  各平台的系统 UI 字体或 Segoe UI
+- 按系统语言挂载 CJK 回退字族（PingFang SC、Microsoft YaHei、Source Han Sans 等），设备发来的
+  中日韩文本照常显示，读者自己的语言排在最前
 
 ## 运行
 

@@ -284,7 +284,7 @@ impl Render for SerialConfigurationEditor {
                     )
                     .child(
                         div()
-                            .mono_token(BODY_STRONG)
+                            .ui_mono_token(BODY_STRONG)
                             .text_color(rgb(palette.strong_foreground))
                             .child(format!(
                                 "{} · {} · {}",

@@ -9,7 +9,10 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
-use gpui_kit::{App, FontWeight, Rgba, SharedString, Styled, Window, WindowAppearance, px, rgb};
+use gpui_kit::{
+    App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Rgba, SharedString, Styled,
+    Window, WindowAppearance, px, rgb,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InterfaceTheme {
@@ -60,6 +63,13 @@ pub(crate) struct WorkbenchPalette {
     pub(crate) category_command: u32,
     pub(crate) category_terminal: u32,
     pub(crate) category_signal: u32,
+    /// The wordmark's three inks, taken from `docs/logo.svg` so the identity
+    /// in the app and the one at the top of the README are the same drawing.
+    /// Only the body switches with the canvas; the orange `s` and the green
+    /// `X` are the logo's own colours in both themes.
+    pub(crate) wordmark_lead: u32,
+    pub(crate) wordmark_body: u32,
+    pub(crate) wordmark_tail: u32,
 }
 
 impl InterfaceTheme {
@@ -130,6 +140,9 @@ impl InterfaceTheme {
                 category_command: 0x3d8a45,
                 category_terminal: 0x8250c8,
                 category_signal: 0x0f8593,
+                wordmark_lead: 0xff754c,
+                wordmark_body: 0x4d75ff,
+                wordmark_tail: 0x35b873,
             },
             // Ink: a near-black canvas lifted by a hint of blue, so the panels
             // separate from the terminal without a single hard grey.
@@ -164,6 +177,9 @@ impl InterfaceTheme {
                 category_command: 0x86cf6a,
                 category_terminal: 0xc08ae8,
                 category_signal: 0x4fc9dc,
+                wordmark_lead: 0xff754c,
+                wordmark_body: 0xf4f3ef,
+                wordmark_tail: 0x35b873,
             },
         }
     }
@@ -183,50 +199,284 @@ pub(crate) fn tint(color: u32, alpha: f32) -> Rgba {
 // Typography
 // ---------------------------------------------------------------------------
 
-/// Families that read well as UI text, best first.
+/// A font stack: the families to try, best first, and the family to fall back
+/// on when this machine has none of them.
 ///
-/// GPUI resolves a single family name per run, so the "stack" has to be walked
-/// against the installed fonts rather than handed to the text system whole.
-const UI_FONT_CANDIDATES: &[&str] = &[
-    "Inter",
-    "Inter Display",
-    "SF Pro Text",
-    "SF Pro Display",
-    "Segoe UI Variable Text",
-    "Segoe UI",
-    "Helvetica Neue",
-    "Noto Sans",
-];
+/// GPUI resolves one family name per text run, so a CSS-style stack has to be
+/// walked against the installed fonts here rather than handed to the text
+/// system whole.
+struct FontStack {
+    candidates: &'static [&'static str],
+    fallback: &'static str,
+}
 
-const MONO_FONT_CANDIDATES: &[&str] = &[
-    "JetBrains Mono",
-    "SF Mono",
-    "Menlo",
-    "Cascadia Mono",
-    "Cascadia Code",
-    "Consolas",
-    "Liberation Mono",
-    "DejaVu Sans Mono",
-];
+/// What one platform reads its interface and its terminal in.
+///
+/// The two monospace roles are VS Code's own split: `mono` is the editor font,
+/// which the terminal and everything else printed as device output uses, and
+/// `ui_mono` is the `--monaco-monospace-font` the chrome sets inline code in.
+/// They differ on macOS, where the editor opens in Menlo but the chrome reads
+/// in SF Mono.
+struct PlatformFonts {
+    ui: FontStack,
+    mono: FontStack,
+    ui_mono: FontStack,
+    cjk: CjkFallbacks,
+}
 
-const UI_FONT_FALLBACK: &str = ".SystemUIFont";
+/// The CJK families VS Code appends to its stacks, per language.
+///
+/// VS Code keys these off the language its own interface is in — the
+/// `:lang(zh-Hans)` and friends variants of every rule above. serialX has one
+/// English interface, so CJK never arrives as interface text here; it arrives
+/// as device output, in whichever language the device speaks. The user's own
+/// language is the best guess at which Han variant they want to read, so it
+/// leads, and the rest follow it for coverage rather than being dropped.
+struct CjkFallbacks {
+    simplified_chinese: &'static [&'static str],
+    traditional_chinese: &'static [&'static str],
+    japanese: &'static [&'static str],
+    korean: &'static [&'static str],
+}
 
-const MONO_FONT_FALLBACK: &str = if cfg!(target_os = "macos") {
-    "Menlo"
-} else if cfg!(windows) {
-    "Consolas"
-} else {
-    "monospace"
+// serialX borrows VS Code's layout, so it borrows how VS Code picks type as
+// well: no bundled family, one hard-coded stack per platform, and the platform
+// font first. The three below are the stacks VS Code 1.136 asks for — the UI
+// ones from the `.monaco-workbench.mac | .windows | .linux` rules in
+// `workbench.desktop.main.css`, the mono ones from the per-platform
+// `EDITOR_FONT_DEFAULTS.fontFamily`, which is also what its integrated terminal
+// inherits. All three are compiled into every build, so a name can only be
+// wrong, never unbuildable on the platform nobody is compiling for today.
+
+/// `-apple-system, BlinkMacSystemFont, sans-serif` over
+/// `Menlo, Monaco, 'Courier New', monospace`.
+///
+/// Both UI names are the browser's alias for the system font, so that stack has
+/// nothing to walk: GPUI spells the same font `.SystemUIFont` and resolves it
+/// to `.AppleSystemUIFont` here.
+const MAC_FONTS: PlatformFonts = PlatformFonts {
+    ui: FontStack {
+        candidates: &[],
+        fallback: ".SystemUIFont",
+    },
+    mono: FontStack {
+        candidates: &["Menlo", "Monaco", "Courier New"],
+        fallback: "Menlo",
+    },
+    // `"SF Mono", Monaco, Menlo, Courier, monospace`.
+    ui_mono: FontStack {
+        candidates: &["SF Mono", "Monaco", "Menlo", "Courier"],
+        fallback: "Menlo",
+    },
+    cjk: CjkFallbacks {
+        simplified_chinese: &["PingFang SC", "Hiragino Sans GB"],
+        traditional_chinese: &["PingFang TC"],
+        japanese: &["Hiragino Kaku Gothic Pro"],
+        korean: &["Apple SD Gothic Neo", "Nanum Gothic", "AppleGothic"],
+    },
 };
+
+/// `Segoe WPC, Segoe UI, sans-serif` over `Consolas, 'Courier New', monospace`.
+///
+/// `Segoe WPC` is VS Code's own name for the shell font; where neither Segoe is
+/// installed, GPUI's `.SystemUIFont` lands where the CSS generic would.
+const WINDOWS_FONTS: PlatformFonts = PlatformFonts {
+    ui: FontStack {
+        candidates: &["Segoe WPC", "Segoe UI"],
+        fallback: ".SystemUIFont",
+    },
+    mono: FontStack {
+        candidates: &["Consolas", "Courier New"],
+        fallback: "Consolas",
+    },
+    // `Consolas, "Courier New", monospace`: the only platform where VS Code
+    // reads its chrome and its editor in the same face.
+    ui_mono: FontStack {
+        candidates: &["Consolas", "Courier New"],
+        fallback: "Consolas",
+    },
+    cjk: CjkFallbacks {
+        simplified_chinese: &["Microsoft YaHei"],
+        traditional_chinese: &["Microsoft Jhenghei"],
+        japanese: &["Yu Gothic UI", "Meiryo UI"],
+        korean: &["Malgun Gothic", "Dotom"],
+    },
+};
+
+/// `system-ui, Ubuntu, Droid Sans, sans-serif` over
+/// `'Droid Sans Mono', monospace`.
+///
+/// `system-ui` cannot be forwarded as-is, because GPUI resolves
+/// `.SystemUIFont` on Linux to the font Zed bundles rather than to the
+/// desktop's own. The desktop faces fontconfig would land on are spelled out
+/// after VS Code's two names instead, and the monospace generic is filled in
+/// with the families VS Code itself names in its Linux monospace stack.
+const LINUX_FONTS: PlatformFonts = PlatformFonts {
+    ui: FontStack {
+        candidates: &[
+            "Ubuntu",
+            "Droid Sans",
+            "Cantarell",
+            "Noto Sans",
+            "DejaVu Sans",
+            "Liberation Sans",
+        ],
+        fallback: "sans-serif",
+    },
+    mono: FontStack {
+        candidates: &[
+            "Droid Sans Mono",
+            "Ubuntu Mono",
+            "Liberation Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+        ],
+        fallback: "monospace",
+    },
+    // `"Ubuntu Mono", "Liberation Mono", "DejaVu Sans Mono", "Courier New",
+    // monospace`.
+    ui_mono: FontStack {
+        candidates: &[
+            "Ubuntu Mono",
+            "Liberation Mono",
+            "DejaVu Sans Mono",
+            "Courier New",
+        ],
+        fallback: "monospace",
+    },
+    cjk: CjkFallbacks {
+        simplified_chinese: &[
+            "Source Han Sans SC",
+            "Source Han Sans CN",
+            "Source Han Sans",
+        ],
+        traditional_chinese: &[
+            "Source Han Sans TC",
+            "Source Han Sans TW",
+            "Source Han Sans",
+        ],
+        japanese: &["Source Han Sans J", "Source Han Sans JP", "Source Han Sans"],
+        korean: &[
+            "Source Han Sans K",
+            "Source Han Sans JR",
+            "Source Han Sans",
+            "UnDotum",
+            "FBaekmuk Gulim",
+        ],
+    },
+};
+
+/// The stacks for the platform this binary was built for.
+const fn platform_fonts() -> PlatformFonts {
+    if cfg!(target_os = "macos") {
+        MAC_FONTS
+    } else if cfg!(target_os = "windows") {
+        WINDOWS_FONTS
+    } else {
+        LINUX_FONTS
+    }
+}
 
 /// The families this machine actually has, resolved once at startup.
 #[derive(Clone)]
 pub(crate) struct WorkbenchFonts {
     pub(crate) ui: SharedString,
+    /// The terminal, and anything else printing what a device said.
     pub(crate) mono: SharedString,
+    /// Monospace inside the chrome: config summaries, saved commands.
+    pub(crate) ui_mono: SharedString,
+    /// Consulted for the glyphs the family above has none of, which for a
+    /// serial monitor means whatever the device on the other end sends.
+    pub(crate) cjk: Option<FontFallbacks>,
 }
 
 static FONTS: OnceLock<WorkbenchFonts> = OnceLock::new();
+
+/// The first family in the stack this machine has installed.
+fn pick_family(stack: &FontStack, installed: &[String]) -> SharedString {
+    stack
+        .candidates
+        .iter()
+        .find(|candidate| {
+            installed
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(candidate))
+        })
+        .copied()
+        .unwrap_or(stack.fallback)
+        .to_string()
+        .into()
+}
+
+/// Which of the CJK lists the reader most likely wants to be read in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CjkLanguage {
+    SimplifiedChinese,
+    TraditionalChinese,
+    Japanese,
+    Korean,
+}
+
+impl CjkLanguage {
+    /// Reads a language out of a tag as either a locale or an environment
+    /// variable spells it: `zh-Hant-TW`, `zh_TW.UTF-8`, `ja`.
+    fn from_tag(tag: &str) -> Option<Self> {
+        let tag = tag.to_ascii_lowercase().replace('_', "-");
+        let mut parts = tag.split(['-', '.', '@']).filter(|part| !part.is_empty());
+        let language = parts.next()?;
+        let rest = parts.collect::<Vec<_>>();
+        let tagged = |name: &str| rest.contains(&name);
+
+        match language {
+            // Simplified is the default for an unqualified `zh`: it is what
+            // the majority of `zh` systems and every `zh-CN` one reads.
+            "zh" => {
+                if tagged("hant") || tagged("tw") || tagged("hk") || tagged("mo") {
+                    Some(Self::TraditionalChinese)
+                } else {
+                    Some(Self::SimplifiedChinese)
+                }
+            }
+            "ja" => Some(Self::Japanese),
+            "ko" => Some(Self::Korean),
+            _ => None,
+        }
+    }
+}
+
+/// The platform's CJK families, the reader's own language first.
+fn cjk_fallbacks(cjk: &CjkFallbacks, language: Option<CjkLanguage>) -> Vec<String> {
+    let lists = [
+        (CjkLanguage::SimplifiedChinese, cjk.simplified_chinese),
+        (CjkLanguage::TraditionalChinese, cjk.traditional_chinese),
+        (CjkLanguage::Japanese, cjk.japanese),
+        (CjkLanguage::Korean, cjk.korean),
+    ];
+
+    let mut families: Vec<String> = Vec::new();
+    let mut push = |list: &[&str]| {
+        for family in list {
+            // Linux names the same Source Han Sans in several lists, and a
+            // family repeated in a cascade is just a slower cascade.
+            if !families.iter().any(|seen| seen == family) {
+                families.push((*family).to_string());
+            }
+        }
+    };
+
+    if let Some(preferred) = language.and_then(|language| {
+        lists
+            .iter()
+            .find_map(|(candidate, list)| (*candidate == language).then_some(*list))
+    }) {
+        push(preferred);
+    }
+    for (_, list) in lists {
+        push(list);
+    }
+
+    families
+}
 
 /// Picks the best installed family for each role.
 ///
@@ -234,28 +484,29 @@ static FONTS: OnceLock<WorkbenchFonts> = OnceLock::new();
 /// whole workbench keeps rendering in one typeface.
 pub(crate) fn resolve_fonts(cx: &App) {
     let installed = cx.text_system().all_font_names();
-    let pick = |candidates: &[&str], fallback: &str| -> SharedString {
-        candidates
-            .iter()
-            .find(|candidate| {
-                installed
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(candidate))
-            })
-            .map(|name| SharedString::from(name.to_string()))
-            .unwrap_or_else(|| SharedString::from(fallback.to_string()))
-    };
+    let platform = platform_fonts();
+    let language = sys_locale::get_locale().and_then(|tag| CjkLanguage::from_tag(&tag));
 
     let _ = FONTS.set(WorkbenchFonts {
-        ui: pick(UI_FONT_CANDIDATES, UI_FONT_FALLBACK),
-        mono: pick(MONO_FONT_CANDIDATES, MONO_FONT_FALLBACK),
+        ui: pick_family(&platform.ui, &installed),
+        mono: pick_family(&platform.mono, &installed),
+        ui_mono: pick_family(&platform.ui_mono, &installed),
+        cjk: Some(FontFallbacks::from_fonts(cjk_fallbacks(
+            &platform.cjk,
+            language,
+        ))),
     });
 }
 
 pub(crate) fn fonts() -> &'static WorkbenchFonts {
-    FONTS.get_or_init(|| WorkbenchFonts {
-        ui: UI_FONT_FALLBACK.into(),
-        mono: MONO_FONT_FALLBACK.into(),
+    FONTS.get_or_init(|| {
+        let platform = platform_fonts();
+        WorkbenchFonts {
+            ui: platform.ui.fallback.into(),
+            mono: platform.mono.fallback.into(),
+            ui_mono: platform.ui_mono.fallback.into(),
+            cjk: None,
+        }
     })
 }
 
@@ -278,8 +529,11 @@ impl TextToken {
     }
 }
 
-/// Hero copy on the empty workspace.
-pub(crate) const DISPLAY: TextToken = TextToken::new(30., 36., FontWeight::SEMIBOLD);
+/// The `serialX` wordmark on the empty workspace. Heavier than the rest of the
+/// scale, and a step past the 750 the logo is drawn at: set at a fraction of
+/// the README's size, the same numeric weight would read thinner than the mark
+/// standing next to it.
+pub(crate) const WORDMARK: TextToken = TextToken::new(34., 42., FontWeight(800.));
 /// Card and dialog titles.
 pub(crate) const TITLE: TextToken = TextToken::new(15., 22., FontWeight::SEMIBOLD);
 /// Panel and section headings.
@@ -309,17 +563,47 @@ pub(crate) trait Typography: Styled + Sized {
             .font_weight(token.weight)
     }
 
-    fn ui_font(self) -> Self {
-        self.font_family(fonts().ui.clone())
+    /// A family plus the CJK cascade behind it.
+    ///
+    /// Fallbacks cannot be set on their own, only as part of a whole `Font`,
+    /// which resets the weight — so this has to run before [`text_token`],
+    /// exactly the order the helpers below use.
+    ///
+    /// [`text_token`]: Typography::text_token
+    fn family_with_fallbacks(self, family: SharedString) -> Self {
+        self.font(Font {
+            family,
+            features: FontFeatures::default(),
+            fallbacks: fonts().cjk.clone(),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+        })
     }
 
+    fn ui_font(self) -> Self {
+        self.family_with_fallbacks(fonts().ui.clone())
+    }
+
+    /// The editor family: the terminal, and anything else printing what a
+    /// device said.
     fn mono_font(self) -> Self {
-        self.font_family(fonts().mono.clone())
+        self.family_with_fallbacks(fonts().mono.clone())
+    }
+
+    /// The chrome family: monospace that labels the interface rather than
+    /// carrying traffic — a port's parameters, a saved command.
+    fn ui_mono_font(self) -> Self {
+        self.family_with_fallbacks(fonts().ui_mono.clone())
     }
 
     /// The type scale plus the monospace family, for terminal-shaped text.
     fn mono_token(self, token: TextToken) -> Self {
         self.mono_font().text_token(token)
+    }
+
+    /// The type scale plus the chrome's monospace family.
+    fn ui_mono_token(self, token: TextToken) -> Self {
+        self.ui_mono_font().text_token(token)
     }
 }
 
@@ -428,7 +712,7 @@ fn workbench_theme_config(theme: InterfaceTheme) -> ThemeConfig {
         mode: theme.mode(),
         font_family: Some(fonts.ui.clone()),
         font_size: Some(BODY.size),
-        mono_font_family: Some(fonts.mono.clone()),
+        mono_font_family: Some(fonts.ui_mono.clone()),
         mono_font_size: Some(MONO.size),
         radius: Some(8),
         radius_lg: Some(12),
@@ -448,7 +732,14 @@ pub(crate) fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, 
 
 #[cfg(test)]
 mod tests {
-    use super::{BODY, DISPLAY, InterfaceTheme, MICRO, MONO, tint};
+    use super::{
+        BODY, CjkLanguage, FontStack, InterfaceTheme, LINUX_FONTS, MAC_FONTS, MICRO, MONO,
+        WINDOWS_FONTS, WORDMARK, cjk_fallbacks, pick_family, tint,
+    };
+
+    fn installed(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
 
     #[test]
     fn light_theme_keeps_a_pure_white_canvas() {
@@ -507,10 +798,156 @@ mod tests {
 
     #[test]
     fn type_scale_climbs_without_ties() {
-        let sizes = [MICRO, MONO, BODY, DISPLAY].map(|token| token.size);
+        let sizes = [MICRO, MONO, BODY, WORDMARK].map(|token| token.size);
         assert!(
             sizes.windows(2).all(|pair| pair[0] < pair[1]),
             "type scale steps must be strictly increasing: {sizes:?}"
+        );
+    }
+
+    /// A stack is a preference order, not a list of equals: the second name is
+    /// only reached when the machine is missing the first.
+    #[test]
+    fn a_font_stack_takes_the_best_family_the_machine_has() {
+        let stack = FontStack {
+            candidates: &["Consolas", "Courier New"],
+            fallback: "monospace",
+        };
+
+        assert_eq!(
+            pick_family(&stack, &installed(&["Courier New", "consolas"])),
+            "Consolas",
+            "matching is case-insensitive, and the first candidate still wins"
+        );
+        assert_eq!(
+            pick_family(&stack, &installed(&["Courier New"])),
+            "Courier New"
+        );
+        assert_eq!(pick_family(&stack, &installed(&["Arial"])), "monospace");
+    }
+
+    /// A name that is blank, or a fallback that is, would leave the workbench
+    /// with no font at all — and only on the platform nobody is building for.
+    #[test]
+    fn every_platform_stack_names_something() {
+        for platform in [MAC_FONTS, WINDOWS_FONTS, LINUX_FONTS] {
+            for stack in [&platform.ui, &platform.mono, &platform.ui_mono] {
+                assert!(!stack.fallback.trim().is_empty());
+                assert!(stack.candidates.iter().all(|name| !name.trim().is_empty()));
+            }
+
+            let cascade = cjk_fallbacks(&platform.cjk, None);
+            assert!(!cascade.is_empty(), "every platform names CJK families");
+            assert!(cascade.iter().all(|name| !name.trim().is_empty()));
+        }
+    }
+
+    /// Locales reach us in several spellings, and the one that matters most —
+    /// which Han variant to draw — hides in a subtag rather than the language.
+    #[test]
+    fn a_language_tag_resolves_to_the_script_it_is_read_in() {
+        use CjkLanguage::*;
+
+        for (tag, expected) in [
+            ("zh", Some(SimplifiedChinese)),
+            ("zh-CN", Some(SimplifiedChinese)),
+            ("zh_CN.UTF-8", Some(SimplifiedChinese)),
+            ("zh-Hans-CN", Some(SimplifiedChinese)),
+            ("zh-Hant", Some(TraditionalChinese)),
+            ("zh_TW.UTF-8", Some(TraditionalChinese)),
+            ("zh-HK", Some(TraditionalChinese)),
+            ("ja-JP", Some(Japanese)),
+            ("ko_KR.UTF-8", Some(Korean)),
+            ("en-US", None),
+            ("", None),
+        ] {
+            assert_eq!(CjkLanguage::from_tag(tag), expected, "{tag}");
+        }
+    }
+
+    /// The reader's own language leads, but nothing is dropped: a device that
+    /// speaks a different one still has a font to be printed in.
+    #[test]
+    fn the_cjk_cascade_leads_with_the_readers_language() {
+        let cascade = cjk_fallbacks(&MAC_FONTS.cjk, Some(CjkLanguage::Japanese));
+        assert_eq!(
+            cascade.first().map(String::as_str),
+            Some("Hiragino Kaku Gothic Pro")
+        );
+        assert!(cascade.iter().any(|family| family == "PingFang SC"));
+
+        assert_eq!(
+            cjk_fallbacks(&MAC_FONTS.cjk, None)
+                .first()
+                .map(String::as_str),
+            Some("PingFang SC"),
+            "with no language to go on, the cascade keeps its written order"
+        );
+    }
+
+    /// Linux names one Source Han Sans in all four lists, and a family
+    /// repeated in a cascade is just a slower cascade.
+    #[test]
+    fn the_cjk_cascade_names_each_family_once() {
+        let cascade = cjk_fallbacks(&LINUX_FONTS.cjk, Some(CjkLanguage::TraditionalChinese));
+        let mut unique = cascade.clone();
+        unique.sort();
+        unique.dedup();
+
+        assert_eq!(cascade.len(), unique.len(), "{cascade:?}");
+        assert_eq!(
+            cascade.first().map(String::as_str),
+            Some("Source Han Sans TC")
+        );
+    }
+
+    /// The macOS UI stack is shaped like this: `-apple-system` is the system
+    /// font itself, so there is nothing to walk and the fallback is the answer.
+    #[test]
+    fn a_stack_with_nothing_to_choose_takes_its_fallback() {
+        let stack = FontStack {
+            candidates: &[],
+            fallback: ".SystemUIFont",
+        };
+
+        assert_eq!(
+            pick_family(&stack, &installed(&["Helvetica Neue"])),
+            ".SystemUIFont"
+        );
+    }
+
+    /// The `fill="#RRGGBB"` inks of a logo's `<text>` element, in file order:
+    /// the body first, then the `s` and the `X` overrides.
+    fn logo_wordmark_inks(svg: &str) -> Vec<u32> {
+        let wordmark = svg
+            .split_once("<text")
+            .expect("the logo carries a wordmark")
+            .1;
+        wordmark
+            .split("fill=\"#")
+            .skip(1)
+            .map(|ink| u32::from_str_radix(&ink[..6], 16).expect("a six-digit hex ink"))
+            .collect()
+    }
+
+    /// Nothing but this test keeps the wordmark in the app and the one in the
+    /// README from drifting apart, since they are drawn by different engines.
+    #[test]
+    fn the_wordmark_is_inked_like_the_logo() {
+        let light = InterfaceTheme::Light.palette();
+        assert_eq!(
+            logo_wordmark_inks(include_str!("../docs/logo.svg")),
+            vec![
+                light.wordmark_body,
+                light.wordmark_lead,
+                light.wordmark_tail
+            ],
+        );
+
+        let dark = InterfaceTheme::Dark.palette();
+        assert_eq!(
+            logo_wordmark_inks(include_str!("../docs/logo-dark.svg")),
+            vec![dark.wordmark_body, dark.wordmark_lead, dark.wordmark_tail],
         );
     }
 

@@ -21,7 +21,7 @@ use crate::app_icon::application_icon_image;
 use crate::app_menu::NewSerialTab;
 use crate::icons::{Glyph, icon_chip};
 use crate::theme::{
-    BODY, CAPTION, DISPLAY, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, TITLE, Typography,
+    BODY, CAPTION, LABEL, MICRO, MONO, MONO_SMALL, MONO_TAG, TITLE, Typography, WORDMARK,
     WorkbenchPalette, tint,
 };
 use crate::{LineKind, SerialTabSnapshot, SerialWorkspace, TerminalLine};
@@ -137,7 +137,7 @@ impl SerialWorkspace {
                                     .child(
                                         div()
                                             .flex_none()
-                                            .mono_token(MONO_SMALL)
+                                            .ui_mono_token(MONO_SMALL)
                                             .child(tab.configuration.summary()),
                                     )
                                     .child(div().flex_none().child("·"))
@@ -488,6 +488,27 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
+    /// The `serialX` wordmark, inked like the logo: an orange `s`, the body in
+    /// the theme's own ink, and a green `X`.
+    ///
+    /// GPUI shapes a text element as a single run, so the three inks come from
+    /// highlight ranges over one string rather than from three labels set side
+    /// by side, which would lose the kerning between the letters.
+    fn render_wordmark(palette: WorkbenchPalette) -> impl IntoElement {
+        let ink = |color: u32| HighlightStyle {
+            color: Some(rgb(color).into()),
+            ..Default::default()
+        };
+
+        div()
+            .text_token(WORDMARK)
+            .text_color(rgb(palette.wordmark_body))
+            .child(StyledText::new("serialX").with_highlights([
+                (0..1, ink(palette.wordmark_lead)),
+                (6..7, ink(palette.wordmark_tail)),
+            ]))
+    }
+
     /// Shown when no tab is open: identity first, then the three ways in.
     pub(crate) fn render_empty_state(
         &mut self,
@@ -545,24 +566,13 @@ impl SerialWorkspace {
             .child(
                 v_flex()
                     .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .p_3()
-                            .rounded_3xl()
-                            .bg(tint(palette.accent, 0.07))
-                            .child(img(application_icon_image()).size(px(84.))),
-                    )
+                    .gap_5()
+                    .child(img(application_icon_image()).size(px(104.)))
                     .child(
                         v_flex()
                             .items_center()
                             .gap_1p5()
-                            .child(
-                                div()
-                                    .text_token(DISPLAY)
-                                    .text_color(rgb(palette.strong_foreground))
-                                    .child("serialX"),
-                            )
+                            .child(Self::render_wordmark(palette))
                             .child(
                                 div()
                                     .text_token(BODY)

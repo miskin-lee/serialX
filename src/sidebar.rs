@@ -439,7 +439,7 @@ impl SerialWorkspace {
                                         .child(
                                             div()
                                                 .truncate()
-                                                .mono_token(MONO_SMALL)
+                                                .ui_mono_token(MONO_SMALL)
                                                 .text_color(rgb(palette.faint))
                                                 .child(saved.configuration.summary()),
                                         ),
@@ -533,7 +533,7 @@ impl SerialWorkspace {
                                     .child(
                                         div()
                                             .truncate()
-                                            .mono_token(MONO_SMALL)
+                                            .ui_mono_token(MONO_SMALL)
                                             .text_color(rgb(palette.faint))
                                             .child(saved.command),
                                     ),

@@ -24,18 +24,17 @@ pub(crate) enum Glyph {
     Bolt,
     Bookmark,
     Cable,
-    Clock,
+    Folder,
+    FolderPlus,
     Hex,
-    Pause,
-    Play,
+    Pencil,
     Port,
     Refresh,
     Run,
-    Scroll,
     Send,
-    Sweep,
     Tag,
     Terminal,
+    Trash,
 }
 
 impl Glyph {
@@ -44,18 +43,17 @@ impl Glyph {
             Self::Bolt => "icons/ui/bolt.svg",
             Self::Bookmark => "icons/ui/bookmark.svg",
             Self::Cable => "icons/ui/cable.svg",
-            Self::Clock => "icons/ui/clock.svg",
+            Self::Folder => "icons/ui/folder.svg",
+            Self::FolderPlus => "icons/ui/folder-plus.svg",
             Self::Hex => "icons/ui/hex.svg",
-            Self::Pause => "icons/ui/pause.svg",
-            Self::Play => "icons/ui/play.svg",
+            Self::Pencil => "icons/ui/pencil.svg",
             Self::Port => "icons/ui/port.svg",
             Self::Refresh => "icons/ui/refresh.svg",
             Self::Run => "icons/ui/run.svg",
-            Self::Scroll => "icons/ui/scroll.svg",
             Self::Send => "icons/ui/send.svg",
-            Self::Sweep => "icons/ui/sweep.svg",
             Self::Tag => "icons/ui/tag.svg",
             Self::Terminal => "icons/ui/terminal.svg",
+            Self::Trash => "icons/ui/trash.svg",
         }
     }
 }
@@ -81,20 +79,20 @@ const GLYPHS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/ui/cable.svg"),
     ),
     (
-        "icons/ui/clock.svg",
-        include_bytes!("../assets/icons/ui/clock.svg"),
+        "icons/ui/folder.svg",
+        include_bytes!("../assets/icons/ui/folder.svg"),
+    ),
+    (
+        "icons/ui/folder-plus.svg",
+        include_bytes!("../assets/icons/ui/folder-plus.svg"),
     ),
     (
         "icons/ui/hex.svg",
         include_bytes!("../assets/icons/ui/hex.svg"),
     ),
     (
-        "icons/ui/pause.svg",
-        include_bytes!("../assets/icons/ui/pause.svg"),
-    ),
-    (
-        "icons/ui/play.svg",
-        include_bytes!("../assets/icons/ui/play.svg"),
+        "icons/ui/pencil.svg",
+        include_bytes!("../assets/icons/ui/pencil.svg"),
     ),
     (
         "icons/ui/port.svg",
@@ -109,16 +107,8 @@ const GLYPHS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/ui/run.svg"),
     ),
     (
-        "icons/ui/scroll.svg",
-        include_bytes!("../assets/icons/ui/scroll.svg"),
-    ),
-    (
         "icons/ui/send.svg",
         include_bytes!("../assets/icons/ui/send.svg"),
-    ),
-    (
-        "icons/ui/sweep.svg",
-        include_bytes!("../assets/icons/ui/sweep.svg"),
     ),
     (
         "icons/ui/tag.svg",
@@ -127,6 +117,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/terminal.svg",
         include_bytes!("../assets/icons/ui/terminal.svg"),
+    ),
+    (
+        "icons/ui/trash.svg",
+        include_bytes!("../assets/icons/ui/trash.svg"),
     ),
 ];
 
@@ -185,18 +179,17 @@ mod tests {
         Glyph::Bolt,
         Glyph::Bookmark,
         Glyph::Cable,
-        Glyph::Clock,
+        Glyph::Folder,
+        Glyph::FolderPlus,
         Glyph::Hex,
-        Glyph::Pause,
-        Glyph::Play,
+        Glyph::Pencil,
         Glyph::Port,
         Glyph::Refresh,
         Glyph::Run,
-        Glyph::Scroll,
         Glyph::Send,
-        Glyph::Sweep,
         Glyph::Tag,
         Glyph::Terminal,
+        Glyph::Trash,
     ];
 
     /// A glyph whose file is missing renders as nothing at all, with no error,

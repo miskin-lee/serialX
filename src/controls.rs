@@ -6,10 +6,17 @@
 //! is a pill or a rounded plate on a hairline: the same vocabulary the title
 //! bar speaks, so a form opened from the bar reads as part of the same surface.
 
+use gpui_kit::component::{
+    button::{Button, ButtonVariants},
+    dialog::{Cancel, Confirm, DialogFooter},
+    h_flex,
+    kbd::Kbd,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::theme::{EYEBROW, TextToken, Typography, WorkbenchPalette, tint};
+use crate::icons::Glyph;
+use crate::theme::{CAPTION, EYEBROW, TextToken, Typography, WorkbenchPalette, tint};
 
 /// What picking a [`Choice`] does.
 type OnChoose = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -136,6 +143,53 @@ pub(crate) fn tag(
         .text_color(rgb(color))
         .whitespace_nowrap()
         .child(text.into())
+}
+
+/// The foot of a dialog: `⏎ to confirm` at the left and, at the right, a
+/// ghost `Cancel` beside the one primary action, named for what it does.
+/// Both buttons dispatch the dialog's own actions, so the keys, the buttons
+/// and the close mark all go the same way.
+pub(crate) fn dialog_footer(
+    palette: WorkbenchPalette,
+    confirm: &'static str,
+    glyph: Glyph,
+) -> DialogFooter {
+    DialogFooter::new()
+        .justify_between()
+        .items_center()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .text_token(CAPTION)
+                .text_color(rgb(palette.faint))
+                .children(
+                    Keystroke::parse("enter")
+                        .ok()
+                        .map(|stroke| Kbd::new(stroke).outline()),
+                )
+                .child("to confirm"),
+        )
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new("dialog-cancel")
+                        .ghost()
+                        .label("Cancel")
+                        .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
+                )
+                .child(
+                    Button::new("dialog-confirm")
+                        .primary()
+                        .icon(glyph)
+                        .label(confirm)
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(Confirm { secondary: false }), cx)
+                        }),
+                ),
+        )
 }
 
 /// A section label in small caps. Tracking has to be typed in, so the label is

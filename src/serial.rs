@@ -252,6 +252,9 @@ pub(crate) struct SerialTabState {
     pub(crate) color: TagColor,
     /// The name the tab was given, if any; the port's path stands in for it.
     pub(crate) alias: Option<String>,
+    /// The saved group the session was filed under when it was made or
+    /// opened, so saving it again keeps it there.
+    pub(crate) group: Option<u64>,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
@@ -291,6 +294,7 @@ impl SerialTabState {
             configuration: SerialConfiguration::default(),
             color: TagColor::default(),
             alias: None,
+            group: None,
             connected: false,
             connecting: false,
             paused: false,
@@ -370,17 +374,16 @@ impl Drop for SerialTabState {
     }
 }
 
-/// What the render pass reads of a tab: the switches over the terminal.
-/// The port and its tag are drawn from the tab itself, in the strip.
+/// What the render pass reads of a tab: its connection, and the switches
+/// that shape the terminal and the composer. The port and its tag are drawn
+/// from the tab itself, in the strip.
 #[derive(Clone)]
 pub(crate) struct SerialTabSnapshot {
     pub(crate) id: usize,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
-    pub(crate) paused: bool,
     pub(crate) hex_mode: bool,
     pub(crate) timestamps: bool,
-    pub(crate) auto_scroll: bool,
     /// How many rows on screen the title bar filter matches, out of how
     /// many there are, while a filter is set.
     pub(crate) filter_counts: Option<(usize, usize)>,
@@ -395,10 +398,8 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             id: tab.id,
             connected: tab.connected,
             connecting: tab.connecting,
-            paused: tab.paused,
             hex_mode: tab.hex_mode,
             timestamps: tab.timestamps,
-            auto_scroll: tab.auto_scroll,
             filter_counts: tab.filter.is_active().then(|| {
                 let texts = tab.terminal.visible_texts();
                 let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();

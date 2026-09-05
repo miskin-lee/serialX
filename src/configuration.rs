@@ -11,17 +11,17 @@
 //! Last, the tab itself: a name, which stands in for the port's path wherever
 //! the session is listed, and two rows of colour swatches, twenty-four in all,
 //! for telling this session's tab from the others; a new session is offered
-//! the first colour no open tab wears. A summary line at the foot restates the
-//! choice in the `115200 8N1` shorthand the rest of the workbench prints,
-//! behind a tag glyph in the chosen colour.
+//! the first colour no open tab wears. In the corner of that section, the
+//! group the session files under in the side panel: a list of the groups
+//! there are, with an offer to make one. A summary line at the foot restates
+//! the choice in the `115200 8N1` shorthand the rest of the workbench prints,
+//! behind a tag glyph in the chosen colour, with the group named at its end.
 
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
-    dialog::{Cancel, Confirm, DialogFooter},
     h_flex,
     input::{Input, InputEvent, InputState},
-    kbd::Kbd,
     menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
     tooltip::Tooltip,
@@ -30,8 +30,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::controls::{Choice, ChoiceText, eyebrow, segmented, tag};
+use crate::controls::{Choice, ChoiceText, dialog_footer, eyebrow, segmented, tag};
+use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
+use crate::presets::{StoredGroup, StoredSession};
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
     BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TAG_HUE_COUNT, TITLE, TagColor, Typography,
@@ -39,7 +41,7 @@ use crate::theme::{
 };
 use crate::{
     BAUD_RATES, DATA_BITS, FLOW_CONTROLS, PARITIES, PortItem, PortKind, STOP_BITS,
-    SerialConfiguration, SerialWorkspace, discover_ports, presets::StoredSession,
+    SerialConfiguration, SerialWorkspace, discover_ports,
 };
 
 /// Width of the dialog: room for a two-column frame, and for the baud field
@@ -56,6 +58,10 @@ const BAUD_LIST_MAX_HEIGHT: f32 = 320.;
 /// How far the caret's right edge sits in from the field's. The list hangs
 /// from the caret, so it is narrowed by this much to line up with the field.
 const BAUD_LIST_INSET: f32 = 8.;
+/// The narrowest the list of groups opens: room for a name of some length.
+const GROUP_LIST_MIN_WIDTH: f32 = 180.;
+/// What the group picker says while the session is in no group.
+const NO_GROUP: &str = "No group";
 /// Height of one device row.
 const PORT_ROW_HEIGHT: f32 = 44.;
 /// The most device rows the list shows before it scrolls.
@@ -132,11 +138,18 @@ enum ConfigurationField {
 struct SerialConfigurationEditor {
     target: ConfigurationTarget,
     theme: InterfaceTheme,
+    /// The workspace the dialog was opened from: where a group made from
+    /// here is kept.
+    workspace: WeakEntity<SerialWorkspace>,
     ports: Vec<PortItem>,
     selected_port: usize,
     configuration: SerialConfiguration,
     /// The colour the session's tab will be tagged with.
     color: TagColor,
+    /// The group the session files under, and the groups there are to pick
+    /// from — a copy, refreshed when one is made from the dialog.
+    group: Option<u64>,
+    groups: Vec<StoredGroup>,
     /// The name the tab will carry. Its placeholder is the chosen device, so
     /// an empty field shows what the tab will say instead.
     alias_input: Entity<InputState>,
@@ -152,11 +165,15 @@ struct SerialConfigurationEditor {
 }
 
 impl SerialConfigurationEditor {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         target: ConfigurationTarget,
         theme: InterfaceTheme,
+        workspace: WeakEntity<SerialWorkspace>,
         saved: Option<&StoredSession>,
         color: TagColor,
+        group: Option<u64>,
+        groups: Vec<StoredGroup>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -216,10 +233,13 @@ impl SerialConfigurationEditor {
         Self {
             target,
             theme,
+            workspace,
             ports,
             selected_port,
             configuration,
             color,
+            group,
+            groups,
             alias_input,
             _alias_subscription: alias_subscription,
             baud_input,
@@ -310,6 +330,45 @@ impl SerialConfigurationEditor {
 
     fn select_color(&mut self, color: TagColor, cx: &mut Context<Self>) {
         self.color = color;
+        cx.notify();
+    }
+
+    fn select_group(&mut self, group: Option<u64>, cx: &mut Context<Self>) {
+        self.group = group;
+        cx.notify();
+    }
+
+    /// The name of the chosen group, or none while the session is in none.
+    fn group_name(&self) -> Option<String> {
+        let id = self.group?;
+        self.groups
+            .iter()
+            .find(|group| group.id == id)
+            .map(|group| group.name.clone())
+    }
+
+    /// Opens the group prompt over the dialog. The group it makes — or names
+    /// again, when the name was a group's already — becomes the pick.
+    fn new_group(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = cx.weak_entity();
+        let _ = self.workspace.update(cx, |workspace, cx| {
+            workspace.open_group_prompt(
+                GroupPrompt::New,
+                move |group, _, cx| {
+                    let _ = editor.update(cx, |editor, cx| editor.adopt_group(group, cx));
+                },
+                window,
+                cx,
+            );
+        });
+    }
+
+    /// Takes the workspace's groups again and picks one of them.
+    fn adopt_group(&mut self, group: u64, cx: &mut Context<Self>) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            self.groups = workspace.read(cx).presets.groups.clone();
+        }
+        self.group = Some(group);
         cx.notify();
     }
 
@@ -748,11 +807,73 @@ impl SerialConfigurationEditor {
             .into_any_element()
     }
 
-    /// The tab: its name and its colour, side by side under one eyebrow. The
-    /// name field takes what the swatches leave; the swatches are the bright
-    /// dozen over the deep dozen, so a column holds two colours that read as
-    /// kin. Two rows beside the field, rather than under it, keep the footer
-    /// on screen at the smallest window.
+    /// The group picker: a pill naming the group, or `No group`, that opens
+    /// the list of groups with a way to make one at its foot. It sits in the
+    /// Tab section's corner, where the Device section keeps its rescan.
+    fn render_group_picker(
+        &mut self,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = self.group_name();
+        let current = self.group;
+        let groups = self.groups.clone();
+        let editor = cx.weak_entity();
+        let ink = if name.is_some() {
+            palette.category_session
+        } else {
+            palette.muted
+        };
+
+        Button::new("config-group")
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(Glyph::Folder).text_color(rgb(ink)))
+            .label(name.unwrap_or_else(|| NO_GROUP.to_string()))
+            .dropdown_caret(true)
+            .tooltip("The group this session files under in the side panel")
+            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                menu = menu.min_w(px(GROUP_LIST_MIN_WIDTH));
+                let pick = |group: Option<u64>| {
+                    let editor = editor.clone();
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                        let _ = editor.update(cx, |editor, cx| editor.select_group(group, cx));
+                    }
+                };
+                menu = menu.item(
+                    PopupMenuItem::new(NO_GROUP)
+                        .checked(current.is_none())
+                        .on_click(pick(None)),
+                );
+                if !groups.is_empty() {
+                    menu = menu.separator();
+                }
+                for group in &groups {
+                    menu = menu.item(
+                        PopupMenuItem::new(group.name.clone())
+                            .icon(Icon::new(Glyph::Folder))
+                            .checked(current == Some(group.id))
+                            .on_click(pick(Some(group.id))),
+                    );
+                }
+                let editor = editor.clone();
+                menu.separator().item(
+                    PopupMenuItem::new("New group…")
+                        .icon(Icon::new(Glyph::FolderPlus))
+                        .on_click(move |_, window, cx| {
+                            let _ = editor.update(cx, |editor, cx| editor.new_group(window, cx));
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The tab: its name and its colour, side by side under one eyebrow, and
+    /// its group in the eyebrow's corner. The name field takes what the
+    /// swatches leave; the swatches are the bright dozen over the deep dozen,
+    /// so a column holds two colours that read as kin. Two rows beside the
+    /// field, rather than under it, keep the footer on screen at the
+    /// smallest window.
     fn render_tab_section(
         &mut self,
         palette: WorkbenchPalette,
@@ -784,16 +905,12 @@ impl SerialConfigurationEditor {
             );
         }
 
-        let aside = div()
-            .text_token(CAPTION)
-            .text_color(rgb(palette.faint))
-            .child("Name is optional · the device stands in")
-            .into_any_element();
+        let picker = self.render_group_picker(palette, cx);
 
         Self::section(
             palette,
             "Tab",
-            Some(aside),
+            Some(picker),
             h_flex()
                 .h(px(TAG_BLOCK_HEIGHT))
                 .items_center()
@@ -808,10 +925,12 @@ impl SerialConfigurationEditor {
     /// device, then the shorthand the tab bar and saved sessions print, and
     /// under it the same thing in words — with the device first when a name
     /// has taken its place above. All behind a tag glyph in the chosen
-    /// colour, the one place the tag is named as a tag.
+    /// colour, the one place the tag is named as a tag, and with the group
+    /// as a pill at the end when there is one.
     fn render_summary(&self, palette: WorkbenchPalette, cx: &App) -> AnyElement {
         let port = self.selected_port();
         let hue = palette.tag(self.color);
+        let group = self.group_name();
         let device = port.map_or("No device", |port| port.name.as_str());
         let alias = self.alias(cx);
         let title = alias.as_deref().unwrap_or(device);
@@ -863,6 +982,9 @@ impl SerialConfigurationEditor {
                             .child(spelled_out),
                     ),
             )
+            .when_some(group, |strip, group| {
+                strip.child(tag(palette, palette.category_session, MICRO, group))
+            })
             .into_any_element()
     }
 }
@@ -916,17 +1038,32 @@ impl SerialWorkspace {
                 .find(|saved| saved.id == saved_id),
         };
         let theme = self.interface_theme;
-        // A saved session keeps its colour; a new one is offered a colour no
-        // open tab wears, so the strip tells its sessions apart from the start.
-        let color = match (target, saved) {
-            (ConfigurationTarget::SavedSession(_), Some(saved)) => saved.color,
-            _ => suggest_tag(self.tabs.iter().map(|tab| tab.color)),
+        // A saved session keeps its colour and its group; a new one is
+        // offered a colour no open tab wears, so the strip tells its sessions
+        // apart from the start, and starts in no group.
+        let (color, group) = match (target, saved) {
+            (ConfigurationTarget::SavedSession(_), Some(saved)) => {
+                (saved.color, self.presets.resolve_group(saved.group))
+            }
+            _ => (suggest_tag(self.tabs.iter().map(|tab| tab.color)), None),
         };
-        let editor =
-            cx.new(|cx| SerialConfigurationEditor::new(target, theme, saved, color, window, cx));
+        let groups = self.presets.groups.clone();
+        let workspace = cx.weak_entity();
+        let editor = cx.new(|cx| {
+            SerialConfigurationEditor::new(
+                target,
+                theme,
+                workspace.clone(),
+                saved,
+                color,
+                group,
+                groups,
+                window,
+                cx,
+            )
+        });
         let editor_for_dialog = editor.clone();
         let editor_for_submit = editor.clone();
-        let workspace = cx.weak_entity();
         let (title, blurb, confirm, confirm_glyph) = match target {
             ConfigurationTarget::NewTab => (
                 "New session",
@@ -962,49 +1099,7 @@ impl SerialWorkspace {
                 .description(blurb)
                 .close_button(true)
                 .child(editor_for_dialog.clone())
-                .footer(
-                    DialogFooter::new()
-                        .justify_between()
-                        .items_center()
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_1p5()
-                                .text_token(CAPTION)
-                                .text_color(rgb(palette.faint))
-                                .children(
-                                    Keystroke::parse("enter")
-                                        .ok()
-                                        .map(|stroke| Kbd::new(stroke).outline()),
-                                )
-                                .child("to confirm"),
-                        )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    Button::new("config-cancel")
-                                        .ghost()
-                                        .label("Cancel")
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(Box::new(Cancel), cx)
-                                        }),
-                                )
-                                .child(
-                                    Button::new("config-confirm")
-                                        .primary()
-                                        .icon(confirm_glyph)
-                                        .label(confirm)
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(
-                                                Box::new(Confirm { secondary: false }),
-                                                cx,
-                                            )
-                                        }),
-                                ),
-                        ),
-                )
+                .footer(dialog_footer(palette, confirm, confirm_glyph))
                 .on_ok(move |_, window, cx| {
                     // A field that does not hold a rate keeps the dialog
                     // open, with the field in focus, rather than opening the
@@ -1021,6 +1116,7 @@ impl SerialWorkspace {
                     let configuration = editor.configuration.sanitized();
                     let color = editor.color;
                     let alias = editor.alias(cx);
+                    let group = editor.group;
                     let target = editor.target;
 
                     let _ = workspace.update(cx, |workspace, cx| match target {
@@ -1029,6 +1125,7 @@ impl SerialWorkspace {
                             configuration,
                             color,
                             alias,
+                            group,
                             window,
                             cx,
                         ),
@@ -1039,7 +1136,11 @@ impl SerialWorkspace {
                                 configuration,
                                 color,
                                 alias,
+                                group,
                             );
+                            if let Some(group) = workspace.presets.resolve_group(group) {
+                                workspace.reveal_group(group);
+                            }
                             cx.notify();
                         }
                     });
@@ -1048,12 +1149,14 @@ impl SerialWorkspace {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_configured_tab(
         &mut self,
         port_name: String,
         configuration: SerialConfiguration,
         color: TagColor,
         alias: Option<String>,
+        group: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1063,6 +1166,7 @@ impl SerialWorkspace {
         tab.configuration = configuration.sanitized();
         tab.color = color;
         tab.alias = alias;
+        tab.group = self.presets.resolve_group(group);
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {

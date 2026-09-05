@@ -6,6 +6,13 @@
 //! Material Icon Theme: a command is green, and a session wears its own tag
 //! colour, so the card and the tab it opens match.
 //!
+//! Saved sessions file under groups — folders, each a row with a chevron over
+//! its cards, the way an explorer shows a directory — with the sessions in no
+//! group at the top level beneath them. A card opens on a double-click, as a
+//! session does in any session manager; a single click only picks it out, and
+//! its two buttons edit it and forget it, so nothing happens by a slip of the
+//! pointer.
+//!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
 //! counts and reopens on a click. A collapsed section gives its height back to
@@ -22,7 +29,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::app_menu::SaveCurrentSession;
+use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
+use crate::presets::{StoredGroup, StoredSession};
 use crate::theme::{
     CAPTION, HEADING, LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, tint,
 };
@@ -38,9 +48,33 @@ pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
 /// Width of the collapsed rail: one icon chip plus breathing room.
 const RAIL_WIDTH: f32 = 52.;
 const SECTION_HEADER_HEIGHT: f32 = 38.;
-/// Resting opacity of a row's remove button. Visible enough to find, quiet
-/// enough not to compete with the row it would delete.
-const ROW_ACTION_REST: f32 = 0.3;
+/// The most of the panel the saved sessions take while Quick send is open.
+const SESSIONS_SHARE: f32 = 0.5;
+/// The rows of a list are of fixed heights, and the list is given the sum:
+/// a scroll region only scrolls from a definite height, and a list sized to
+/// its rows by the layout alone came out empty. A card is two lines of type
+/// with the padding around them; the gap is the list's `gap_1p5`; the
+/// bottom padding its `pb_2`.
+const CARD_HEIGHT: f32 = 52.;
+const LIST_GAP: f32 = 6.;
+const LIST_PAD_BOTTOM: f32 = 8.;
+/// Height of the prompt an empty list shows.
+const EMPTY_HINT_HEIGHT: f32 = 122.;
+/// Height of a group's row: a line of label type with air, shorter than a
+/// card so the folders read as headings over their cards, not as more cards.
+const GROUP_ROW_HEIGHT: f32 = 28.;
+/// Height of the line an empty group shows in place of cards.
+const GROUP_EMPTY_HEIGHT: f32 = 26.;
+/// Where a group's guide line falls: under the centre of its chevron.
+const GROUP_GUIDE_INSET: f32 = 11.;
+/// The gap between the guide and the cards it groups.
+const GROUP_BODY_GAP: f32 = 8.;
+/// Resting opacity of a row's buttons. Visible enough to find, quiet enough
+/// not to compete with the row they act on.
+const ROW_ACTION_REST: f32 = 0.35;
+/// How strongly the accent washes the picked-out card, and rings it.
+const SELECTED_PLATE: f32 = 0.07;
+const SELECTED_RING: f32 = 0.55;
 
 /// Which of the two libraries a header or rail button stands for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,17 +91,26 @@ impl SerialWorkspace {
         let port_name = tab.selected_port().name.clone();
         let configuration = tab.configuration;
         let label = format!("{} · {}", port_name, configuration.summary());
+        let group = self.presets.resolve_group(tab.group);
         self.presets.add_session(
             label,
             port_name,
             configuration,
             tab.color,
             tab.alias.clone(),
+            group,
         );
         self.sessions_collapsed = false;
+        if let Some(group) = group {
+            self.collapsed_groups.remove(&group);
+        }
         cx.notify();
     }
 
+    /// Opens a saved session: a tab on its port, connecting at once when the
+    /// device is attached, so a double-click on the card is the whole way
+    /// from the list to a live terminal. A tab already on that port is
+    /// brought to the front instead — a port cannot be opened twice.
     pub(crate) fn open_saved_session(
         &mut self,
         saved_id: u64,
@@ -83,6 +126,17 @@ impl SerialWorkspace {
         else {
             return;
         };
+        self.selected_saved = Some(saved_id);
+
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.selected_port().name == saved.port_name)
+        {
+            self.active_tab = index;
+            cx.notify();
+            return;
+        }
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
@@ -90,27 +144,60 @@ impl SerialWorkspace {
         tab.configuration = saved.configuration.sanitized();
         tab.color = saved.color;
         tab.alias = saved.alias.clone();
-        if let Some(index) = tab
+        tab.group = self.presets.resolve_group(saved.group);
+        let attached = match tab
             .ports
             .iter()
             .position(|port| port.name == saved.port_name)
         {
-            tab.selected_port = index;
-        } else {
-            tab.ports.push(crate::PortItem::unavailable(
-                saved.port_name.clone(),
-                "Saved device · currently unavailable",
-            ));
-            tab.selected_port = tab.ports.len() - 1;
-        }
+            Some(index) => {
+                tab.selected_port = index;
+                true
+            }
+            None => {
+                tab.ports.push(crate::PortItem::unavailable(
+                    saved.port_name.clone(),
+                    "Saved device · currently unavailable",
+                ));
+                tab.selected_port = tab.ports.len() - 1;
+                false
+            }
+        };
         tab.note(format!("Restored saved session: {}", saved.label));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
+        if attached {
+            self.toggle_connection(id, cx);
+        }
         cx.notify();
+    }
+
+    fn select_saved_session(&mut self, saved_id: u64, cx: &mut Context<Self>) {
+        if self.selected_saved != Some(saved_id) {
+            self.selected_saved = Some(saved_id);
+            cx.notify();
+        }
     }
 
     fn remove_saved_session(&mut self, saved_id: u64, cx: &mut Context<Self>) {
         self.presets.remove_session(saved_id);
+        if self.selected_saved == Some(saved_id) {
+            self.selected_saved = None;
+        }
+        cx.notify();
+    }
+
+    fn toggle_group(&mut self, group_id: u64, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.remove(&group_id) {
+            self.collapsed_groups.insert(group_id);
+        }
+        cx.notify();
+    }
+
+    /// Removes a group. Its sessions stay, at the top of the list.
+    fn remove_group(&mut self, group_id: u64, cx: &mut Context<Self>) {
+        self.presets.remove_group(group_id);
+        self.collapsed_groups.remove(&group_id);
         cx.notify();
     }
 
@@ -239,20 +326,23 @@ impl SerialWorkspace {
                             .text_color(rgb(palette.strong_foreground))
                             .child(title),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .px(px(6.))
-                            .py(px(1.))
-                            .rounded_full()
-                            .bg(tint(palette.muted, 0.14))
-                            .text_token(MICRO)
-                            .text_color(rgb(palette.muted))
-                            .child(count.to_string()),
-                    ),
+                    .child(Self::count_pill(palette, count)),
             )
             .children(action)
             .into_any_element()
+    }
+
+    /// A count in a small grey pill, after a heading.
+    fn count_pill(palette: WorkbenchPalette, count: usize) -> impl IntoElement {
+        div()
+            .flex_none()
+            .px(px(6.))
+            .py(px(1.))
+            .rounded_full()
+            .bg(tint(palette.muted, 0.14))
+            .text_token(MICRO)
+            .text_color(rgb(palette.muted))
+            .child(count.to_string())
     }
 
     /// The prompt shown where a list has nothing in it yet.
@@ -263,9 +353,11 @@ impl SerialWorkspace {
         hint: &'static str,
     ) -> impl IntoElement {
         v_flex()
+            .h(px(EMPTY_HINT_HEIGHT))
+            .flex_none()
             .items_center()
+            .justify_center()
             .px_4()
-            .py_5()
             .gap_2()
             .child(
                 div()
@@ -298,7 +390,7 @@ impl SerialWorkspace {
     }
 
     /// The shell every list row shares: a raised card that lifts on hover and
-    /// only brings its remove button forward once the pointer is on it.
+    /// only brings its buttons forward once the pointer is on it.
     fn row_card(
         palette: WorkbenchPalette,
         id: impl Into<ElementId>,
@@ -307,9 +399,11 @@ impl SerialWorkspace {
         div()
             .id(id)
             .group(group)
+            .h(px(CARD_HEIGHT))
+            .flex_none()
             .flex()
             .items_center()
-            .p_2()
+            .px_2()
             .gap_2p5()
             .rounded_lg()
             .bg(rgb(palette.card))
@@ -322,157 +416,362 @@ impl SerialWorkspace {
             })
     }
 
-    fn row_remove_button(
-        id: impl Into<ElementId>,
-        group: &'static str,
-        tooltip: &'static str,
-        on_click: impl Fn(&mut Window, &mut App) + 'static,
-    ) -> impl IntoElement {
-        div()
+    /// A row's buttons: faint at rest, full once the row is under the
+    /// pointer. Each stops its click short of the row, so pressing one
+    /// never also does what the row does.
+    fn row_actions(group: &'static str, buttons: Vec<Button>) -> impl IntoElement {
+        h_flex()
             .flex_none()
+            .gap_0p5()
             .opacity(ROW_ACTION_REST)
-            .group_hover(group, |action| action.opacity(1.))
-            .child(
-                Button::new(id)
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip(tooltip)
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        on_click(window, cx);
+            .group_hover(group, |actions| actions.opacity(1.))
+            .children(buttons)
+    }
+
+    fn row_action(
+        id: impl Into<ElementId>,
+        glyph: Glyph,
+        tooltip: &'static str,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Button {
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .icon(glyph)
+            .tooltip(tooltip)
+            .on_click(move |event, window, cx| {
+                cx.stop_propagation();
+                on_click(event, window, cx);
+            })
+    }
+
+    /// One saved session. A single click picks it out; a double-click opens
+    /// it; the pencil edits it and the bin forgets it. A named session shows
+    /// its name, and keeps the port on the line below beside the rate.
+    fn render_session_card(
+        &mut self,
+        saved: &StoredSession,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let saved_id = saved.id;
+        let is_open = self.port_is_open(&saved.port_name);
+        let selected = self.selected_saved == Some(saved_id);
+        let summary = saved.configuration.summary();
+        let (title, detail) = match &saved.alias {
+            Some(alias) => (alias.clone(), format!("{} · {summary}", saved.port_name)),
+            None => (saved.port_name.clone(), summary),
+        };
+
+        Self::row_card(
+            palette,
+            ("saved-session", saved_id as usize),
+            "saved-session",
+        )
+        .when(selected, |card| {
+            card.bg(tint(palette.accent, SELECTED_PLATE))
+                .border_color(tint(palette.accent, SELECTED_RING))
+        })
+        .tooltip(|window, cx| Tooltip::new("Double-click to open").build(window, cx))
+        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            if event.click_count() >= 2 {
+                this.open_saved_session(saved_id, window, cx);
+            } else {
+                this.select_saved_session(saved_id, cx);
+            }
+        }))
+        .child(icon_chip(Glyph::Bookmark, palette.tag(saved.color), 28.))
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_token(LABEL)
+                                .text_color(rgb(palette.strong_foreground))
+                                .child(title),
+                        )
+                        .when(is_open, |row| {
+                            row.child(Self::status_dot(5., palette.success))
+                        }),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .ui_mono_token(MONO_SMALL)
+                        .text_color(rgb(palette.faint))
+                        .child(detail),
+                ),
+        )
+        .child(Self::row_actions(
+            "saved-session",
+            vec![
+                Self::row_action(
+                    ("edit-session", saved_id as usize),
+                    Glyph::Pencil,
+                    "Edit this session",
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_saved_session_editor(saved_id, window, cx);
                     }),
+                ),
+                Self::row_action(
+                    ("remove-session", saved_id as usize),
+                    Glyph::Trash,
+                    "Forget this session",
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_saved_session(saved_id, cx);
+                    }),
+                ),
+            ],
+        ))
+        .into_any_element()
+    }
+
+    /// A group's row: a chevron, a folder, its name, how many it holds, and
+    /// the buttons to rename and remove it. The row folds its cards away,
+    /// like a directory in an explorer.
+    fn render_group_row(
+        &mut self,
+        group: &StoredGroup,
+        count: usize,
+        folded: bool,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group_id = group.id;
+
+        h_flex()
+            .id(("saved-group", group_id as usize))
+            .group("saved-group")
+            .h(px(GROUP_ROW_HEIGHT))
+            .flex_none()
+            .pl_1p5()
+            .pr_1()
+            .gap_1p5()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|row| row.bg(rgb(palette.hover)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_group(group_id, cx);
+            }))
+            .child(
+                Icon::new(if folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(px(12.))
+                .text_color(rgb(palette.faint)),
             )
+            .child(
+                Icon::new(Glyph::Folder)
+                    .size(px(15.))
+                    .text_color(rgb(palette.category_session)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_token(LABEL)
+                    .text_color(rgb(palette.strong_foreground))
+                    .child(group.name.clone()),
+            )
+            .child(Self::count_pill(palette, count))
+            .child(Self::row_actions(
+                "saved-group",
+                vec![
+                    Self::row_action(
+                        ("rename-group", group_id as usize),
+                        Glyph::Pencil,
+                        "Rename this group",
+                        cx.listener(move |this, _, window, cx| {
+                            this.open_group_prompt(
+                                GroupPrompt::Rename(group_id),
+                                |_, _, _| {},
+                                window,
+                                cx,
+                            );
+                        }),
+                    ),
+                    Self::row_action(
+                        ("remove-group", group_id as usize),
+                        Glyph::Trash,
+                        "Remove this group · its sessions are kept",
+                        cx.listener(move |this, _, _, cx| {
+                            this.remove_group(group_id, cx);
+                        }),
+                    ),
+                ],
+            ))
+            .into_any_element()
+    }
+
+    /// The cards of one group, set in from its row behind a guide line that
+    /// hangs from the chevron, so the eye can follow the group down.
+    fn render_group_body(
+        &mut self,
+        group_id: u64,
+        members: &[StoredSession],
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cards = members
+            .iter()
+            .map(|saved| self.render_session_card(saved, palette, cx))
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .id(("saved-group-body", group_id as usize))
+            .flex_none()
+            .ml(px(GROUP_GUIDE_INSET))
+            .pl(px(GROUP_BODY_GAP))
+            .border_l_1()
+            .border_color(rgb(palette.border))
+            .gap_1p5()
+            .when(cards.is_empty(), |body| {
+                body.child(
+                    div()
+                        .h(px(GROUP_EMPTY_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .text_token(CAPTION)
+                        .text_color(rgb(palette.faint))
+                        .child("Empty · pick this group in a session's dialog"),
+                )
+            })
+            .children(cards)
+            .into_any_element()
     }
 
     fn render_saved_sessions(
         &mut self,
         has_active_tab: bool,
+        panel_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.sessions_collapsed;
-        let saved_sessions = self.presets.sessions.clone();
-        let open_ports = saved_sessions
-            .iter()
-            .map(|saved| self.port_is_open(&saved.port_name))
-            .collect::<Vec<_>>();
-        let workspace = cx.weak_entity();
+        let total = self.presets.sessions.len();
+        let groups = self.presets.groups.clone();
 
         let header = self.section_header(
             PanelSection::Sessions,
             "Sessions",
-            saved_sessions.len(),
+            total,
             Some(
-                Button::new("save-active-session")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Plus)
-                    .tooltip("Save the active port configuration")
-                    .disabled(!has_active_tab)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.save_active_session(cx);
-                    }))
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Button::new("new-session-group")
+                            .ghost()
+                            .xsmall()
+                            .icon(Glyph::FolderPlus)
+                            .tooltip("New group")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_group_prompt(GroupPrompt::New, |_, _, _| {}, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("save-active-session")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip_with_action("Save the active session", &SaveCurrentSession, None)
+                            .disabled(!has_active_tab)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.save_active_session(cx);
+                            })),
+                    )
                     .into_any_element(),
             ),
             cx,
         );
 
+        // Groups first, each over its cards, then the sessions in none. The
+        // rows' heights are summed as they are made, for the list's own.
+        let mut rows = Vec::new();
+        let mut content = 0.;
+        for group in &groups {
+            let members = self
+                .presets
+                .sessions_in(Some(group.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let folded = self.collapsed_groups.contains(&group.id);
+            rows.push(self.render_group_row(group, members.len(), folded, palette, cx));
+            content += GROUP_ROW_HEIGHT;
+            if !folded {
+                rows.push(self.render_group_body(group.id, &members, palette, cx));
+                content += match members.len() {
+                    0 => GROUP_EMPTY_HEIGHT,
+                    count => count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP,
+                };
+            }
+        }
+        let loose = self.presets.sessions_in(None).cloned().collect::<Vec<_>>();
+        for saved in &loose {
+            rows.push(self.render_session_card(saved, palette, cx));
+            content += CARD_HEIGHT;
+        }
+        let content = if rows.is_empty() {
+            EMPTY_HINT_HEIGHT
+        } else {
+            content + (rows.len() - 1) as f32 * LIST_GAP
+        } + LIST_PAD_BOTTOM;
+
+        // The list is as tall as its rows, up to what the panel can spare:
+        // half of it at least, and all that Quick send does not need for its
+        // own rows. Past that it scrolls. With Quick send folded it takes
+        // the rest of the panel instead, through the flex chain down from
+        // the panel.
+        let fills = !collapsed && self.commands_collapsed;
+        let commands = self.presets.commands.len();
+        let quick_send_need = SECTION_HEADER_HEIGHT
+            + match commands {
+                0 => EMPTY_HINT_HEIGHT,
+                count => count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP,
+            }
+            + LIST_PAD_BOTTOM;
+        let cap = (panel_height * SESSIONS_SHARE)
+            .max(panel_height - quick_send_need)
+            .round()
+            - SECTION_HEADER_HEIGHT;
+        let list_height = content.min(cap).max(0.);
         v_flex()
-            .flex_none()
             .min_h_0()
+            .when(fills, |section| section.flex_1())
+            .when(!fills, |section| section.flex_none())
             .child(header)
             .when(!collapsed, |section| {
                 section.child(
                     v_flex()
-                        .flex_none()
-                        .max_h(relative(0.5))
+                        .when(fills, |list| list.flex_1().min_h_0())
+                        .when(!fills, |list| list.flex_none().h(px(list_height)))
                         .px_2()
                         .pb_2()
                         .gap_1p5()
                         .overflow_y_scrollbar()
-                        .when(saved_sessions.is_empty(), |list| {
+                        .when(rows.is_empty(), |list| {
                             list.child(Self::empty_hint(
                                 palette,
                                 Glyph::Bookmark,
                                 "No saved sessions yet",
-                                "Use + to keep the active port configuration.",
+                                "Save the active session with +, or start a group with the folder.",
                             ))
                         })
-                        .children(saved_sessions.into_iter().zip(open_ports).map(
-                            |(saved, is_open)| {
-                                let open_workspace = workspace.clone();
-                                let edit_workspace = workspace.clone();
-                                let remove_workspace = workspace.clone();
-                                let saved_id = saved.id;
-                                // A named session shows its name, and keeps
-                                // the port on the line below beside the rate.
-                                let summary = saved.configuration.summary();
-                                let (title, detail) = match &saved.alias {
-                                    Some(alias) => {
-                                        (alias.clone(), format!("{} · {summary}", saved.port_name))
-                                    }
-                                    None => (saved.port_name.clone(), summary),
-                                };
-
-                                Self::row_card(
-                                    palette,
-                                    ("saved-session", saved_id as usize),
-                                    "saved-session",
-                                )
-                                .on_click(move |_, window, cx| {
-                                    let _ = open_workspace.update(cx, |this, cx| {
-                                        this.open_saved_session(saved_id, window, cx);
-                                    });
-                                })
-                                .on_mouse_down(MouseButton::Right, move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    let _ = edit_workspace.update(cx, |this, cx| {
-                                        this.open_saved_session_editor(saved_id, window, cx);
-                                    });
-                                })
-                                .child(icon_chip(Glyph::Bookmark, palette.tag(saved.color), 28.))
-                                .child(
-                                    v_flex()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .child(
-                                            h_flex()
-                                                .min_w_0()
-                                                .gap_1p5()
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .text_token(LABEL)
-                                                        .text_color(rgb(palette.strong_foreground))
-                                                        .child(title),
-                                                )
-                                                .when(is_open, |row| {
-                                                    row.child(Self::status_dot(5., palette.success))
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .ui_mono_token(MONO_SMALL)
-                                                .text_color(rgb(palette.faint))
-                                                .child(detail),
-                                        ),
-                                )
-                                .child(Self::row_remove_button(
-                                    ("remove-session", saved_id as usize),
-                                    "saved-session",
-                                    "Forget this session",
-                                    move |_, cx| {
-                                        let _ = remove_workspace.update(cx, |this, cx| {
-                                            this.remove_saved_session(saved_id, cx);
-                                        });
-                                    },
-                                ))
-                            },
-                        )),
+                        .children(rows),
                 )
             })
             .into_any_element()
@@ -555,15 +854,18 @@ impl SerialWorkspace {
                                             .child(saved.command),
                                     ),
                             )
-                            .child(Self::row_remove_button(
-                                ("remove-command", command_id as usize),
+                            .child(Self::row_actions(
                                 "saved-command",
-                                "Forget this command",
-                                move |_, cx| {
-                                    let _ = remove_workspace.update(cx, |this, cx| {
-                                        this.remove_saved_command(command_id, cx);
-                                    });
-                                },
+                                vec![Self::row_action(
+                                    ("remove-command", command_id as usize),
+                                    Glyph::Trash,
+                                    "Forget this command",
+                                    move |_, _, cx| {
+                                        let _ = remove_workspace.update(cx, |this, cx| {
+                                            this.remove_saved_command(command_id, cx);
+                                        });
+                                    },
+                                )],
                             ))
                         })),
                 )
@@ -668,9 +970,12 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
+    /// The panel, given its height so the saved sessions can take a share
+    /// of it.
     pub(crate) fn render_right_sidebar(
         &mut self,
         active_tab: Option<SerialTabSnapshot>,
+        panel_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.side_panel_collapsed {
@@ -679,7 +984,7 @@ impl SerialWorkspace {
 
         let palette = self.interface_theme.palette();
         let has_active_tab = active_tab.is_some();
-        let sessions = self.render_saved_sessions(has_active_tab, cx);
+        let sessions = self.render_saved_sessions(has_active_tab, panel_height, cx);
         let commands = self.render_quick_send(has_active_tab, cx);
 
         // The width is the resizable panel's to set; the column fills it.

@@ -19,7 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
-use crate::app_menu::NewSerialTab;
+use crate::app_menu::{NewSerialTab, ToggleConnection};
 use crate::controls::{Choice, ChoiceText, segmented};
 use crate::icons::Glyph;
 use crate::filter::OutputFilter;
@@ -85,10 +85,11 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    /// The band above the terminal: one tab per session on the left, and on
-    /// the right the controls that act on the session in front of you —
-    /// connect, pause, clear, timestamps, follow. What the session *is* is
-    /// already named by its tab, so the strip does not say it twice.
+    /// The band above the terminal: one tab per session on the left, and at
+    /// the right end the one control the session in front of you needs at
+    /// hand — connect or disconnect. Pausing, clearing and the log's two
+    /// switches live in the menus with their shortcuts, so the strip holds
+    /// nothing that is not about *which* session and whether it is open.
     pub(crate) fn render_tab_strip(
         &mut self,
         active: Option<&SerialTabSnapshot>,
@@ -104,7 +105,7 @@ impl SerialWorkspace {
             .enumerate()
             .map(|(index, tab)| Self::render_tab(index, tab, index == active_index, palette, cx))
             .collect::<Vec<_>>();
-        let actions = self.render_session_actions(active, palette, cx);
+        let actions = self.render_session_actions(active, cx);
 
         Some(
             h_flex()
@@ -243,13 +244,13 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
-    /// The controls that act on the session in front of you, at the right
-    /// end of the strip: connect or disconnect, then pause and clear, then
-    /// the two switches that change how the log reads.
+    /// The one control at the right end of the strip: connect or disconnect
+    /// the session in front of you. A pill, filled while the port is shut
+    /// and outlined while it is open, so the strip says the state as well
+    /// as offering the switch.
     fn render_session_actions(
         &mut self,
         tab: &SerialTabSnapshot,
-        palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let tab_id = tab.id;
@@ -257,7 +258,6 @@ impl SerialWorkspace {
 
         h_flex()
             .flex_none()
-            .gap_0p5()
             .items_center()
             .child(
                 Button::new(("toggle-connection", tab_id))
@@ -276,73 +276,20 @@ impl SerialWorkspace {
                     } else {
                         "Connect"
                     })
+                    .tooltip_with_action(
+                        if connected {
+                            "Disconnect"
+                        } else {
+                            "Connect"
+                        },
+                        &ToggleConnection,
+                        None,
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_connection(tab_id, cx);
                     })),
             )
-            .child(Self::strip_divider(palette))
-            .child(
-                Button::new(("toggle-pause", tab_id))
-                    .ghost()
-                    .with_size(px(TAB_HEIGHT))
-                    .icon(if tab.paused {
-                        Glyph::Play
-                    } else {
-                        Glyph::Pause
-                    })
-                    .toggled(tab.paused)
-                    .tooltip(if tab.paused {
-                        "Resume receiving"
-                    } else {
-                        "Pause receiving"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_pause(cx);
-                    })),
-            )
-            .child(
-                Button::new(("clear-terminal", tab_id))
-                    .ghost()
-                    .with_size(px(TAB_HEIGHT))
-                    .icon(Glyph::Sweep)
-                    .tooltip("Clear the terminal")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.clear_terminal(cx);
-                    })),
-            )
-            .child(Self::strip_divider(palette))
-            .child(
-                Button::new(("toggle-timestamps", tab_id))
-                    .ghost()
-                    .with_size(px(TAB_HEIGHT))
-                    .icon(Glyph::Clock)
-                    .toggled(tab.timestamps)
-                    .tooltip("Show timestamps")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_timestamps(cx);
-                    })),
-            )
-            .child(
-                Button::new(("toggle-auto-scroll", tab_id))
-                    .ghost()
-                    .with_size(px(TAB_HEIGHT))
-                    .icon(Glyph::Scroll)
-                    .toggled(tab.auto_scroll)
-                    .tooltip("Follow new output")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_auto_scroll(cx);
-                    })),
-            )
             .into_any_element()
-    }
-
-    fn strip_divider(palette: WorkbenchPalette) -> impl IntoElement {
-        div()
-            .flex_none()
-            .w(px(1.))
-            .h(px(14.))
-            .mx_1p5()
-            .bg(rgb(palette.border))
     }
 
     /// The UTF-8 / HEX switch: the same segmented rail the session dialog

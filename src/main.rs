@@ -5,6 +5,7 @@ mod app_menu;
 mod configuration;
 mod controls;
 mod filter;
+mod groups;
 mod highlight;
 mod icons;
 mod presets;
@@ -17,6 +18,7 @@ mod updater;
 mod workbench;
 
 use std::{
+    collections::HashSet,
     ops::Range,
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
@@ -42,7 +44,7 @@ use sidebar::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
 use terminal::key_bytes;
-use title_bar::{FILTER_PLACEHOLDER, traffic_light_position};
+use title_bar::{FILTER_PLACEHOLDER, TITLE_BAR_HEIGHT, traffic_light_position};
 use workbench::TerminalMetrics;
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
@@ -75,6 +77,12 @@ pub struct SerialWorkspace {
     side_panel_collapsed: bool,
     sessions_collapsed: bool,
     commands_collapsed: bool,
+    /// The saved groups folded to their row, by id. In memory for the same
+    /// reason as the sections.
+    collapsed_groups: HashSet<u64>,
+    /// The saved session last clicked, picked out in the list until another
+    /// is; a double-click is what opens one.
+    selected_saved: Option<u64>,
     /// The dragged width of the side panel. Owned here rather than by the
     /// resizable group, so collapsing to the rail and back keeps the width.
     panel_layout: Entity<ResizableState>,
@@ -117,6 +125,8 @@ impl SerialWorkspace {
             side_panel_collapsed: false,
             sessions_collapsed: false,
             commands_collapsed: false,
+            collapsed_groups: HashSet::new(),
+            selected_saved: None,
             panel_layout,
             terminal_focus: cx.focus_handle(),
             composing: None,
@@ -927,7 +937,10 @@ impl Render for SerialWorkspace {
             Some(tab) => self.render_active_tab(tab, window, cx),
             None => self.render_empty_state(window, cx),
         };
-        let sidebar = self.render_right_sidebar(active_snapshot, cx);
+        // The panel's height, for the saved sessions list to take its share
+        // of in pixels: a percentage of a flex parent resolves to nothing.
+        let panel_height: f32 = window.viewport_size().height.into();
+        let sidebar = self.render_right_sidebar(active_snapshot, panel_height - TITLE_BAR_HEIGHT, cx);
 
         // `Root` only renders the window chrome; dialogs, sheets and
         // notifications live in overlay layers the window content has to render

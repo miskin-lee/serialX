@@ -3,11 +3,13 @@
 mod app_icon;
 mod app_menu;
 mod configuration;
+mod filter;
 mod icons;
 mod presets;
 mod serial;
 mod sidebar;
 mod theme;
+mod title_bar;
 mod updater;
 mod workbench;
 
@@ -17,7 +19,7 @@ use std::{
 };
 
 use app_icon::apply_application_icon;
-use app_menu::{ToggleSidePanel, bind_window_actions, configure_application_menus};
+use app_menu::{bind_window_actions, configure_application_menus};
 use gpui_kit::component::{
     Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     button::{Button, ButtonVariants},
@@ -29,15 +31,13 @@ use gpui_kit::component::{
     tab::{Tab, TabBar},
     v_flex,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use icons::{Glyph, WorkbenchAssets};
+use icons::WorkbenchAssets;
 use presets::PresetStore;
 use serial::*;
 use smol::Timer;
-use theme::{
-    CAPTION, InterfaceTheme, LABEL, Typography, apply_interface_theme, resolve_fonts, tint,
-};
+use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
+use title_bar::FILTER_PLACEHOLDER;
 use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
@@ -126,23 +126,13 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    /// Flips between the two workbenches, for the title bar switch.
-    fn toggle_interface_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let next = if self.interface_theme.is_dark() {
-            InterfaceTheme::Light
-        } else {
-            InterfaceTheme::Dark
-        };
-        self.set_interface_theme(next, window, cx);
-    }
-
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
         let send_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Enter a command…")
                 .default_value("AT+STATUS?")
         });
-        let subscription = cx.subscribe_in(
+        let send_subscription = cx.subscribe_in(
             &send_input,
             window,
             move |this, _, event: &InputEvent, window, cx| {
@@ -151,7 +141,28 @@ impl SerialWorkspace {
                 }
             },
         );
-        SerialTabState::new(id, send_input, subscription)
+        let filter_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(FILTER_PLACEHOLDER)
+                .clean_on_escape()
+        });
+        let filter_subscription = cx.subscribe_in(
+            &filter_input,
+            window,
+            move |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let pattern = input.read(cx).value().to_string();
+                    this.set_filter_pattern(id, &pattern, cx);
+                }
+            },
+        );
+        SerialTabState::new(
+            id,
+            send_input,
+            send_subscription,
+            filter_input,
+            filter_subscription,
+        )
     }
 
     fn active_tab(&self) -> Option<&SerialTabState> {
@@ -180,6 +191,53 @@ impl SerialWorkspace {
     fn close_active_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.active_tab().map(|tab| tab.id) {
             self.close_tab(id, cx);
+        }
+    }
+
+    /// Moves to the tab on the left, if there is one. No wrapping: the arrow
+    /// that goes grey is what tells you where you are in the row.
+    fn select_previous_tab(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab > 0 && !self.tabs.is_empty() {
+            self.active_tab -= 1;
+            cx.notify();
+        }
+    }
+
+    fn select_next_tab(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab + 1 < self.tabs.len() {
+            self.active_tab += 1;
+            cx.notify();
+        }
+    }
+
+    /// Called as the filter box changes, so the matcher is compiled once per
+    /// keystroke rather than once per frame.
+    fn set_filter_pattern(&mut self, tab_id: usize, pattern: &str, cx: &mut Context<Self>) {
+        if let Some(index) = self.tab_index(tab_id)
+            && self.tabs[index].filter.set_pattern(pattern)
+        {
+            cx.notify();
+        }
+    }
+
+    fn toggle_filter_regex(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.filter.toggle_regex();
+            cx.notify();
+        }
+    }
+
+    fn toggle_filter_match_case(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.filter.toggle_match_case();
+            cx.notify();
+        }
+    }
+
+    /// Puts the cursor in the title bar filter box, for ⌘F.
+    fn focus_output_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self.active_tab().map(|tab| tab.filter_input.clone()) {
+            input.update(cx, |input, cx| input.focus(window, cx));
         }
     }
 
@@ -573,34 +631,11 @@ impl SerialWorkspace {
                 })
         });
     }
-
-    /// Opens the built-in demo device, so the workbench can be explored with no
-    /// hardware attached.
-    fn open_loopback_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let loopback = discover_ports()
-            .into_iter()
-            .find(|port| port.is_demo)
-            .map(|port| port.name)
-            .unwrap_or_else(|| "Loopback".into());
-        self.create_configured_tab(loopback, SerialConfiguration::default(), window, cx);
-    }
-
-    /// Restores the most recently saved session, or falls back to the
-    /// configuration dialog when nothing has been saved yet.
-    fn open_first_saved_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.presets.sessions.last().map(|saved| saved.id) {
-            Some(saved_id) => self.open_saved_session(saved_id, window, cx),
-            None => self.open_new_serial_tab_dialog(window, cx),
-        }
-    }
 }
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
-        let breadcrumb = self
-            .active_tab()
-            .map(|tab| format!("Serial {} · {}", tab.id, tab.selected_port().name));
 
         let mut tab_items = Vec::with_capacity(self.tabs.len());
         for tab in &self.tabs {
@@ -656,11 +691,12 @@ impl Render for SerialWorkspace {
                 })
         });
 
+        let title_bar = self.render_title_bar(active_snapshot.as_ref(), cx);
         let content = match active_snapshot.clone() {
             Some(tab) => self.render_active_tab(tab, cx),
             None => self.render_empty_state(window, cx),
         };
-        let sidebar = self.render_right_sidebar(active_snapshot.clone(), cx);
+        let sidebar = self.render_right_sidebar(active_snapshot, cx);
 
         // `Root` only renders the window chrome; dialogs, sheets and
         // notifications live in overlay layers the window content has to render
@@ -674,104 +710,7 @@ impl Render for SerialWorkspace {
             .ui_font()
             .bg(rgb(palette.editor))
             .text_color(rgb(palette.foreground))
-            .child(
-                TitleBar::new()
-                    .bg(rgb(palette.title_bar))
-                    .border_b_1()
-                    .border_color(rgb(palette.border))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .px_3()
-                            .gap_3()
-                            .items_center()
-                            .when(cfg!(not(target_os = "macos")), |row| {
-                                row.child(div().w(px(310.)).h_8().child(self.menu_bar.clone()))
-                            })
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .size(px(20.))
-                                            .rounded(px(6.))
-                                            .bg(tint(palette.category_terminal, 0.14))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                Icon::new(Glyph::Terminal)
-                                                    .size(px(12.))
-                                                    .text_color(rgb(palette.category_terminal)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_token(LABEL)
-                                            .text_color(rgb(palette.strong_foreground))
-                                            .child("serialX"),
-                                    ),
-                            )
-                            .when_some(breadcrumb, |row, breadcrumb| {
-                                row.child(
-                                    div()
-                                        .flex_none()
-                                        .text_token(CAPTION)
-                                        .text_color(rgb(palette.faint))
-                                        .child("/"),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_token(CAPTION)
-                                        .text_color(rgb(palette.muted))
-                                        .child(breadcrumb),
-                                )
-                            })
-                            .child(div().flex_1())
-                            .child(
-                                h_flex()
-                                    .flex_none()
-                                    .gap_0p5()
-                                    .child(
-                                        Button::new("title-theme")
-                                            .ghost()
-                                            .with_size(px(26.))
-                                            .icon(if self.interface_theme.is_dark() {
-                                                IconName::Moon
-                                            } else {
-                                                IconName::Sun
-                                            })
-                                            .tooltip("Switch between the light and dark workbench")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.toggle_interface_theme(window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("title-side-panel")
-                                            .ghost()
-                                            .with_size(px(26.))
-                                            .icon(if self.side_panel_collapsed {
-                                                IconName::PanelRightOpen
-                                            } else {
-                                                IconName::PanelRightClose
-                                            })
-                                            .tooltip_with_action(
-                                                "Show / hide the side panel",
-                                                &ToggleSidePanel,
-                                                None,
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_side_panel(cx);
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
+            .child(title_bar)
             .child(
                 h_flex()
                     .flex_1()
@@ -824,7 +763,7 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
-                let interface_theme = InterfaceTheme::from_appearance(window.appearance());
+                let interface_theme = InterfaceTheme::default();
                 apply_interface_theme(interface_theme, window, cx);
                 let workspace = cx.new(|cx| SerialWorkspace::new(interface_theme, window, cx));
                 bind_window_actions(&workspace, cx);

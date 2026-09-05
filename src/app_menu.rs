@@ -17,6 +17,9 @@ actions!(
         ToggleTimestamps,
         ToggleAutoScroll,
         ToggleSidePanel,
+        PreviousTab,
+        NextTab,
+        FocusOutputFilter,
         UseLightTheme,
         UseDarkTheme,
         CheckForUpdates,
@@ -39,6 +42,19 @@ const QUIT_KEYSTROKE: &str = "ctrl-q";
 const SIDE_PANEL_KEYSTROKE: &str = "cmd-b";
 #[cfg(not(target_os = "macos"))]
 const SIDE_PANEL_KEYSTROKE: &str = "ctrl-b";
+// Tab navigation follows VS Code's editor bindings on each platform.
+#[cfg(target_os = "macos")]
+const PREVIOUS_TAB_KEYSTROKE: &str = "cmd-shift-[";
+#[cfg(not(target_os = "macos"))]
+const PREVIOUS_TAB_KEYSTROKE: &str = "ctrl-pageup";
+#[cfg(target_os = "macos")]
+const NEXT_TAB_KEYSTROKE: &str = "cmd-shift-]";
+#[cfg(not(target_os = "macos"))]
+const NEXT_TAB_KEYSTROKE: &str = "ctrl-pagedown";
+#[cfg(target_os = "macos")]
+const FILTER_KEYSTROKE: &str = "cmd-f";
+#[cfg(not(target_os = "macos"))]
+const FILTER_KEYSTROKE: &str = "ctrl-f";
 
 fn application_menus() -> Vec<Menu> {
     vec![
@@ -55,6 +71,9 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Close Current Tab", CloseSerialTab),
             MenuItem::action("Save Current Session", SaveCurrentSession),
             MenuItem::separator(),
+            MenuItem::action("Previous Tab", PreviousTab),
+            MenuItem::action("Next Tab", NextTab),
+            MenuItem::separator(),
             MenuItem::action("Connect / Disconnect", ToggleConnection),
             MenuItem::action("Refresh Port List", RefreshPorts),
             MenuItem::separator(),
@@ -65,6 +84,8 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("ASCII / HEX", ToggleHex),
             MenuItem::action("Show / Hide Timestamps", ToggleTimestamps),
             MenuItem::action("Auto / Manual Scroll", ToggleAutoScroll),
+            MenuItem::separator(),
+            MenuItem::action("Filter Output…", FocusOutputFilter),
             MenuItem::separator(),
             MenuItem::action("Show / Hide Side Panel", ToggleSidePanel),
             MenuItem::separator(),
@@ -80,6 +101,9 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(NEW_TAB_KEYSTROKE, NewSerialTab, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
         KeyBinding::new(SIDE_PANEL_KEYSTROKE, ToggleSidePanel, None),
+        KeyBinding::new(PREVIOUS_TAB_KEYSTROKE, PreviousTab, None),
+        KeyBinding::new(NEXT_TAB_KEYSTROKE, NextTab, None),
+        KeyBinding::new(FILTER_KEYSTROKE, FocusOutputFilter, None),
     ]);
     GlobalState::global_mut(cx)
         .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
@@ -168,6 +192,23 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &ToggleSidePanel, cx| {
         let _ = view.update(cx, |view, cx| view.toggle_side_panel(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &PreviousTab, cx| {
+        let _ = view.update(cx, |view, cx| view.select_previous_tab(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &NextTab, cx| {
+        let _ = view.update(cx, |view, cx| view.select_next_tab(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &FocusOutputFilter, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.focus_output_filter(window, cx);
+        });
     });
 
     let view = workspace.downgrade();

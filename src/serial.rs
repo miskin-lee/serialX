@@ -9,6 +9,8 @@ use gpui_kit::component::input::InputState;
 use gpui_kit::{Entity, Subscription};
 use serde::{Deserialize, Serialize};
 
+use crate::filter::OutputFilter;
+
 pub(crate) const BAUD_RATES: &[u32] = &[9_600, 19_200, 38_400, 57_600, 115_200, 230_400];
 pub(crate) const DATA_BITS: &[&str] = &["5", "6", "7", "8"];
 pub(crate) const STOP_BITS: &[&str] = &["1", "2"];
@@ -35,6 +37,27 @@ pub(crate) struct TerminalLine {
     pub(crate) kind: LineKind,
     pub(crate) payload: Vec<u8>,
     pub(crate) note: Option<String>,
+}
+
+impl TerminalLine {
+    /// The text the line prints as: its note, or the payload in the tab's
+    /// mode. The filter matches against this, so what it reads is what you see.
+    pub(crate) fn display_text(&self, hex_mode: bool) -> String {
+        if let Some(note) = &self.note {
+            return note.clone();
+        }
+        if hex_mode {
+            self.payload
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            String::from_utf8_lossy(&self.payload)
+                .trim_end_matches(['\r', '\n'])
+                .to_string()
+        }
+    }
 }
 
 pub(crate) enum SerialCommand {
@@ -146,10 +169,14 @@ pub(crate) struct SerialTabState {
     pub(crate) terminal_lines: Vec<TerminalLine>,
     clock_tick: usize,
     pub(crate) send_input: Entity<InputState>,
+    /// The title bar filter box and what it currently holds back.
+    pub(crate) filter_input: Entity<InputState>,
+    pub(crate) filter: OutputFilter,
     pub(crate) command_tx: Option<Sender<SerialCommand>>,
     pub(crate) event_tx: Sender<SerialEvent>,
     pub(crate) event_rx: Receiver<SerialEvent>,
     _input_subscription: Subscription,
+    _filter_subscription: Subscription,
 }
 
 impl SerialTabState {
@@ -157,6 +184,8 @@ impl SerialTabState {
         id: usize,
         send_input: Entity<InputState>,
         input_subscription: Subscription,
+        filter_input: Entity<InputState>,
+        filter_subscription: Subscription,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel();
         Self {
@@ -178,10 +207,13 @@ impl SerialTabState {
             }],
             clock_tick: 0,
             send_input,
+            filter_input,
+            filter: OutputFilter::default(),
             command_tx: None,
             event_tx,
             event_rx,
             _input_subscription: input_subscription,
+            _filter_subscription: filter_subscription,
         }
     }
 
@@ -239,9 +271,23 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) auto_scroll: bool,
     pub(crate) terminal_lines: Vec<TerminalLine>,
     pub(crate) send_input: Entity<InputState>,
+    pub(crate) filter_input: Entity<InputState>,
+    pub(crate) filter: OutputFilter,
 }
 
 impl SerialTabSnapshot {
+    /// The lines the title bar filter lets through, with their positions in
+    /// the log. An idle filter skips the text formatting altogether.
+    pub(crate) fn visible_lines(&self) -> impl Iterator<Item = (usize, &TerminalLine)> {
+        let active = self.filter.is_active();
+        self.terminal_lines
+            .iter()
+            .enumerate()
+            .filter(move |(_, line)| {
+                !active || self.filter.matches(&line.display_text(self.hex_mode))
+            })
+    }
+
     pub(crate) fn status_label(&self) -> &'static str {
         if self.connecting {
             "Connecting…"
@@ -272,6 +318,8 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             auto_scroll: tab.auto_scroll,
             terminal_lines: tab.terminal_lines.clone(),
             send_input: tab.send_input.clone(),
+            filter_input: tab.filter_input.clone(),
+            filter: tab.filter.clone(),
         }
     }
 }

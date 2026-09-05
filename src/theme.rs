@@ -61,7 +61,6 @@ pub(crate) struct WorkbenchPalette {
     pub(crate) category_device: u32,
     pub(crate) category_session: u32,
     pub(crate) category_command: u32,
-    pub(crate) category_terminal: u32,
     pub(crate) category_signal: u32,
     /// The wordmark's three inks, taken from `docs/logo.svg` so the identity
     /// in the app and the one at the top of the README are the same drawing.
@@ -72,23 +71,20 @@ pub(crate) struct WorkbenchPalette {
     pub(crate) wordmark_tail: u32,
 }
 
-impl InterfaceTheme {
-    pub(crate) fn from_appearance(appearance: WindowAppearance) -> Self {
-        match appearance {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self::Dark,
-            WindowAppearance::Light | WindowAppearance::VibrantLight => Self::Light,
-        }
+/// The workbench opens dark, whatever the system is set to; the terminal is
+/// where the eyes stay, and a near-black page is the one that holds them.
+impl Default for InterfaceTheme {
+    fn default() -> Self {
+        Self::Dark
     }
+}
 
+impl InterfaceTheme {
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Light => "Light",
             Self::Dark => "Dark",
         }
-    }
-
-    pub(crate) fn is_dark(self) -> bool {
-        matches!(self, Self::Dark)
     }
 
     fn mode(self) -> ThemeMode {
@@ -138,7 +134,6 @@ impl InterfaceTheme {
                 category_device: 0x2f7fd4,
                 category_session: 0xb2740b,
                 category_command: 0x3d8a45,
-                category_terminal: 0x8250c8,
                 category_signal: 0x0f8593,
                 wordmark_lead: 0xff754c,
                 wordmark_body: 0x4d75ff,
@@ -175,7 +170,6 @@ impl InterfaceTheme {
                 category_device: 0x62b0f5,
                 category_session: 0xf2b45c,
                 category_command: 0x86cf6a,
-                category_terminal: 0xc08ae8,
                 category_signal: 0x4fc9dc,
                 wordmark_lead: 0xff754c,
                 wordmark_body: 0xf4f3ef,
@@ -535,7 +529,6 @@ impl TextToken {
 /// standing next to it.
 pub(crate) const WORDMARK: TextToken = TextToken::new(34., 42., FontWeight(800.));
 /// Card and dialog titles.
-pub(crate) const TITLE: TextToken = TextToken::new(15., 22., FontWeight::SEMIBOLD);
 /// Panel and section headings.
 pub(crate) const HEADING: TextToken = TextToken::new(12.5, 18., FontWeight::SEMIBOLD);
 /// Default running text.
@@ -747,7 +740,6 @@ mod tests {
         assert_eq!(light.editor, 0xffffff);
         assert_eq!(light.accent, 0x5b57d8);
         assert_eq!(InterfaceTheme::Light.name(), "Light");
-        assert!(!InterfaceTheme::Light.is_dark());
     }
 
     #[test]
@@ -756,7 +748,11 @@ mod tests {
         assert_eq!(dark.editor, 0x0b0d11);
         assert_eq!(dark.accent, 0x8b87ff);
         assert_eq!(InterfaceTheme::Dark.name(), "Dark");
-        assert!(InterfaceTheme::Dark.is_dark());
+        assert_eq!(
+            InterfaceTheme::default().name(),
+            "Dark",
+            "the workbench opens dark"
+        );
     }
 
     /// Surfaces have to climb in one direction or cards stop reading as raised.
@@ -786,7 +782,6 @@ mod tests {
                 palette.category_device,
                 palette.category_session,
                 palette.category_command,
-                palette.category_terminal,
                 palette.category_signal,
             ];
             let total = hues.len();

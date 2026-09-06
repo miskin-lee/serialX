@@ -43,7 +43,7 @@ use presets::PresetStore;
 use serial::*;
 use sidebar::{
     COMMAND_SEARCH_PLACEHOLDER, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_WIDTH,
+    SIDEBAR_WIDTH, panel_divider,
 };
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
@@ -1082,6 +1082,7 @@ impl Render for SerialWorkspace {
                 .child(
                     h_resizable("workbench-panels")
                         .with_state(&self.panel_layout)
+                        .with_handle_appearance(panel_divider(palette))
                         .child(resizable_panel().child(centre))
                         .child(
                             resizable_panel()

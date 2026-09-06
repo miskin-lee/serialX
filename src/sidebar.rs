@@ -24,6 +24,9 @@
 //! saves it are a hand's width apart. It sends to whichever tab is in front,
 //! and says which.
 
+use std::rc::Rc;
+
+use gpui_kit::base::{ResizeHandleContext, ResizeHandleRenderer};
 use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
@@ -54,6 +57,9 @@ pub(crate) const SIDEBAR_WIDTH: f32 = 296.;
 pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 220.;
 /// The widest: past this the cards are mostly air.
 pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
+/// Width of the line the panel's edge lights up to under the pointer: wide
+/// enough to read as something held, narrow enough to stay a seam.
+const DIVIDER_LIT_WIDTH: f32 = 3.;
 /// Width of the collapsed rail: one icon chip plus breathing room.
 const RAIL_WIDTH: f32 = 52.;
 /// The chip beside a section's title, in the section's colour.
@@ -101,6 +107,31 @@ const ROW_ACTION_REST: f32 = 0.35;
 /// How strongly the accent washes the picked-out card, and rings it.
 const SELECTED_PLATE: f32 = 0.07;
 const SELECTED_RING: f32 = 0.55;
+
+/// What the divider between the log and the panel paints. At rest, nothing:
+/// the panel's own border is the seam. Under the pointer, and for as long as
+/// it is being dragged, an accent line straddles that border, so the edge
+/// says it can be moved before the cursor does.
+pub(crate) fn panel_divider(palette: WorkbenchPalette) -> ResizeHandleRenderer {
+    Rc::new(
+        move |handle: &ResizeHandleContext, _: &mut Window, _: &mut App| {
+            let lit = rgb(palette.accent);
+            Some(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .w(px(DIVIDER_LIT_WIDTH))
+                    // The handle's content box is the seam itself, zero wide;
+                    // the line grows out of it to the right, and is pulled
+                    // back so it sits astride the border instead.
+                    .ml(px(-((DIVIDER_LIT_WIDTH - 1.) / 2.)))
+                    .when(handle.is_active(), |line| line.bg(lit))
+                    .group_hover("handle", move |line| line.bg(lit))
+                    .into_any_element(),
+            )
+        },
+    )
+}
 
 impl SerialWorkspace {
     pub(crate) fn save_active_session(&mut self, cx: &mut Context<Self>) {

@@ -26,7 +26,7 @@ use std::{
 };
 
 use app_icon::apply_application_icon;
-use app_menu::{bind_window_actions, configure_application_menus};
+use app_menu::{bind_window_actions, configure_application_menus, prepare_application_menus};
 use gpui_kit::component::{
     Icon, IconName, Root, TitleBar, WindowExt,
     dialog::DialogButtonProps,
@@ -1123,6 +1123,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn main() {
+    prepare_application_menus();
     let app = gpui_kit::application().with_assets(WorkbenchAssets);
     app.run(move |cx| {
         gpui_kit::init(cx);

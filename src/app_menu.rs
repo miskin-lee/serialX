@@ -127,8 +127,14 @@ fn application_menus() -> Vec<Menu> {
 }
 
 /// AppKit appends "Enter Full Screen" to any menu titled `View` unless the
-/// application opts out before the menu bar is built. The green traffic light
-/// already covers full screen, so the menu keeps only what serialX put there.
+/// application opts out. The green traffic light already covers full screen,
+/// so the menu keeps only what serialX put there.
+///
+/// AppKit reads the opt-out as the application object is set up, before GPUI
+/// hands the run closure control: registered from there it still held for an
+/// unbundled binary, but a bundled build got the item anyway, with the rest
+/// of the menu shifted over to make room for its glyph. So this runs first
+/// thing in `main`, before the application exists.
 #[cfg(target_os = "macos")]
 fn suppress_automatic_full_screen_item() {
     use objc2::runtime::AnyObject;
@@ -158,12 +164,17 @@ fn suppress_help_search_field() {
     application.setHelpMenu(Some(&NSMenu::new(main_thread)));
 }
 
+/// What has to be said to the platform before the application object is
+/// made. Called first thing in `main`; [`configure_application_menus`] does
+/// the rest once GPUI is running.
+pub(crate) fn prepare_application_menus() {
+    #[cfg(target_os = "macos")]
+    suppress_automatic_full_screen_item();
+}
+
 pub(crate) fn configure_application_menus(cx: &mut App) {
     #[cfg(target_os = "macos")]
-    {
-        suppress_automatic_full_screen_item();
-        suppress_help_search_field();
-    }
+    suppress_help_search_field();
 
     cx.bind_keys([
         KeyBinding::new(NEW_TAB_KEYSTROKE, NewSerialTab, None),

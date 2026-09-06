@@ -36,14 +36,14 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_menu::SaveCurrentSession;
-use crate::controls::{Choice, ChoiceText, segmented};
+use crate::controls::{Choice, ChoiceText, segmented, spaced_caps};
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
-use crate::presets::{StoredGroup, StoredSession};
+use crate::presets::{StoredCommand, StoredGroup, StoredSession};
 use crate::theme::{
-    CAPTION, HEADING, LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, tint,
+    CAPTION, EYEBROW, LABEL, MICRO, MONO_SMALL, TagColor, Typography, WorkbenchPalette, tint,
 };
-use crate::{SerialTabSnapshot, SerialWorkspace};
+use crate::{SerialConfiguration, SerialTabSnapshot, SerialWorkspace};
 
 /// Width the panel opens at. Wide enough for a port path plus its baud
 /// summary on one line at the caption size; the edge drags from there.
@@ -54,6 +54,13 @@ pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 220.;
 pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
 /// Width of the collapsed rail: one icon chip plus breathing room.
 const RAIL_WIDTH: f32 = 52.;
+/// The chip beside a section's title, in the section's colour.
+const SECTION_CHIP: f32 = 20.;
+/// The search box over the Quick send list, and the row it sits in.
+const SEARCH_HEIGHT: f32 = 26.;
+const SEARCH_ROW_HEIGHT: f32 = 34.;
+/// What the search box says while it is empty.
+pub(crate) const COMMAND_SEARCH_PLACEHOLDER: &str = "Search commands";
 /// Height of the composer at the panel's foot: the box, the row of switches
 /// under it, and the air around them.
 const COMPOSER_HEIGHT: f32 = 82.;
@@ -106,22 +113,30 @@ impl SerialWorkspace {
             return;
         };
         let port_name = tab.selected_port().name.clone();
-        let configuration = tab.configuration;
+        let (configuration, color, alias, group) =
+            (tab.configuration, tab.color, tab.alias.clone(), tab.group);
+        self.save_session_preset(port_name, configuration, color, alias, group);
+        cx.notify();
+    }
+
+    /// Keeps a session in the panel, filed under its group, which is
+    /// unfolded — as is the section — so the new card is in view.
+    pub(crate) fn save_session_preset(
+        &mut self,
+        port_name: String,
+        configuration: SerialConfiguration,
+        color: TagColor,
+        alias: Option<String>,
+        group: Option<u64>,
+    ) {
         let label = format!("{} · {}", port_name, configuration.summary());
-        let group = self.presets.resolve_group(tab.group);
-        self.presets.add_session(
-            label,
-            port_name,
-            configuration,
-            tab.color,
-            tab.alias.clone(),
-            group,
-        );
+        let group = self.presets.resolve_group(group);
+        self.presets
+            .add_session(label, port_name, configuration, color, alias, group);
         self.sessions_collapsed = false;
         if let Some(group) = group {
             self.collapsed_groups.remove(&group);
         }
-        cx.notify();
     }
 
     /// Opens a saved session: a tab on its port, connecting at once when the
@@ -162,30 +177,24 @@ impl SerialWorkspace {
         tab.color = saved.color;
         tab.alias = saved.alias.clone();
         tab.group = self.presets.resolve_group(saved.group);
-        let attached = match tab
+        match tab
             .ports
             .iter()
             .position(|port| port.name == saved.port_name)
         {
-            Some(index) => {
-                tab.selected_port = index;
-                true
-            }
+            Some(index) => tab.selected_port = index,
             None => {
                 tab.ports.push(crate::PortItem::unavailable(
                     saved.port_name.clone(),
                     "Saved device · currently unavailable",
                 ));
                 tab.selected_port = tab.ports.len() - 1;
-                false
             }
-        };
+        }
         tab.note(format!("Restored saved session: {}", saved.label));
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
-        if attached {
-            self.toggle_connection(id, cx);
-        }
+        self.connect_if_attached(id, cx);
         cx.notify();
     }
 
@@ -289,7 +298,9 @@ impl SerialWorkspace {
             .any(|tab| tab.selected_port().name == port_name)
     }
 
-    /// A section header: a disclosure chevron, the title, a count, an action.
+    /// A section header: a disclosure chevron, the section's chip in its
+    /// colour, the title in tracked small caps the way an explorer names
+    /// its views, a count, an action.
     ///
     /// The whole strip is the disclosure target — a 12px chevron is a poor
     /// thing to ask anyone to hit.
@@ -303,6 +314,10 @@ impl SerialWorkspace {
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.is_collapsed(section);
+        let (glyph, category) = match section {
+            PanelSection::Sessions => (Glyph::Bookmark, palette.category_session),
+            PanelSection::Commands => (Glyph::Run, palette.category_command),
+        };
 
         h_flex()
             .id(match section {
@@ -333,12 +348,13 @@ impl SerialWorkspace {
                         .size(px(13.))
                         .text_color(rgb(palette.faint)),
                     )
+                    .child(icon_chip(glyph, category, SECTION_CHIP))
                     .child(
                         div()
                             .truncate()
-                            .text_token(HEADING)
+                            .text_token(EYEBROW)
                             .text_color(rgb(palette.strong_foreground))
-                            .child(title),
+                            .child(spaced_caps(title)),
                     )
                     .child(Self::count_pill(palette, count)),
             )
@@ -755,7 +771,9 @@ impl SerialWorkspace {
         let quick_send_need = SECTION_HEADER_HEIGHT
             + match commands {
                 0 => EMPTY_HINT_HEIGHT,
-                count => count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP,
+                count => {
+                    SEARCH_ROW_HEIGHT + count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP
+                }
             }
             + LIST_PAD_BOTTOM;
         let cap = (panel_height * SESSIONS_SHARE)
@@ -791,19 +809,53 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
+    /// Whether a saved command answers to the search box: its name or its
+    /// text holds the query, case folded.
+    fn command_matches(command: &StoredCommand, query: &str) -> bool {
+        query.is_empty()
+            || command.label.to_lowercase().contains(query)
+            || command.command.to_lowercase().contains(query)
+    }
+
     fn render_quick_send(&mut self, has_active_tab: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.commands_collapsed;
-        let saved_commands = self.presets.commands.clone();
+        let query = self.command_query.clone();
+        let searching = !query.is_empty();
+        let total = self.presets.commands.len();
+        let saved_commands = self
+            .presets
+            .commands
+            .iter()
+            .filter(|command| Self::command_matches(command, &query))
+            .cloned()
+            .collect::<Vec<_>>();
         let workspace = cx.weak_entity();
 
+        // While a search is on, the count is of what it found.
         let header = self.section_header(
             PanelSection::Commands,
             "Quick send",
-            saved_commands.len(),
+            if searching { saved_commands.len() } else { total },
             None,
             cx,
         );
+        // The box sits over the list once there is something to search.
+        let search = (total > 0).then(|| {
+            div().flex_none().px_2().pb_2().child(
+                Input::new(&self.command_search)
+                    .small()
+                    .h(px(SEARCH_HEIGHT))
+                    .text_token(CAPTION)
+                    .rounded(px(SEARCH_HEIGHT / 2.))
+                    .prefix(
+                        Icon::new(IconName::Search)
+                            .size(px(13.))
+                            .text_color(rgb(palette.muted)),
+                    )
+                    .cleanable(true),
+            )
+        });
 
         v_flex()
             .when(!collapsed, |section| section.flex_1().min_h_0())
@@ -812,7 +864,7 @@ impl SerialWorkspace {
             .border_color(rgb(palette.border))
             .child(header)
             .when(!collapsed, |section| {
-                section.child(
+                section.children(search).child(
                     v_flex()
                         .flex_1()
                         .min_h_0()
@@ -820,13 +872,25 @@ impl SerialWorkspace {
                         .pb_2()
                         .gap_1p5()
                         .overflow_y_scrollbar()
-                        .when(saved_commands.is_empty(), |list| {
+                        .when(total == 0, |list| {
                             list.child(Self::empty_hint(
                                 palette,
                                 Glyph::Run,
                                 "No saved commands yet",
                                 "Type a command below, then save it with the bookmark.",
                             ))
+                        })
+                        .when(total > 0 && saved_commands.is_empty(), |list| {
+                            list.child(
+                                div()
+                                    .h(px(CARD_HEIGHT))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_token(CAPTION)
+                                    .text_color(rgb(palette.faint))
+                                    .child("No command matches the search"),
+                            )
                         })
                         .children(saved_commands.into_iter().map(|saved| {
                             let send_workspace = workspace.clone();

@@ -40,7 +40,10 @@ use gpui_kit::*;
 use icons::WorkbenchAssets;
 use presets::PresetStore;
 use serial::*;
-use sidebar::{SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
+use sidebar::{
+    COMMAND_SEARCH_PLACEHOLDER, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    SIDEBAR_WIDTH,
+};
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
 use terminal::key_bytes;
@@ -90,6 +93,10 @@ pub struct SerialWorkspace {
     /// to whichever tab is in front, so what was typed survives a switch.
     send_input: Entity<InputState>,
     _send_subscription: Subscription,
+    /// The search box over Quick send, and its text folded for matching.
+    command_search: Entity<InputState>,
+    _command_search_subscription: Subscription,
+    command_query: String,
     /// The terminal log as a place to type: while it holds focus, keys go to
     /// the port of the tab in front.
     terminal_focus: FocusHandle,
@@ -125,6 +132,22 @@ impl SerialWorkspace {
             },
         );
 
+        let command_search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(COMMAND_SEARCH_PLACEHOLDER)
+                .clean_on_escape()
+        });
+        let command_search_subscription = cx.subscribe_in(
+            &command_search,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.command_query = input.read(cx).value().trim().to_lowercase();
+                    cx.notify();
+                }
+            },
+        );
+
         let workspace = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -144,6 +167,9 @@ impl SerialWorkspace {
             panel_layout,
             send_input,
             _send_subscription: send_subscription,
+            command_search,
+            _command_search_subscription: command_search_subscription,
+            command_query: String::new(),
             terminal_focus: cx.focus_handle(),
             composing: None,
             terminal_metrics: TerminalMetrics::default(),
@@ -378,6 +404,17 @@ impl SerialWorkspace {
             tab.event_tx.clone(),
         );
         cx.notify();
+    }
+
+    /// Opens the port of a tab just made, when its device is attached. A tab
+    /// on a device that is not there keeps its note and waits.
+    pub(crate) fn connect_if_attached(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let attached = self
+            .tab(tab_id)
+            .is_some_and(|tab| tab.selected_port().kind != PortKind::Unavailable);
+        if attached {
+            self.toggle_connection(tab_id, cx);
+        }
     }
 
     fn toggle_active_connection(&mut self, cx: &mut Context<Self>) {

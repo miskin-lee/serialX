@@ -145,14 +145,24 @@ pub(crate) fn tag(
         .child(text.into())
 }
 
+/// A second way to confirm a dialog, offered beside the primary one: what
+/// it says, its glyph, and what to note down before the dialog's confirm
+/// runs — the confirm itself cannot tell the two buttons apart.
+pub(crate) struct SecondaryConfirm {
+    pub(crate) label: &'static str,
+    pub(crate) glyph: Glyph,
+    pub(crate) before: Box<dyn Fn(&mut Window, &mut App) + 'static>,
+}
+
 /// The foot of a dialog: `⏎ to confirm` at the left and, at the right, a
-/// ghost `Cancel` beside the one primary action, named for what it does.
-/// Both buttons dispatch the dialog's own actions, so the keys, the buttons
-/// and the close mark all go the same way.
+/// ghost `Cancel`, a secondary action when there is one, and the primary
+/// action, named for what it does. Every button dispatches the dialog's own
+/// actions, so the keys, the buttons and the close mark all go the same way.
 pub(crate) fn dialog_footer(
     palette: WorkbenchPalette,
     confirm: &'static str,
     glyph: Glyph,
+    secondary: Option<SecondaryConfirm>,
 ) -> DialogFooter {
     DialogFooter::new()
         .justify_between()
@@ -180,6 +190,17 @@ pub(crate) fn dialog_footer(
                         .label("Cancel")
                         .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
                 )
+                .children(secondary.map(|secondary| {
+                    let before = secondary.before;
+                    Button::new("dialog-secondary")
+                        .outline()
+                        .icon(secondary.glyph)
+                        .label(secondary.label)
+                        .on_click(move |_, window, cx| {
+                            before(window, cx);
+                            window.dispatch_action(Box::new(Confirm { secondary: true }), cx)
+                        })
+                }))
                 .child(
                     Button::new("dialog-confirm")
                         .primary()
@@ -204,7 +225,7 @@ pub(crate) fn eyebrow(palette: WorkbenchPalette, text: &str) -> impl IntoElement
 
 /// `Baud rate` as `B A U D  R A T E`, with thin spaces: the closest GPUI gets
 /// to letter-spacing.
-fn spaced_caps(text: &str) -> String {
+pub(crate) fn spaced_caps(text: &str) -> String {
     let mut out = String::with_capacity(text.len() * 2);
     for word in text.split_whitespace() {
         if !out.is_empty() {

@@ -44,7 +44,9 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use smol::Timer;
 
-use crate::controls::{Choice, ChoiceText, dialog_footer, eyebrow, segmented, tag};
+use crate::controls::{
+    Choice, ChoiceText, SecondaryConfirm, dialog_footer, eyebrow, segmented, tag,
+};
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{StoredGroup, StoredSession};
@@ -244,6 +246,9 @@ struct SerialConfigurationEditor {
     /// configuration keeps the last rate that was, and the dialog will not
     /// confirm until the text is one again.
     baud_error: Option<BaudRateError>,
+    /// Set by `Save & Connect` just before it confirms, and taken by the
+    /// confirm, so the one handler knows which button it was.
+    save_on_confirm: bool,
 }
 
 impl SerialConfigurationEditor {
@@ -329,6 +334,7 @@ impl SerialConfigurationEditor {
             baud_input,
             _baud_subscription: baud_subscription,
             baud_error: None,
+            save_on_confirm: false,
         }
     }
 
@@ -1254,11 +1260,12 @@ impl SerialWorkspace {
         });
         let editor_for_dialog = editor.clone();
         let editor_for_submit = editor.clone();
+        let editor_for_footer = editor.clone();
         let (title, blurb, confirm, confirm_glyph) = match target {
             ConfigurationTarget::NewTab => (
                 "New session",
-                "Pick the device and the parameters it expects. They open in a tab of their own.",
-                "Open Session",
+                "Pick the device and the parameters it expects. Connect opens them in a tab of their own; Save & Connect also keeps the session in the side panel.",
+                "Connect",
                 Glyph::Bolt,
             ),
             ConfigurationTarget::SavedSession(_) => (
@@ -1285,6 +1292,21 @@ impl SerialWorkspace {
             });
             let header_frame = frame.clone();
             let footer_frame = frame.clone();
+            // A new session can be kept as it is opened; an edit is a save
+            // already, so it has the one button.
+            let secondary = match target {
+                ConfigurationTarget::NewTab => {
+                    let editor = editor_for_footer.clone();
+                    Some(SecondaryConfirm {
+                        label: "Save & Connect",
+                        glyph: Glyph::Bookmark,
+                        before: Box::new(move |_, cx| {
+                            editor.update(cx, |editor, _| editor.save_on_confirm = true);
+                        }),
+                    })
+                }
+                ConfigurationTarget::SavedSession(_) => None,
+            };
             let viewport_height: f32 = window.viewport_size().height.into();
             alert
                 .width(px(DIALOG_WIDTH))
@@ -1309,10 +1331,14 @@ impl SerialWorkspace {
                 .close_button(true)
                 .child(editor_for_dialog.clone())
                 .footer(DialogFrame::measuring(
-                    dialog_footer(palette, confirm, confirm_glyph),
+                    dialog_footer(palette, confirm, confirm_glyph, secondary),
                     move |bounds| footer_frame.footer_bottom.set(Some(bounds.bottom())),
                 ))
                 .on_ok(move |_, window, cx| {
+                    // Taken first, so a confirm that fails below does not
+                    // leave the choice lying around for the next one.
+                    let save_too =
+                        editor.update(cx, |editor, _| std::mem::take(&mut editor.save_on_confirm));
                     // A field that does not hold a rate keeps the dialog
                     // open, with the field in focus, rather than opening the
                     // port at the last rate that was one.
@@ -1332,15 +1358,27 @@ impl SerialWorkspace {
                     let target = editor.target;
 
                     let _ = workspace.update(cx, |workspace, cx| match target {
-                        ConfigurationTarget::NewTab => workspace.create_configured_tab(
-                            port_name,
-                            configuration,
-                            color,
-                            alias,
-                            group,
-                            window,
-                            cx,
-                        ),
+                        ConfigurationTarget::NewTab => {
+                            if save_too {
+                                workspace.save_session_preset(
+                                    port_name.clone(),
+                                    configuration,
+                                    color,
+                                    alias.clone(),
+                                    group,
+                                );
+                            }
+                            let id = workspace.create_configured_tab(
+                                port_name,
+                                configuration,
+                                color,
+                                alias,
+                                group,
+                                window,
+                                cx,
+                            );
+                            workspace.connect_if_attached(id, cx);
+                        }
                         ConfigurationTarget::SavedSession(saved_id) => {
                             workspace.presets.update_session(
                                 saved_id,
@@ -1371,7 +1409,7 @@ impl SerialWorkspace {
         group: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> usize {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let mut tab = Self::build_tab(id, window, cx);
@@ -1396,6 +1434,7 @@ impl SerialWorkspace {
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         cx.notify();
+        id
     }
 }
 

@@ -744,8 +744,6 @@ pub(crate) const WORDMARK: TextToken = TextToken::new(34., 42., FontWeight(800.)
 /// Dialog titles: one step above the body, so a sheet opens with a headline
 /// rather than a bold sentence.
 pub(crate) const TITLE: TextToken = TextToken::new(15., 20., FontWeight::SEMIBOLD);
-/// Panel and section headings.
-pub(crate) const HEADING: TextToken = TextToken::new(12.5, 18., FontWeight::SEMIBOLD);
 /// Default running text.
 pub(crate) const BODY: TextToken = TextToken::new(13., 20., FontWeight::NORMAL);
 /// Running text that carries the emphasis in its row.

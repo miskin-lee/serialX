@@ -101,7 +101,7 @@ impl SerialWorkspace {
                         .px_2p5()
                         .cleanable(true),
                 )
-                .footer(dialog_footer(palette, confirm, Glyph::Folder))
+                .footer(dialog_footer(palette, confirm, Glyph::Folder, None))
                 .on_ok(move |_, window, cx| {
                     // A blank name keeps the prompt open with the field in
                     // focus, rather than making a group with nothing on it.

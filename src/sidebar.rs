@@ -26,8 +26,14 @@
 //!
 //! Along the panel's foot sits the composer: the one box commands are typed
 //! into, under the commands kept for reuse, so a line and the bookmark that
-//! saves it are a hand's width apart. It sends to whichever tab is in front,
-//! and says which.
+//! saves it are a hand's width apart. It is built the way a chat composer
+//! is — Slack's, Linear's — one card with the text on top and a rail of
+//! switches under it: the encoding, UTF-8 or HEX, and what follows the
+//! line, `CRLF`, `LF` or nothing, with the send button at the rail's end.
+//! The bookmark that keeps the line sits at the end of the box itself, as
+//! a browser's star sits at the end of its address bar. Over the card a
+//! line names the tab it sends to, the way a mail's `To` does, with the
+//! tab's connection dot.
 
 use std::rc::Rc;
 
@@ -37,7 +43,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
@@ -46,20 +52,23 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::commands::CommandTarget;
-use crate::controls::{Choice, ChoiceText, segmented, spaced_caps};
+use crate::controls::{Choice, ChoiceText, segmented, spaced_caps, tag};
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{Library, StoredCommand, StoredGroup, StoredSession};
 use crate::theme::{
     CAPTION, EYEBROW, LABEL, MICRO, MONO_SMALL, TagColor, Typography, WorkbenchPalette, tint,
 };
-use crate::{SerialConfiguration, SerialTabSnapshot, SerialWorkspace};
+use crate::{
+    HexError, LineEnding, SerialConfiguration, SerialTabSnapshot, SerialWorkspace, parse_hex,
+};
 
 /// Width the panel opens at. Wide enough for a port path plus its baud
 /// summary on one line at the caption size; the edge drags from there.
 pub(crate) const SIDEBAR_WIDTH: f32 = 296.;
-/// The narrowest the panel drags to: one card with its glyph and a name.
-pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 220.;
+/// The narrowest the panel drags to: one card with its glyph and a name,
+/// and the composer's two switches with the send button beside them.
+pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 240.;
 /// The widest: past this the cards are mostly air.
 pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
 /// Width of the line the panel's edge lights up to under the pointer: wide
@@ -76,13 +85,32 @@ const SEARCH_ROW_HEIGHT: f32 = 36.;
 /// What the search boxes say while they are empty.
 const SESSION_SEARCH_PLACEHOLDER: &str = "Search sessions";
 const COMMAND_SEARCH_PLACEHOLDER: &str = "Search commands";
-/// Height of the composer at the panel's foot: the box, the row of switches
-/// under it, and the air around them.
-const COMPOSER_HEIGHT: f32 = 82.;
-/// Height of the box commands are typed into.
-const COMPOSER_INPUT_HEIGHT: f32 = 32.;
-/// What the composer says while it is empty.
+/// Height of the composer at the panel's foot: the line naming where a
+/// command goes, the card under it, and the air around them.
+const COMPOSER_HEIGHT: f32 = 104.;
+/// Height of the line over the card.
+const COMPOSER_TARGET_HEIGHT: f32 = 20.;
+/// Height of the box commands are typed into, at the top of the card.
+const COMPOSER_INPUT_HEIGHT: f32 = 34.;
+/// Height of the rail of switches under it, and of each switch on it —
+/// the segmented rail and the ending's pill are the same height, so they
+/// read as one family.
+const COMPOSER_RAIL_HEIGHT: f32 = 32.;
+const COMPOSER_SWITCH_HEIGHT: f32 = 24.;
+/// Diameter of the two discs at the card's right edge — the bookmark at
+/// the box's end and the send button under it — as every chat composer's
+/// send is. One size, so the pair reads as a pair: the quiet one keeps,
+/// the accent one sends.
+const ACTION_BUTTON_SIZE: f32 = 26.;
+/// The glyph in each: the plane is wide, the bookmark tall, so the
+/// bookmark takes a little more to weigh the same.
+const SEND_ICON_SIZE: f32 = 14.;
+const BOOKMARK_ICON_SIZE: f32 = 16.;
+/// The narrowest the ending's list opens: room for a name and its bytes.
+const ENDING_LIST_MIN_WIDTH: f32 = 148.;
+/// What the composer says while it is empty, in each encoding.
 pub(crate) const SEND_PLACEHOLDER: &str = "Enter a command…";
+const HEX_PLACEHOLDER: &str = "Hex bytes, e.g. 41 54 0D 0A";
 const SECTION_HEADER_HEIGHT: f32 = 38.;
 /// The most of the panel the saved sessions take while Quick send is open.
 const SESSIONS_SHARE: f32 = 0.5;
@@ -289,7 +317,8 @@ impl SerialWorkspace {
 
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let mut tab = Self::build_tab(id, window, cx);
+        let scrollback = self.presets.settings.scrollback_lines;
+        let mut tab = Self::build_tab(id, scrollback, window, cx);
         tab.configuration = saved.configuration.sanitized();
         tab.color = saved.color;
         tab.alias = saved.alias.clone();
@@ -1278,40 +1307,128 @@ impl SerialWorkspace {
     /// sets its framing with, so the two places a mode is picked look alike.
     fn render_mode_switch(&mut self, hex_mode: bool, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
-        segmented(
-            "mode-switch",
-            palette,
-            ChoiceText::ui(MICRO),
-            vec![
-                Choice::new(
-                    "UTF-8",
-                    !hex_mode,
-                    cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
-                ),
-                Choice::new(
-                    "HEX",
-                    hex_mode,
-                    cx.listener(|this, _, _, cx| this.set_hex_mode(true, cx)),
-                ),
-            ],
-        )
-        .into_any_element()
+        div()
+            .flex_none()
+            .h(px(COMPOSER_SWITCH_HEIGHT))
+            .child(segmented(
+                "mode-switch",
+                palette,
+                ChoiceText::ui(MICRO),
+                vec![
+                    Choice::new(
+                        "UTF-8",
+                        !hex_mode,
+                        cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
+                    ),
+                    Choice::new(
+                        "HEX",
+                        hex_mode,
+                        cx.listener(|this, _, _, cx| this.set_hex_mode(true, cx)),
+                    ),
+                ],
+            ))
+            .into_any_element()
     }
 
-    /// The composer: the box on top, and under it the mode switch, where
-    /// the line will go, and the two buttons — bookmark and send. Without a
-    /// tab the box and the send button are put to rest; the bookmark still
-    /// works, since a command can be kept before there is anywhere to send it.
+    /// The line-ending switch: a pill on the same rail as the mode switch,
+    /// a return glyph, the ending's name and a caret, opening the list of
+    /// the three above it — the way Arduino's monitor and VS Code's serial
+    /// monitor put the ending beside the box. Each row names the ending
+    /// and spells its bytes, so `CRLF` and `\r\n` are read together.
+    fn render_ending_switch(&mut self, ending: LineEnding, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let workspace = cx.weak_entity();
+
+        Button::new("line-ending")
+            .ghost()
+            .compact()
+            .h(px(COMPOSER_SWITCH_HEIGHT))
+            .px(px(7.))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border_subtle))
+            .rounded(px(8.))
+            .tab_stop(false)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_token(MICRO)
+                            .text_color(rgb(palette.faint))
+                            .child("↵"),
+                    )
+                    .child(
+                        div()
+                            .text_token(MICRO)
+                            .text_color(rgb(palette.strong_foreground))
+                            .whitespace_nowrap()
+                            .child(ending.label()),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(px(10.))
+                            .text_color(rgb(palette.muted)),
+                    ),
+            )
+            .tooltip("What follows the line")
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
+                menu = menu.min_w(px(ENDING_LIST_MIN_WIDTH));
+                for choice in LineEnding::ALL {
+                    let workspace = workspace.clone();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_3()
+                                .child(choice.label())
+                                .when(!choice.spelled().is_empty(), |row| {
+                                    row.child(
+                                        div()
+                                            .ui_mono_font()
+                                            .text_token(MONO_SMALL)
+                                            .text_color(rgb(palette.muted))
+                                            .child(choice.spelled()),
+                                    )
+                                })
+                        })
+                        .checked(choice == ending)
+                        .on_click(move |_, _, cx| {
+                            let _ = workspace.update(cx, |this, cx| {
+                                this.set_line_ending(choice, cx);
+                            });
+                        }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+
+    /// The composer: a line naming the tab it sends to, and under it one
+    /// card — the box on top, with the bookmark at its end, and along the
+    /// card's foot the rail of switches, the encoding and the line ending,
+    /// with the send disc at its end. The card carries the frame the box
+    /// would: the accent while the box has focus, red while a line in HEX
+    /// is not hex, with a `Not hex` tag on the line above saying so.
+    /// Without a tab the box and the send button are put to rest; the
+    /// bookmark still works, since a command can be kept before there is
+    /// anywhere to send it.
     fn render_composer(
         &mut self,
         active: Option<&SerialTabSnapshot>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let hex_mode = active.is_some_and(|tab| tab.hex_mode);
+        let ending = active.map_or(LineEnding::default(), |tab| tab.line_ending);
         let (target, status) = match self.active_tab() {
             Some(tab) => (
-                tab.title().to_string(),
+                Some(tab.title().to_string()),
                 if tab.connected {
                     palette.success
                 } else if tab.connecting {
@@ -1320,77 +1437,159 @@ impl SerialWorkspace {
                     palette.faint
                 },
             ),
-            None => ("No session open".to_string(), palette.faint),
+            None => (None, palette.faint),
         };
+
+        // The box says what it takes, in the encoding it is in. The state
+        // keeps the placeholder, so it is put right here, where the mode
+        // is known, whenever it has drifted.
+        let placeholder = if hex_mode {
+            HEX_PLACEHOLDER
+        } else {
+            SEND_PLACEHOLDER
+        };
+        if self.send_input.read(cx).presentation().placeholder().as_ref() != placeholder {
+            self.send_input
+                .update(cx, |input, cx| input.set_placeholder(placeholder, window, cx));
+        }
+        let focused = self.send_input.read(cx).focus_handle(cx).is_focused(window);
+        // A digit short of a byte is what every other keystroke leaves, so
+        // only a character that can never be hex reddens the frame; the
+        // odd digit is caught on send.
+        let not_hex = hex_mode
+            && matches!(
+                parse_hex(self.send_input.read(cx).value().as_ref()),
+                Err(HexError::NotHex)
+            );
+        let ring = if not_hex {
+            palette.danger
+        } else if focused {
+            palette.accent
+        } else {
+            palette.input_border
+        };
+
         let mode_switch = self.render_mode_switch(hex_mode, cx);
+        let ending_switch = self.render_ending_switch(ending, cx);
+
+        let target_line = h_flex()
+            .h(px(COMPOSER_TARGET_HEIGHT))
+            .flex_none()
+            .items_center()
+            .gap_1p5()
+            .px_1()
+            .when(target.is_some(), |line| {
+                line.child(
+                    div()
+                        .text_token(CAPTION)
+                        .text_color(rgb(palette.faint))
+                        .child("To"),
+                )
+            })
+            .child(Self::status_dot(6., status))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_token(CAPTION)
+                    .text_color(rgb(if target.is_some() {
+                        palette.foreground
+                    } else {
+                        palette.muted
+                    }))
+                    .child(target.unwrap_or_else(|| "No session open".to_string())),
+            )
+            .child(div().flex_1())
+            .when(not_hex, |line| {
+                line.child(tag(palette, palette.danger, MICRO, "Not hex"))
+            });
+
+        let input = Styled::h(
+            Input::new(&self.send_input)
+                .appearance(false)
+                .focus_bordered(false)
+                .px_2p5(),
+            px(COMPOSER_INPUT_HEIGHT),
+        )
+        .disabled(active.is_none())
+        .prefix(
+            Icon::new(if hex_mode {
+                Glyph::Hex
+            } else {
+                Glyph::Terminal
+            })
+            .size(px(15.))
+            .text_color(rgb(palette.muted)),
+        )
+        .when(hex_mode, |input| input.ui_mono_font())
+        .cleanable(true)
+        .suffix(
+            Button::new("save-command")
+                .ghost()
+                .with_size(px(ACTION_BUTTON_SIZE))
+                .rounded(px(ACTION_BUTTON_SIZE / 2.))
+                .bg(rgb(palette.surface))
+                .border_1()
+                .border_color(rgb(palette.border_subtle))
+                .tab_stop(false)
+                .icon(Icon::new(Glyph::Bookmark).size(px(BOOKMARK_ICON_SIZE)))
+                .tooltip("Save this command to Quick send")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.save_current_command(window, cx);
+                })),
+        );
+
+        // The rail keeps the box's side padding, so the send disc hangs
+        // under the bookmark and the switches start under the glyph.
+        let rail = h_flex()
+            .h(px(COMPOSER_RAIL_HEIGHT))
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .px_2p5()
+            .pb_1p5()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .when(active.is_none(), |switches| switches.opacity(0.5))
+                    .child(mode_switch)
+                    .child(ending_switch),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("send-command")
+                    .primary()
+                    .with_size(px(ACTION_BUTTON_SIZE))
+                    .rounded(px(ACTION_BUTTON_SIZE / 2.))
+                    .icon(Icon::new(Glyph::Send).size(px(SEND_ICON_SIZE)))
+                    .disabled(active.is_none())
+                    .tooltip("Send to the session in front")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.send_to_active_tab(window, cx);
+                    })),
+            );
+
+        let card = v_flex()
+            .flex_none()
+            .rounded(px(10.))
+            .bg(rgb(palette.input))
+            .border_1()
+            .border_color(rgb(ring))
+            .child(input)
+            .child(rail);
 
         v_flex()
             .h(px(COMPOSER_HEIGHT))
             .flex_none()
             .px_2()
-            .py_2()
-            .gap_1p5()
+            .pt_1p5()
+            .pb_2()
+            .gap_1()
             .border_t_1()
             .border_color(rgb(palette.border))
-            .child(
-                // `Input::h` is the multi-line box's own and shadows the
-                // style height, so the style's is named in full.
-                Styled::h(Input::new(&self.send_input), px(COMPOSER_INPUT_HEIGHT))
-                    .disabled(active.is_none())
-                    .prefix(
-                        Icon::new(if hex_mode {
-                            Glyph::Hex
-                        } else {
-                            Glyph::Terminal
-                        })
-                        .size(px(15.))
-                        .text_color(rgb(palette.muted)),
-                    )
-                    .cleanable(true),
-            )
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap_2()
-                    .child(mode_switch)
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(Self::status_dot(6., status))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_token(CAPTION)
-                                    .text_color(rgb(palette.muted))
-                                    .child(target),
-                            ),
-                    )
-                    .child(
-                        Button::new("save-command")
-                            .ghost()
-                            .small()
-                            .icon(Glyph::Bookmark)
-                            .tooltip("Save this command to Quick send")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_current_command(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("send-command")
-                            .primary()
-                            .small()
-                            .icon(Glyph::Send)
-                            .disabled(active.is_none())
-                            .tooltip("Send to the session in front")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.send_to_active_tab(window, cx);
-                            })),
-                    ),
-            )
+            .child(target_line)
+            .child(card)
             .into_any_element()
     }
 
@@ -1482,6 +1681,7 @@ impl SerialWorkspace {
         &mut self,
         active_tab: Option<SerialTabSnapshot>,
         panel_height: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.side_panel_collapsed {
@@ -1495,7 +1695,7 @@ impl SerialWorkspace {
         let (commands, quick_send_need) = self.render_quick_send(has_active_tab, cx);
         let sessions =
             self.render_saved_sessions(panel_height - COMPOSER_HEIGHT, quick_send_need, cx);
-        let composer = self.render_composer(active_tab.as_ref(), cx);
+        let composer = self.render_composer(active_tab.as_ref(), window, cx);
 
         // The width is the resizable panel's to set; the column fills it.
         v_flex()

@@ -36,6 +36,18 @@
 //! alone, does that alone. The alternate screen is left to itself: a
 //! full-screen program clearing its own screen is not clearing the log,
 //! which is there again when the program ends.
+//!
+//! Lines are numbered, the way an editor numbers them, from the first line
+//! since the log was last cleared. The number rides with the stamp: both
+//! are kept per line begun, so a line the terminal wrapped shows its number
+//! once, and a line the scrollback has let go still counts — the first
+//! number on screen climbs past one, rather than every line renumbering
+//! as the oldest falls off. A clear, from either end, starts again at one.
+//!
+//! The find bar asks the grid where a pattern occurs ([`Terminal::find`]).
+//! It reads logical lines — a wrapped line joined back together, so a word
+//! split by the wrap is still found — and answers in cells, so a match can
+//! be painted over the rows it sits on and scrolled into view.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
@@ -48,10 +60,17 @@ use alacritty_terminal::{
 };
 use gpui_kit::Keystroke;
 
-use crate::{highlight::Highlighter, theme::TerminalPalette};
+use crate::{
+    filter::OutputFilter, highlight::Highlighter, presets::DEFAULT_SCROLLBACK_LINES,
+    theme::TerminalPalette,
+};
 
-/// Lines kept above the screen to scroll back through.
-const SCROLLBACK: usize = 10_000;
+/// Stamps kept past the scrollback, for the lines on screen: the screen is
+/// rarely this tall, and a stamp is small.
+const STAMP_SLACK: usize = INITIAL_LINES * 8;
+/// The fewest digits the line-number gutter is sized for, so it does not
+/// widen at every power of ten while a log is short.
+const MIN_NUMBER_DIGITS: usize = 4;
 /// The size a terminal starts at, before its first layout says otherwise.
 const INITIAL_COLUMNS: usize = 80;
 const INITIAL_LINES: usize = 24;
@@ -104,22 +123,54 @@ pub(crate) struct Terminal {
     /// The start of an escape sequence a read ended in the middle of,
     /// kept until the rest arrives and says whether it is an erase.
     held: Vec<u8>,
+    /// Lines kept above the screen to scroll back through.
+    scrollback: usize,
+    /// The number of the oldest line still stamped, counting from one at
+    /// the last clear: what the scrollback let go is added here, so the
+    /// lines that remain keep the numbers they had.
+    first_number: usize,
+    /// Goes up whenever the grid changes — bytes in, a resize, a clear —
+    /// so a search over it can tell whether its answer is still current.
+    revision: u64,
 }
 
 impl Default for Terminal {
     fn default() -> Self {
-        Self::with_size(GridSize {
-            columns: INITIAL_COLUMNS,
-            lines: INITIAL_LINES,
-        })
+        Self::new(DEFAULT_SCROLLBACK_LINES)
     }
 }
 
 impl Terminal {
-    fn with_size(size: GridSize) -> Self {
+    /// A terminal that keeps `scrollback` lines above its screen.
+    pub(crate) fn new(scrollback: usize) -> Self {
+        Self::with_size(
+            GridSize {
+                columns: INITIAL_COLUMNS,
+                lines: INITIAL_LINES,
+            },
+            scrollback,
+        )
+    }
+
+    fn with_size(size: GridSize, scrollback: usize) -> Self {
         let outbox = Outbox::default();
-        let config = Config {
-            scrolling_history: SCROLLBACK,
+        Self {
+            term: Term::new(Self::config(scrollback), &size, outbox.clone()),
+            parser: Processor::new(),
+            outbox,
+            size,
+            stamps: VecDeque::new(),
+            unstamped: true,
+            held: Vec::new(),
+            scrollback,
+            first_number: 1,
+            revision: 0,
+        }
+    }
+
+    fn config(scrollback: usize) -> Config {
+        Config {
+            scrolling_history: scrollback,
             // A blinking block unless the program on the other end asks
             // for something else.
             default_cursor_style: CursorStyle {
@@ -127,15 +178,40 @@ impl Terminal {
                 blinking: true,
             },
             ..Config::default()
-        };
-        Self {
-            term: Term::new(config, &size, outbox.clone()),
-            parser: Processor::new(),
-            outbox,
-            size,
-            stamps: VecDeque::new(),
-            unstamped: true,
-            held: Vec::new(),
+        }
+    }
+
+    /// Changes how many lines are kept above the screen. Fewer, and the
+    /// oldest go now; more, and the room is there for what comes.
+    pub(crate) fn set_scrollback(&mut self, scrollback: usize) {
+        if scrollback == self.scrollback {
+            return;
+        }
+        self.scrollback = scrollback;
+        self.term.set_options(Self::config(scrollback));
+        self.trim_stamps();
+        self.revision += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scrollback(&self) -> usize {
+        self.scrollback
+    }
+
+    /// Which state of the grid this is: a search made at one revision is
+    /// stale at any other.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Lets go of the stamps of lines the scrollback no longer holds,
+    /// carrying their count into the numbering.
+    fn trim_stamps(&mut self) {
+        let cap = self.scrollback + STAMP_SLACK;
+        if self.stamps.len() > cap {
+            let drop = self.stamps.len() - cap;
+            self.stamps.drain(..drop);
+            self.first_number += drop;
         }
     }
 
@@ -154,14 +230,13 @@ impl Terminal {
                 self.unstamped = false;
             }
         }
-        while self.stamps.len() > SCROLLBACK + INITIAL_LINES * 8 {
-            self.stamps.pop_front();
-        }
+        self.trim_stamps();
         let following = self.is_at_bottom();
         self.advance(bytes);
         if following {
             self.scroll_to_bottom();
         }
+        self.revision += 1;
         std::mem::take(&mut *self.outbox.0.borrow_mut())
     }
 
@@ -225,6 +300,9 @@ impl Terminal {
         let keep = usize::from(!self.unstamped);
         self.parser.advance(&mut self.term, b"\x1b[2J\x1b[3J");
         self.keep_last_stamps(keep);
+        // The log starts over, and so does the count: the line kept, if
+        // any, is the first of what comes next.
+        self.first_number = 1;
     }
 
     /// How many lines on screen, from the top row down to the cursor's,
@@ -246,10 +324,13 @@ impl Terminal {
         hard.saturating_sub(usize::from(self.unstamped))
     }
 
-    /// Drops every stamp but the newest `count`.
+    /// Drops every stamp but the newest `count`. The lines let go still
+    /// count towards the numbering, as an erase of the scrollback is not a
+    /// fresh start.
     fn keep_last_stamps(&mut self, count: usize) {
         let drop = self.stamps.len().saturating_sub(count);
         self.stamps.drain(..drop);
+        self.first_number += drop;
     }
 
     /// Prints a line of the workbench's own — a port opening, a scan —
@@ -280,17 +361,154 @@ impl Terminal {
             if following {
                 self.scroll_to_bottom();
             }
+            self.revision += 1;
         }
     }
 
-    /// Wipes the screen, the scrollback and the stamps.
+    /// Wipes the screen, the scrollback and the stamps, and starts the
+    /// numbering over.
     pub(crate) fn clear(&mut self) {
-        *self = Self::with_size(self.size);
+        let revision = self.revision + 1;
+        *self = Self::with_size(self.size, self.scrollback);
+        self.revision = revision;
     }
 
     /// Moves the view through the scrollback: positive is back in time.
     pub(crate) fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
+    }
+
+    /// Brings a line of the grid to the middle of the screen, as near as
+    /// the ends of the scrollback allow.
+    pub(crate) fn scroll_to_line(&mut self, line: i32) {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let current = grid.display_offset() as i32;
+        let wanted = (self.size.lines as i32 / 2 - line).clamp(0, history);
+        if wanted != current {
+            self.term.scroll_display(Scroll::Delta(wanted - current));
+        }
+    }
+
+    /// How wide the line numbers run: the digits of the highest number in
+    /// the log, and never fewer than a short log is sized for.
+    pub(crate) fn number_digits(&self) -> usize {
+        let highest = (self.first_number + self.stamps.len()).saturating_sub(1).max(1);
+        let digits = highest.checked_ilog10().map_or(1, |log| log as usize + 1);
+        digits.max(MIN_NUMBER_DIGITS)
+    }
+
+    /// Whether a row continues the line above it: that row was wrapped by
+    /// the terminal rather than ended by the device.
+    fn is_continuation(&self, line: i32) -> bool {
+        let grid = self.term.grid();
+        line > -(grid.history_size() as i32)
+            && grid[Line(line - 1)]
+                .last()
+                .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
+    }
+
+    /// The number of the first line in the grid — the top of the
+    /// scrollback — from which every line below is numbered in turn. Found
+    /// from the cursor's line, whose stamp is the newest: counting the
+    /// lines from the top to it says how far the newest number is from the
+    /// first. Below the first stamp, for a grid cleared to blank rows, the
+    /// count runs into what would have been negative; those rows have no
+    /// text, so the number never shows.
+    fn first_line_number(&self) -> i64 {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let cursor_line = grid.cursor.point.line.0;
+        let hard_at_cursor = (-history..=cursor_line)
+            .filter(|&line| !self.is_continuation(line))
+            .count()
+            .saturating_sub(1);
+        let anchor = hard_at_cursor as i64 - i64::from(self.unstamped);
+        self.first_number as i64 + self.stamps.len() as i64 - 1 - anchor
+    }
+
+    /// Where a pattern occurs in the log, oldest first, as cells. Each
+    /// logical line is read whole — the rows the terminal wrapped it over
+    /// joined back — and a match that straddles the wrap comes back as one
+    /// match of two spans. A match is named by its line's number and how
+    /// far along the line it starts, which is the same match through a
+    /// scroll, a reflow or new lines pushing the rows up.
+    pub(crate) fn find(&self, matcher: &OutputFilter) -> Vec<FindMatch> {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let last = self.size.lines as i32 - 1;
+        let is_spacer = |flags: Flags| {
+            flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+        };
+        let mut matches = Vec::new();
+        let mut text = String::new();
+        let mut number = self.first_line_number();
+        let mut line = -history;
+        while line <= last {
+            // The logical line's text, and the row after its last.
+            text.clear();
+            let mut end = line;
+            loop {
+                let row = &grid[Line(end)];
+                text.extend(row[..].iter().filter(|cell| !is_spacer(cell.flags)).map(|cell| cell.c));
+                let wrapped = row
+                    .last()
+                    .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
+                end += 1;
+                if !wrapped || end > last {
+                    break;
+                }
+            }
+            text.truncate(text.trim_end().len());
+            let ranges = matcher.find_ranges(&text);
+            if !ranges.is_empty() {
+                // One cell per character of the text, in order, for the
+                // few lines that hold a match.
+                let cells: Vec<FindSpan> = (line..end)
+                    .flat_map(|at| {
+                        grid[Line(at)][..]
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cell)| !is_spacer(cell.flags))
+                            .map(move |(column, cell)| FindSpan {
+                                line: at,
+                                column,
+                                width: if cell.flags.contains(Flags::WIDE_CHAR) {
+                                    2
+                                } else {
+                                    1
+                                },
+                            })
+                    })
+                    .collect();
+                for range in ranges {
+                    let start = text[..range.start].chars().count();
+                    let end = start + text[range].chars().count();
+                    let mut spans: Vec<FindSpan> = Vec::new();
+                    for cell in &cells[start..end.min(cells.len())] {
+                        match spans.last_mut() {
+                            Some(span)
+                                if span.line == cell.line
+                                    && span.column + span.width == cell.column =>
+                            {
+                                span.width += cell.width;
+                            }
+                            _ => spans.push(*cell),
+                        }
+                    }
+                    if !spans.is_empty() {
+                        matches.push(FindMatch {
+                            line: number,
+                            offset: start,
+                            spans,
+                        });
+                    }
+                }
+            }
+            number += 1;
+            line = end;
+        }
+        matches
     }
 
     pub(crate) fn scroll_to_bottom(&mut self) {
@@ -355,14 +573,7 @@ impl Terminal {
         let lines = self.size.lines;
         let history = grid.history_size() as i32;
 
-        // A row continues the line above when that row was wrapped by the
-        // terminal rather than ended by the device.
-        let is_continuation = |line: Line| -> bool {
-            line.0 > -history
-                && grid[Line(line.0 - 1)]
-                    .last()
-                    .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
-        };
+        let is_continuation = |line: Line| self.is_continuation(line.0);
         // Rows that begin a line, numbered from the top of the scrollback:
         // one pass up to the cursor, noting the number as it passes the
         // first row on screen.
@@ -382,14 +593,13 @@ impl Terminal {
             }
         }
         // The last stamped line is the cursor's, or the one above it while
-        // the cursor's line is still empty.
+        // the cursor's line is still empty. A hard row's stamp is found by
+        // counting back from it, and its number is the stamp's place in
+        // the log.
         let anchor = hard_at_cursor as i64 - i64::from(self.unstamped);
-        let stamp_for = |hard: usize| -> Option<String> {
+        let stamp_index = |hard: usize| -> Option<usize> {
             let back = usize::try_from(anchor - hard as i64).ok()?;
-            self.stamps
-                .len()
-                .checked_sub(back + 1)
-                .map(|index| self.stamps[index].clone())
+            self.stamps.len().checked_sub(back + 1)
         };
 
         let mut hard = hard_at_first;
@@ -400,10 +610,13 @@ impl Terminal {
                 if index > 0 && !continuation {
                     hard += 1;
                 }
+                let stamped = if continuation { None } else { stamp_index(hard) };
                 RenderRow {
-                    stamp: if continuation { None } else { stamp_for(hard) },
+                    stamp: stamped.map(|index| self.stamps[index].clone()),
+                    number: stamped.map(|index| self.first_number + index),
                     runs: Vec::new(),
                     text: String::new(),
+                    columns: Vec::new(),
                 }
             })
             .collect();
@@ -438,6 +651,7 @@ impl Terminal {
                 }
             }
             row.text.push(cell.c);
+            row.columns.push(cell.point.column.0);
             cells.push(Pending {
                 column: cell.point.column.0,
                 width: if flags.contains(Flags::WIDE_CHAR) {
@@ -533,6 +747,7 @@ impl Terminal {
         }
         for row in &mut rows {
             row.text.truncate(row.text.trim_end().len());
+            row.columns.truncate(row.text.chars().count());
             // Blank stretches with nothing to show are not worth shaping.
             row.runs.retain(|run| {
                 run.style.background.is_some()
@@ -561,7 +776,11 @@ impl Terminal {
             })
             .flatten();
 
-        RenderContent { rows, cursor }
+        RenderContent {
+            rows,
+            cursor,
+            offset,
+        }
     }
 }
 
@@ -595,14 +814,55 @@ fn erase(bytes: &[u8]) -> Erase {
 pub(crate) struct RenderContent {
     pub(crate) rows: Vec<RenderRow>,
     pub(crate) cursor: Option<RenderCursor>,
+    /// How far the view is scrolled back: the grid line drawn on the
+    /// first row is `-offset`.
+    pub(crate) offset: i32,
 }
 
 pub(crate) struct RenderRow {
     /// When the line began, on the row that begins it.
     pub(crate) stamp: Option<String>,
+    /// Which line of the log it is, on the row that begins it.
+    pub(crate) number: Option<usize>,
     pub(crate) runs: Vec<RenderRun>,
-    /// The row's text, for the filter.
+    /// The row's text, for the filter and the find.
     pub(crate) text: String,
+    /// The cell each character of the text sits in: a wide character
+    /// takes two cells, so the two drift apart after one.
+    pub(crate) columns: Vec<usize>,
+}
+
+/// One occurrence of what the find bar looks for: a run of cells, or two
+/// when the terminal wrapped the line under it. Named by the number of the
+/// line it is on and how many characters along it starts — the name a
+/// match keeps while the rows under it move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FindMatch {
+    pub(crate) line: i64,
+    pub(crate) offset: usize,
+    pub(crate) spans: Vec<FindSpan>,
+}
+
+impl FindMatch {
+    /// Where the match begins, on the grid as it was scanned.
+    pub(crate) fn start(&self) -> FindSpan {
+        self.spans[0]
+    }
+
+    /// The match's name: the same occurrence answers to it scan after scan.
+    pub(crate) fn key(&self) -> (i64, usize) {
+        (self.line, self.offset)
+    }
+}
+
+/// Cells on one row of the grid: the row as alacritty numbers it — zero
+/// the top of the screen, negative into the scrollback — and the cells
+/// along it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FindSpan {
+    pub(crate) line: i32,
+    pub(crate) column: usize,
+    pub(crate) width: usize,
 }
 
 /// Adjacent cells that share a style, painted as one piece of text.
@@ -812,13 +1072,26 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
 
 #[cfg(test)]
 mod tests {
-    use super::{CaretShape, GridSize, RenderContent, RenderRun, Terminal, key_bytes};
-    use crate::{highlight::Role, theme::TerminalPalette};
-    use alacritty_terminal::term::TermMode;
+    use super::{
+        CaretShape, DEFAULT_SCROLLBACK_LINES, FindMatch, FindSpan, GridSize, MIN_NUMBER_DIGITS,
+        RenderContent, RenderRun, Terminal, key_bytes,
+    };
+    use crate::{filter::OutputFilter, highlight::Role, theme::TerminalPalette};
+    use alacritty_terminal::{grid::Dimensions, term::TermMode};
     use gpui_kit::Keystroke;
 
     fn terminal(columns: usize, lines: usize) -> Terminal {
-        Terminal::with_size(GridSize { columns, lines })
+        Terminal::with_size(GridSize { columns, lines }, DEFAULT_SCROLLBACK_LINES)
+    }
+
+    /// The line number on each row of the screen.
+    fn numbers(terminal: &Terminal) -> Vec<Option<usize>> {
+        terminal
+            .render(&TerminalPalette::DARK, false)
+            .rows
+            .iter()
+            .map(|row| row.number)
+            .collect()
     }
 
     fn rows(terminal: &Terminal) -> Vec<(Option<String>, String)> {
@@ -858,6 +1131,146 @@ mod tests {
         // The empty line the cursor sits on has no time until something lands on it.
         terminal.receive(b"OK", "10:00:04.000");
         assert_eq!(rows(&terminal)[3], stamped("10:00:04.000", "OK"));
+    }
+
+    /// Lines are numbered from one, a wrapped line once, and the line the
+    /// cursor waits on not until it holds something.
+    #[test]
+    fn lines_are_numbered_from_one() {
+        let mut terminal = terminal(5, 5);
+        terminal.receive(b"one\r\ntwo\r\nabcdefgh\r\n", "1");
+        assert_eq!(
+            numbers(&terminal),
+            vec![Some(1), Some(2), Some(3), None, None],
+            "the wrapped third line takes one number, the empty fourth none yet"
+        );
+        terminal.receive(b"x", "2");
+        assert_eq!(numbers(&terminal)[4], Some(4));
+    }
+
+    /// Once the scrollback is full the oldest lines go, but the ones that
+    /// stay keep their numbers, and the gutter is sized to the highest.
+    #[test]
+    fn numbers_keep_counting_past_the_scrollback() {
+        let mut terminal = Terminal::with_size(GridSize { columns: 8, lines: 2 }, 3);
+        for index in 1..=250 {
+            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+        }
+        assert_eq!(numbers(&terminal), vec![Some(250), None]);
+        assert!(terminal.first_number > 1, "the stamps of lost lines went");
+        assert_eq!(terminal.number_digits(), MIN_NUMBER_DIGITS);
+        terminal.first_number = 99_996;
+        assert_eq!(terminal.number_digits(), 6);
+    }
+
+    /// A clear from the device or the workbench starts the count over; an
+    /// erase of the scrollback alone does not.
+    #[test]
+    fn a_clear_starts_the_numbering_over() {
+        let mut terminal = terminal(8, 3);
+        terminal.receive(b"one\r\ntwo\r\nthree\r\n", "1");
+        terminal.receive(b"\x1b[3J", "2");
+        terminal.receive(b"four", "3");
+        assert_eq!(numbers(&terminal), vec![Some(2), Some(3), Some(4)]);
+        terminal.receive(b"\x1b[2J", "4");
+        terminal.receive(b"\r\nfive", "5");
+        assert_eq!(
+            numbers(&terminal),
+            vec![None, Some(1), Some(2)],
+            "the cleared row above is no line; the line kept is the first again"
+        );
+        terminal.clear();
+        terminal.receive(b"six", "6");
+        assert_eq!(numbers(&terminal)[0], Some(1));
+    }
+
+    /// The scrollback can be made smaller or larger as the log runs.
+    #[test]
+    fn the_scrollback_can_be_resized() {
+        let mut terminal = Terminal::with_size(GridSize { columns: 8, lines: 2 }, 100);
+        for index in 1..=50 {
+            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+        }
+        terminal.set_scrollback(10);
+        assert_eq!(terminal.scrollback(), 10);
+        assert_eq!(terminal.term.grid().history_size(), 10);
+        terminal.set_scrollback(1_000);
+        for index in 51..=500 {
+            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+        }
+        assert_eq!(terminal.term.grid().history_size(), 460);
+        assert_eq!(numbers(&terminal), vec![Some(500), None]);
+    }
+
+    /// The find reads wrapped lines whole, answers in cells, and minds
+    /// case only when told to.
+    #[test]
+    fn find_locates_matches_across_a_wrap() {
+        let mut terminal = terminal(5, 4);
+        terminal.receive(b"abcdefgh\r\nDEF\r\n", "1");
+        let mut matcher = OutputFilter::literal();
+        matcher.set_pattern("def");
+        let found = terminal.find(&matcher);
+        assert_eq!(
+            found,
+            vec![
+                FindMatch {
+                    line: 1,
+                    offset: 3,
+                    spans: vec![
+                        FindSpan { line: 0, column: 3, width: 2 },
+                        FindSpan { line: 1, column: 0, width: 1 },
+                    ],
+                },
+                FindMatch {
+                    line: 2,
+                    offset: 0,
+                    spans: vec![FindSpan { line: 2, column: 0, width: 3 }],
+                },
+            ]
+        );
+        matcher.toggle_match_case();
+        assert_eq!(terminal.find(&matcher).len(), 1);
+        matcher.set_pattern("");
+        assert!(terminal.find(&matcher).is_empty());
+    }
+
+    /// A wide character is one match cell of two columns, and a line in
+    /// the scrollback is found at its negative row.
+    #[test]
+    fn find_counts_wide_characters_and_reaches_the_scrollback() {
+        let mut terminal = terminal(10, 2);
+        terminal.receive("温度=25\r\nnext\r\nlast\r\n".as_bytes(), "1");
+        let mut matcher = OutputFilter::literal();
+        matcher.set_pattern("度=2");
+        assert_eq!(
+            terminal.find(&matcher),
+            vec![FindMatch {
+                line: 1,
+                offset: 1,
+                spans: vec![FindSpan { line: -2, column: 2, width: 4 }],
+            }]
+        );
+        terminal.scroll_to_line(-2);
+        assert!(!terminal.is_at_bottom());
+        assert_eq!(terminal.render(&TerminalPalette::DARK, false).rows[0].text, "温度=25");
+    }
+
+    /// A match answers to the same name after the rows under it have
+    /// moved — new lines pushing them up, or a reflow — so the find keeps
+    /// its place by the text and not by the row.
+    #[test]
+    fn a_match_keeps_its_name_as_the_rows_move() {
+        let mut terminal = Terminal::with_size(GridSize { columns: 40, lines: 3 }, 100);
+        terminal.receive(b"lost 1\r\nfine\r\nlost 2\r\n", "1");
+        let mut matcher = OutputFilter::literal();
+        matcher.set_pattern("lost");
+        let before: Vec<_> = terminal.find(&matcher).iter().map(FindMatch::key).collect();
+        assert_eq!(before, vec![(1, 0), (3, 0)]);
+        terminal.receive(b"lost 3\r\nmore\r\n", "2");
+        terminal.resize(8, 6);
+        let after: Vec<_> = terminal.find(&matcher).iter().map(FindMatch::key).collect();
+        assert_eq!(after, vec![(1, 0), (3, 0), (4, 0)]);
     }
 
     #[test]

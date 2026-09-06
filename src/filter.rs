@@ -1,10 +1,14 @@
-//! The output filter in the title bar.
+//! The output filter in the title bar, and the matcher behind it.
 //!
 //! Each tab has one: a pattern, two switches (regular expression, match case),
 //! and the matcher compiled from them. Compilation happens when any of the
 //! three changes rather than on every frame, and a literal pattern is escaped
 //! and sent through the same `Regex`, so both modes share one Unicode-aware,
-//! case-folding matcher.
+//! case-folding matcher. The find bar over the terminal (see [`crate::find`])
+//! is the same pattern and switches asked a different question — *where*
+//! rather than *whether* — so it holds one of these too, starting literal.
+
+use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
 
@@ -32,6 +36,19 @@ impl Default for OutputFilter {
 }
 
 impl OutputFilter {
+    /// A matcher with regular expressions off: what a find box starts as,
+    /// where `.` and `+` are usually the characters looked for.
+    pub(crate) fn literal() -> Self {
+        Self {
+            use_regex: false,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn pattern(&self) -> &str {
+        &self.pattern
+    }
+
     pub(crate) fn use_regex(&self) -> bool {
         self.use_regex
     }
@@ -79,6 +96,21 @@ impl OutputFilter {
         match &self.matcher {
             Some(Ok(regex)) => regex.is_match(text),
             _ => true,
+        }
+    }
+
+    /// Where the pattern occurs in a text, as byte ranges, left to right.
+    /// Empty matches — what `a*` finds between every two characters — are
+    /// left out, since there is nothing there to show. Nothing while the
+    /// pattern is empty or broken.
+    pub(crate) fn find_ranges(&self, text: &str) -> Vec<Range<usize>> {
+        match &self.matcher {
+            Some(Ok(regex)) => regex
+                .find_iter(text)
+                .map(|found| found.range())
+                .filter(|range| !range.is_empty())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -174,6 +206,21 @@ mod tests {
         assert_eq!(filter.error(), None, "the same text is a fine literal");
         assert!(filter.matches("ERR("));
         assert!(!filter.matches("ERROR"));
+    }
+
+    /// A find starts literal, and says where each occurrence is.
+    #[test]
+    fn a_literal_matcher_locates_every_occurrence() {
+        let mut find = OutputFilter::literal();
+        assert!(!find.use_regex());
+        find.set_pattern("a.");
+        assert_eq!(find.find_ranges("a. ab a."), vec![0..2, 6..8]);
+        find.toggle_regex();
+        assert_eq!(find.find_ranges("a. ab a."), vec![0..2, 3..5, 6..8]);
+        find.set_pattern("b*");
+        assert_eq!(find.find_ranges("abba"), vec![1..3], "empty matches are dropped");
+        find.set_pattern("");
+        assert!(find.find_ranges("anything").is_empty());
     }
 
     #[test]

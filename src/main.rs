@@ -6,11 +6,13 @@ mod commands;
 mod configuration;
 mod controls;
 mod filter;
+mod find;
 mod groups;
 mod highlight;
 mod icons;
 mod presets;
 mod serial;
+mod settings;
 mod sidebar;
 mod terminal;
 mod theme;
@@ -120,6 +122,9 @@ pub struct SerialWorkspace {
     cursor_shown: bool,
     blinking: bool,
     blink_epoch: usize,
+    /// Whether a frame is already on its way for a find scan the interval
+    /// held back, so one wait is enough.
+    find_refresh_pending: bool,
 }
 
 impl SerialWorkspace {
@@ -169,6 +174,7 @@ impl SerialWorkspace {
             cursor_shown: true,
             blinking: false,
             blink_epoch: 0,
+            find_refresh_pending: false,
         };
 
         // The cursor is drawn hollow while another window is in front, so
@@ -211,7 +217,14 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
+    /// A tab with its two boxes wired — the title bar's filter and the
+    /// find bar's — keeping the scrollback the settings say.
+    fn build_tab(
+        id: usize,
+        scrollback: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SerialTabState {
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(FILTER_PLACEHOLDER)
@@ -227,7 +240,15 @@ impl SerialWorkspace {
                 }
             },
         );
-        let mut tab = SerialTabState::new(id, filter_input, filter_subscription);
+        let (find_input, find_subscription) = Self::build_find_input(id, window, cx);
+        let mut tab = SerialTabState::new(
+            id,
+            filter_input,
+            filter_subscription,
+            find_input,
+            find_subscription,
+            scrollback,
+        );
         Self::listen_to_port(id, tab.take_events(), cx);
         tab
     }
@@ -338,7 +359,7 @@ impl SerialWorkspace {
         }
     }
 
-    /// Puts the cursor in the title bar filter box, for ⌘F.
+    /// Puts the cursor in the title bar filter box, for the View menu.
     fn focus_output_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = self.active_tab().map(|tab| tab.filter_input.clone()) {
             input.update(cx, |input, cx| input.focus(window, cx));
@@ -415,7 +436,11 @@ impl SerialWorkspace {
         }
     }
 
-    /// Sends what the composer holds, as a line, to the tab in front.
+    /// Sends what the composer holds to the tab in front, in the tab's
+    /// encoding and with the tab's line ending after it. A line that is
+    /// not the hex it claims to be stays in the box, with a note in the
+    /// log saying why: a typo sent as text would reach the device as
+    /// something else entirely.
     fn send_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = self.send_input.clone();
         let value = input.read(cx).value().trim().to_string();
@@ -433,11 +458,18 @@ impl SerialWorkspace {
         }
 
         let mut bytes = if tab.hex_mode {
-            parse_hex(&value).unwrap_or_else(|| value.as_bytes().to_vec())
+            match parse_hex(&value) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tab.note(error.message());
+                    cx.notify();
+                    return;
+                }
+            }
         } else {
-            value.as_bytes().to_vec()
+            value.into_bytes()
         };
-        bytes.extend_from_slice(b"\r\n");
+        bytes.extend_from_slice(tab.line_ending().bytes());
         tab.write(bytes);
         if tab.auto_scroll {
             tab.terminal.scroll_to_bottom();
@@ -606,6 +638,7 @@ impl SerialWorkspace {
         }
     }
 
+    /// Flips the composer between text and hex, for the menu's shortcut.
     fn toggle_hex(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.hex_mode = !tab.hex_mode;
@@ -613,7 +646,7 @@ impl SerialWorkspace {
         }
     }
 
-    /// Selects a payload mode outright, for the segmented UTF-8 / HEX switch
+    /// Selects an encoding outright, for the segmented UTF-8 / HEX switch
     /// where each half names the mode it turns on rather than flipping it.
     fn set_hex_mode(&mut self, hex_mode: bool, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab)
@@ -624,9 +657,27 @@ impl SerialWorkspace {
         }
     }
 
+    /// Sets what follows a sent line, for the composer's ending switch. The
+    /// tab keeps one ending per encoding, so this sets the current one.
+    fn set_line_ending(&mut self, ending: LineEnding, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && tab.line_ending() != ending
+        {
+            tab.set_line_ending(ending);
+            cx.notify();
+        }
+    }
+
     fn toggle_timestamps(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.timestamps = !tab.timestamps;
+            cx.notify();
+        }
+    }
+
+    fn toggle_line_numbers(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.line_numbers = !tab.line_numbers;
             cx.notify();
         }
     }
@@ -1023,6 +1074,8 @@ impl SerialWorkspace {
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
+        // The find is brought up to the log before the frame reads either.
+        self.refresh_find(cx);
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
         let tab_strip = self.render_tab_strip(active_snapshot.as_ref(), cx);
         let title_bar = self.render_title_bar(active_snapshot.as_ref(), cx);
@@ -1033,7 +1086,8 @@ impl Render for SerialWorkspace {
         // The panel's height, for the saved sessions list to take its share
         // of in pixels: a percentage of a flex parent resolves to nothing.
         let panel_height: f32 = window.viewport_size().height.into();
-        let sidebar = self.render_right_sidebar(active_snapshot, panel_height - TITLE_BAR_HEIGHT, cx);
+        let sidebar =
+            self.render_right_sidebar(active_snapshot, panel_height - TITLE_BAR_HEIGHT, window, cx);
 
         // `Root` only renders the window chrome; dialogs, sheets and
         // notifications live in overlay layers the window content has to render

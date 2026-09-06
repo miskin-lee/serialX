@@ -67,6 +67,36 @@ impl StoredCommand {
     }
 }
 
+/// Lines a terminal keeps above its screen to scroll back through, out of
+/// the box: a long bench session without losing the morning's boot log.
+pub(crate) const DEFAULT_SCROLLBACK_LINES: usize = 50_000;
+/// The least and the most the setting takes. Below a hundred a terminal
+/// would forget what it just showed; above a million the memory is the
+/// machine's to lose.
+pub(crate) const MIN_SCROLLBACK_LINES: usize = 100;
+pub(crate) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
+
+/// What is the workbench's to set rather than a session's, kept in the
+/// same file as the presets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Settings {
+    /// Lines kept above the screen to scroll back through, per terminal.
+    #[serde(default = "default_scrollback_lines")]
+    pub(crate) scrollback_lines: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+        }
+    }
+}
+
+fn default_scrollback_lines() -> usize {
+    DEFAULT_SCROLLBACK_LINES
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PresetStore {
     #[serde(default)]
@@ -77,6 +107,9 @@ pub(crate) struct PresetStore {
     pub(crate) commands: Vec<StoredCommand>,
     #[serde(default = "default_next_id")]
     next_id: u64,
+    /// Absent in files written before there was anything to set.
+    #[serde(default)]
+    pub(crate) settings: Settings,
 }
 
 impl Default for PresetStore {
@@ -86,6 +119,7 @@ impl Default for PresetStore {
             groups: Vec::new(),
             commands: Vec::new(),
             next_id: default_next_id(),
+            settings: Settings::default(),
         }
     }
 }
@@ -344,6 +378,14 @@ impl PresetStore {
         self.persist();
     }
 
+    /// Replaces the settings and writes them down.
+    pub(crate) fn set_settings(&mut self, settings: Settings) {
+        if self.settings != settings {
+            self.settings = settings;
+            self.persist();
+        }
+    }
+
     fn take_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -420,8 +462,25 @@ fn store_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Library, PresetStore, TagColor};
+    use super::{DEFAULT_SCROLLBACK_LINES, Library, PresetStore, Settings, TagColor};
     use crate::SerialConfiguration;
+
+    /// A file from before there were settings comes up with the defaults,
+    /// and a setting written down comes back.
+    #[test]
+    fn settings_default_and_round_trip() {
+        let old = r#"{"sessions":[],"groups":[],"commands":[],"next_id":100}"#;
+        let store: PresetStore = serde_json::from_str(old).unwrap();
+        assert_eq!(store.settings.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
+
+        let mut store = PresetStore::default();
+        store.set_settings(Settings {
+            scrollback_lines: 1_234,
+        });
+        let json = serde_json::to_string(&store).unwrap();
+        let restored: PresetStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.settings.scrollback_lines, 1_234);
+    }
 
     #[test]
     fn default_presets_round_trip() {

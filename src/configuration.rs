@@ -1445,7 +1445,8 @@ impl SerialWorkspace {
     ) -> usize {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let mut tab = Self::build_tab(id, window, cx);
+        let scrollback = self.presets.settings.scrollback_lines;
+        let mut tab = Self::build_tab(id, scrollback, window, cx);
         tab.configuration = configuration.sanitized();
         tab.color = color;
         tab.alias = alias;

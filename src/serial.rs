@@ -14,6 +14,7 @@ use gpui_kit::{Entity, Subscription};
 use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
+use crate::find::{FindState, FindView};
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
 
@@ -258,8 +259,16 @@ pub(crate) struct SerialTabState {
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
+    /// Whether the composer's line goes out as the hex bytes it spells,
+    /// rather than as text.
     pub(crate) hex_mode: bool,
+    /// What follows the line, kept once per encoding: a switch to HEX and
+    /// back does not forget which ending the device wanted for its text.
+    pub(crate) text_line_ending: LineEnding,
+    pub(crate) hex_line_ending: LineEnding,
     pub(crate) timestamps: bool,
+    /// Whether the log's lines are numbered in the gutter.
+    pub(crate) line_numbers: bool,
     /// Whether plain output is coloured by what it says — levels, times,
     /// addresses — on top of any colour the device sent itself.
     pub(crate) highlight: bool,
@@ -268,19 +277,27 @@ pub(crate) struct SerialTabState {
     /// The title bar filter box and what it currently holds back.
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
+    /// The find bar over the terminal, and its box.
+    pub(crate) find: FindState,
+    pub(crate) find_input: Entity<InputState>,
     pub(crate) command_tx: Option<Sender<SerialCommand>>,
     /// Where the port's threads report to. The receiving end is taken by
     /// the task that feeds the terminal, the moment the tab is built.
     pub(crate) event_tx: smol::channel::Sender<SerialEvent>,
     event_rx: Option<smol::channel::Receiver<SerialEvent>>,
     _filter_subscription: Subscription,
+    _find_subscription: Subscription,
 }
 
 impl SerialTabState {
+    /// A tab with its boxes wired, keeping `scrollback` lines of log.
     pub(crate) fn new(
         id: usize,
         filter_input: Entity<InputState>,
         filter_subscription: Subscription,
+        find_input: Entity<InputState>,
+        find_subscription: Subscription,
+        scrollback: usize,
     ) -> Self {
         let (event_tx, event_rx) = smol::channel::unbounded();
         Self {
@@ -295,25 +312,50 @@ impl SerialTabState {
             connecting: false,
             paused: false,
             hex_mode: false,
+            text_line_ending: LineEnding::default_for(false),
+            hex_line_ending: LineEnding::default_for(true),
             timestamps: true,
+            line_numbers: true,
             highlight: true,
             auto_scroll: true,
             terminal: {
-                let mut terminal = Terminal::default();
+                let mut terminal = Terminal::new(scrollback);
                 terminal.note("Configure the serial port, then connect.", &now());
                 terminal
             },
             filter_input,
             filter: OutputFilter::default(),
+            find: FindState::default(),
+            find_input,
             command_tx: None,
             event_tx,
             event_rx: Some(event_rx),
             _filter_subscription: filter_subscription,
+            _find_subscription: find_subscription,
         }
     }
 
     pub(crate) fn selected_port(&self) -> &PortItem {
         &self.ports[self.selected_port.min(self.ports.len().saturating_sub(1))]
+    }
+
+    /// What follows a line sent in the encoding the composer is in.
+    pub(crate) fn line_ending(&self) -> LineEnding {
+        if self.hex_mode {
+            self.hex_line_ending
+        } else {
+            self.text_line_ending
+        }
+    }
+
+    /// Sets the ending for the encoding the composer is in; the other
+    /// encoding keeps its own.
+    pub(crate) fn set_line_ending(&mut self, ending: LineEnding) {
+        if self.hex_mode {
+            self.hex_line_ending = ending;
+        } else {
+            self.text_line_ending = ending;
+        }
     }
 
     /// What the tab is called: the alias it was given, else the port's path.
@@ -377,12 +419,15 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) hex_mode: bool,
+    pub(crate) line_ending: LineEnding,
     pub(crate) timestamps: bool,
+    pub(crate) line_numbers: bool,
     /// How many rows on screen the title bar filter matches, out of how
     /// many there are, while a filter is set.
     pub(crate) filter_counts: Option<(usize, usize)>,
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
+    pub(crate) find: FindView,
 }
 
 impl From<&SerialTabState> for SerialTabSnapshot {
@@ -392,7 +437,9 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             connected: tab.connected,
             connecting: tab.connecting,
             hex_mode: tab.hex_mode,
+            line_ending: tab.line_ending(),
             timestamps: tab.timestamps,
+            line_numbers: tab.line_numbers,
             filter_counts: tab.filter.is_active().then(|| {
                 let texts = tab.terminal.visible_texts();
                 let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
@@ -400,6 +447,13 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             }),
             filter_input: tab.filter_input.clone(),
             filter: tab.filter.clone(),
+            find: FindView {
+                open: tab.find.open,
+                matcher: tab.find.matcher.clone(),
+                current: tab.find.current_span(),
+                status: tab.find.status(),
+                input: tab.find_input.clone(),
+            },
         }
     }
 }
@@ -508,30 +562,119 @@ pub(crate) fn spawn_serial_worker(
     });
 }
 
-pub(crate) fn parse_hex(value: &str) -> Option<Vec<u8>> {
-    let compact: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
-    if compact.is_empty() || !compact.len().is_multiple_of(2) {
-        return None;
+/// What follows a line the composer sends. Text goes out as a line, so it
+/// ends the way the device expects one to: `\r\n` is what nearly every
+/// serial console and AT modem wants, `\n` what a Unix shell on a UART
+/// reads. Hex goes out as the frame it spells, with nothing added unless
+/// asked for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LineEnding {
+    #[default]
+    CrLf,
+    Lf,
+    None,
+}
+
+impl LineEnding {
+    /// Every ending, in the order the composer lists them.
+    pub(crate) const ALL: [Self; 3] = [Self::CrLf, Self::Lf, Self::None];
+
+    /// What a tab starts with in each encoding: a line after text, nothing
+    /// after hex bytes.
+    pub(crate) const fn default_for(hex: bool) -> Self {
+        if hex { Self::None } else { Self::CrLf }
     }
-    (0..compact.len())
+
+    pub(crate) const fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::CrLf => b"\r\n",
+            Self::Lf => b"\n",
+            Self::None => b"",
+        }
+    }
+
+    /// Its name on the composer's switch.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::CrLf => "CRLF",
+            Self::Lf => "LF",
+            Self::None => "None",
+        }
+    }
+
+    /// The bytes as code spells them, for the list behind the switch.
+    pub(crate) const fn spelled(self) -> &'static str {
+        match self {
+            Self::CrLf => "\\r\\n",
+            Self::Lf => "\\n",
+            Self::None => "",
+        }
+    }
+}
+
+/// Why a line is not hex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HexError {
+    /// Something in it is neither a hex digit nor a space.
+    NotHex,
+    /// A digit short of whole bytes.
+    OddDigit,
+}
+
+impl HexError {
+    /// What to tell whoever typed it.
+    pub(crate) const fn message(self) -> &'static str {
+        match self {
+            Self::NotHex => "Not sent: hex takes only 0-9 and A-F, with spaces between bytes.",
+            Self::OddDigit => "Not sent: hex bytes take two digits each.",
+        }
+    }
+}
+
+/// Reads a line of hex — `41 54 0D 0A`, or run together — as the bytes it
+/// spells. Spaces are for the eye and are skipped; anything else, or a
+/// digit short of a byte, is refused. Nothing spells no bytes.
+pub(crate) fn parse_hex(value: &str) -> Result<Vec<u8>, HexError> {
+    let compact: String = value.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if !compact.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(HexError::NotHex);
+    }
+    if !compact.len().is_multiple_of(2) {
+        return Err(HexError::OddDigit);
+    }
+    Ok((0..compact.len())
         .step_by(2)
-        .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).ok())
-        .collect()
+        .map(|index| u8::from_str_radix(&compact[index..index + 2], 16).unwrap_or(0))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BAUD_RATES, BaudRateError, DEFAULT_BAUD_RATE, SerialConfiguration, is_listed_baud_rate,
-        parse_baud_rate, parse_hex,
+        BAUD_RATES, BaudRateError, DEFAULT_BAUD_RATE, HexError, LineEnding, SerialConfiguration,
+        is_listed_baud_rate, parse_baud_rate, parse_hex,
     };
 
     #[test]
     fn parses_hex_with_or_without_spaces() {
-        assert_eq!(parse_hex("41 54 0D 0A"), Some(b"AT\r\n".to_vec()));
-        assert_eq!(parse_hex("41540d0a"), Some(b"AT\r\n".to_vec()));
-        assert_eq!(parse_hex("123"), None);
-        assert_eq!(parse_hex("GG"), None);
+        assert_eq!(parse_hex("41 54 0D 0A"), Ok(b"AT\r\n".to_vec()));
+        assert_eq!(parse_hex("41540d0a"), Ok(b"AT\r\n".to_vec()));
+        assert_eq!(parse_hex("  "), Ok(Vec::new()));
+        assert_eq!(parse_hex("123"), Err(HexError::OddDigit));
+        assert_eq!(parse_hex("GG"), Err(HexError::NotHex));
+        assert_eq!(parse_hex("4G"), Err(HexError::NotHex));
+    }
+
+    /// Text starts as a line, hex as bare bytes, and each ending is the
+    /// bytes its name says.
+    #[test]
+    fn line_endings_spell_their_bytes() {
+        assert_eq!(LineEnding::default_for(false), LineEnding::CrLf);
+        assert_eq!(LineEnding::default_for(true), LineEnding::None);
+        assert_eq!(LineEnding::CrLf.bytes(), b"\r\n");
+        assert_eq!(LineEnding::Lf.bytes(), b"\n");
+        assert_eq!(LineEnding::None.bytes(), b"");
+        assert_eq!(LineEnding::ALL.map(LineEnding::label), ["CRLF", "LF", "None"]);
     }
 
     #[test]

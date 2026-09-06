@@ -24,12 +24,18 @@ actions!(
         ClearTerminal,
         ToggleHex,
         ToggleTimestamps,
+        ToggleLineNumbers,
         ToggleHighlight,
         ToggleAutoScroll,
         ToggleSidePanel,
         PreviousTab,
         NextTab,
         FocusOutputFilter,
+        FindInOutput,
+        FindNext,
+        FindPrevious,
+        CloseFind,
+        OpenSettings,
         UseLightTheme,
         UseDarkTheme,
         ToggleTheme,
@@ -62,14 +68,23 @@ keystroke!(PAUSE_KEYSTROKE, "cmd-shift-p", "ctrl-shift-p");
 keystroke!(CLEAR_KEYSTROKE, "cmd-k", "ctrl-k");
 keystroke!(HEX_KEYSTROKE, "cmd-shift-h", "ctrl-shift-h");
 keystroke!(TIMESTAMPS_KEYSTROKE, "cmd-shift-t", "ctrl-shift-t");
+keystroke!(LINE_NUMBERS_KEYSTROKE, "cmd-shift-n", "ctrl-shift-n");
 keystroke!(AUTO_SCROLL_KEYSTROKE, "cmd-shift-a", "ctrl-shift-a");
 keystroke!(THEME_KEYSTROKE, "cmd-shift-l", "ctrl-shift-l");
 keystroke!(SIDE_PANEL_KEYSTROKE, "cmd-b", "ctrl-b");
 // Tab navigation follows VS Code's editor bindings on each platform.
 keystroke!(PREVIOUS_TAB_KEYSTROKE, "cmd-shift-[", "ctrl-pageup");
 keystroke!(NEXT_TAB_KEYSTROKE, "cmd-shift-]", "ctrl-pagedown");
-keystroke!(FILTER_KEYSTROKE, "cmd-f", "ctrl-f");
+// ⌘F is find, as it is everywhere; the filter is a different question and
+// has no key of its own. Stepping follows the platform's find: ⌘G on macOS,
+// F3 elsewhere.
+keystroke!(FIND_KEYSTROKE, "cmd-f", "ctrl-f");
+keystroke!(FIND_NEXT_KEYSTROKE, "cmd-g", "f3");
+keystroke!(FIND_PREVIOUS_KEYSTROKE, "cmd-shift-g", "shift-f3");
+keystroke!(SETTINGS_KEYSTROKE, "cmd-,", "ctrl-,");
 keystroke!(QUIT_KEYSTROKE, "cmd-q", "ctrl-q");
+/// Where `Escape` closes the find bar: only while the bar is in focus.
+pub(crate) const FIND_BAR_CONTEXT: &str = "FindBar";
 
 fn application_menus() -> Vec<Menu> {
     let mut help = vec![
@@ -90,6 +105,8 @@ fn application_menus() -> Vec<Menu> {
         Menu::new("serialX").items([
             MenuItem::action("About serialX", ShowAbout),
             MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
             MenuItem::action("Quit serialX", QuitApplication),
         ]),
         // Rescan and pause stay on their shortcuts and toolbar buttons; the
@@ -106,10 +123,15 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Next Session", NextTab),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Find…", FindInOutput),
+            MenuItem::action("Find Next", FindNext),
+            MenuItem::action("Find Previous", FindPrevious),
+            MenuItem::separator(),
             MenuItem::action("Filter Output…", FocusOutputFilter),
             MenuItem::separator(),
-            MenuItem::action("Toggle HEX Display", ToggleHex),
+            MenuItem::action("Send as HEX", ToggleHex),
             MenuItem::action("Toggle Timestamps", ToggleTimestamps),
+            MenuItem::action("Toggle Line Numbers", ToggleLineNumbers),
             MenuItem::action("Toggle Semantic Colours", ToggleHighlight),
             MenuItem::action("Toggle Auto-scroll", ToggleAutoScroll),
             MenuItem::separator(),
@@ -186,12 +208,17 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(CLEAR_KEYSTROKE, ClearTerminal, None),
         KeyBinding::new(HEX_KEYSTROKE, ToggleHex, None),
         KeyBinding::new(TIMESTAMPS_KEYSTROKE, ToggleTimestamps, None),
+        KeyBinding::new(LINE_NUMBERS_KEYSTROKE, ToggleLineNumbers, None),
         KeyBinding::new(AUTO_SCROLL_KEYSTROKE, ToggleAutoScroll, None),
         KeyBinding::new(THEME_KEYSTROKE, ToggleTheme, None),
         KeyBinding::new(SIDE_PANEL_KEYSTROKE, ToggleSidePanel, None),
         KeyBinding::new(PREVIOUS_TAB_KEYSTROKE, PreviousTab, None),
         KeyBinding::new(NEXT_TAB_KEYSTROKE, NextTab, None),
-        KeyBinding::new(FILTER_KEYSTROKE, FocusOutputFilter, None),
+        KeyBinding::new(FIND_KEYSTROKE, FindInOutput, None),
+        KeyBinding::new(FIND_NEXT_KEYSTROKE, FindNext, None),
+        KeyBinding::new(FIND_PREVIOUS_KEYSTROKE, FindPrevious, None),
+        KeyBinding::new("escape", CloseFind, Some(FIND_BAR_CONTEXT)),
+        KeyBinding::new(SETTINGS_KEYSTROKE, OpenSettings, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
     ]);
     GlobalState::global_mut(cx)
@@ -257,6 +284,35 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &ToggleTimestamps, cx| {
         let _ = view.update(cx, |view, cx| view.toggle_timestamps(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ToggleLineNumbers, cx| {
+        let _ = view.update(cx, |view, cx| view.toggle_line_numbers(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &FindInOutput, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_find(window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &FindNext, cx| {
+        let _ = view.update(cx, |view, cx| view.find_step(Some(true), cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &FindPrevious, cx| {
+        let _ = view.update(cx, |view, cx| view.find_step(Some(false), cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &OpenSettings, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_settings_dialog(window, cx);
+        });
     });
 
     let view = workspace.downgrade();

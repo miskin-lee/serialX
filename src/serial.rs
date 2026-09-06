@@ -149,9 +149,9 @@ pub(crate) enum BaudRateError {
 impl BaudRateError {
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::Empty => "Enter a rate, or pick one from the list",
-            Self::NotANumber => "A rate is a whole number of bits per second",
-            Self::Zero => "A rate has to be greater than zero",
+            Self::Empty => "Enter a rate, or pick one",
+            Self::NotANumber => "Whole number of bits per second",
+            Self::Zero => "Has to be greater than zero",
             Self::TooLarge => "Too large for a serial port",
         }
     }

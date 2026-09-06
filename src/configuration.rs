@@ -40,6 +40,7 @@ use gpui_kit::component::{
     tooltip::Tooltip,
     v_flex,
 };
+use gpui_kit::base::Scrollbar;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use smol::Timer;
@@ -63,10 +64,18 @@ use crate::{
 /// Width of the dialog: room for a two-column frame, and for the baud field
 /// with a sentence beside it.
 const DIALOG_WIDTH: f32 = 540.;
-/// Width of the baud rate field: seven digits in the chrome's monospace, the
-/// caret that opens the list, and air around both.
-const BAUD_FIELD_WIDTH: f32 = 176.;
-/// Height of the baud rate field, a little over a chip so the caret has room.
+/// The gap between the two columns of a section.
+const COLUMN_GAP: f32 = 12.;
+/// Width of one column: the frame's controls stand two to a row, and the
+/// fields in the other sections take a column each so their edges line up
+/// with the controls above and below them.
+const COLUMN_WIDTH: f32 = (DIALOG_WIDTH - 2. * DIALOG_PADDING - COLUMN_GAP) / 2.;
+/// Width of the baud rate field: the left column, under the data bits. Seven
+/// digits and the caret need less, but a field narrower than the control it
+/// stands under reads as an afterthought.
+const BAUD_FIELD_WIDTH: f32 = COLUMN_WIDTH;
+/// Height of the baud rate field, a little over a chip so the caret has
+/// room. The name and group fields stand at it too.
 const BAUD_FIELD_HEIGHT: f32 = 30.;
 /// How tall the list of standard rates grows before it scrolls: every
 /// standard rate on a tall window, a scrollbar on a short one.
@@ -74,11 +83,11 @@ const BAUD_LIST_MAX_HEIGHT: f32 = 320.;
 /// How far the caret's right edge sits in from the field's. The list hangs
 /// from the caret, so it is narrowed by this much to line up with the field.
 const BAUD_LIST_INSET: f32 = 8.;
-/// Width of the group field: enough for the folder, a short name and the
-/// caret, and no more, so the name field beside it gets the rest of the
-/// row. A longer group name truncates in the field and reads whole in the
-/// list, which opens wider.
-const GROUP_FIELD_WIDTH: f32 = 136.;
+/// Width of the group field: the right column, under the parity and flow
+/// control, with the name field taking the left. A group name of some
+/// length fits; a longer one truncates in the field and reads whole in the
+/// list.
+const GROUP_FIELD_WIDTH: f32 = COLUMN_WIDTH;
 /// The narrowest the list of groups opens: room for a name of some length.
 const GROUP_LIST_MIN_WIDTH: f32 = 180.;
 /// What the group field says while the session is in no group.
@@ -102,12 +111,16 @@ const PORT_ROWS_MIN: usize = 2;
 /// first; when even its two rows will not fit, the dialog is capped at this
 /// share and its body scrolls for the rest.
 const DIALOG_MAX_HEIGHT_FRACTION: f32 = 0.9;
-/// The gap between sections.
-const SECTION_GAP: f32 = 14.;
-/// What the dialog stands at with an empty device list: padding, header, the
+/// The gap between sections. The eyebrow row over each carries air of its
+/// own, so two grid steps keep them apart and leave the height to the
+/// fields and the device list.
+const SECTION_GAP: f32 = 12.;
+/// What the dialog stands at less the device list: padding, header, the
 /// other four sections — the Tab section two rows deep — the summary and the
-/// footer.
-const DIALOG_FIXED_HEIGHT: f32 = 542.;
+/// footer, as measured. The window the workbench opens at, 800 tall, has
+/// room for three rows over this, so the list there shows two and a half;
+/// a taller one shows the full three and a half.
+const DIALOG_FIXED_HEIGHT: f32 = 585.;
 /// What the name field says while it is empty and no device is chosen.
 const NAME_FALLBACK: &str = "Name";
 /// A tag swatch: the disc, the hit target around it that also carries the
@@ -139,6 +152,13 @@ fn port_list_height(port_count: usize, viewport_height: f32) -> f32 {
     } else {
         (fit as f32 - 0.5) * PORT_ROW_HEIGHT
     }
+}
+
+/// Gives a single-line input the height of a field. `Input::h` is for the
+/// multi-line kind and leaves a single line at its size's own height, so
+/// the frame is sized through `Styled` instead.
+fn field_frame(input: Input) -> Input {
+    Styled::h(input, px(BAUD_FIELD_HEIGHT))
 }
 
 #[derive(Clone, Copy)]
@@ -642,6 +662,10 @@ impl SerialConfigurationEditor {
     ) -> AnyElement {
         let selected_index = self.selected_port;
         let list_height = port_list_height(self.ports.len(), viewport_height);
+        // The scrollbar lies over the list's right edge. When the rows
+        // outnumber the ones that fit it has somewhere to be, so the rows
+        // end short of it and the mark at their end stays in the clear.
+        let scrolls = self.ports.len() as f32 * PORT_ROW_HEIGHT > list_height;
         let mut rows = self
             .ports
             .iter()
@@ -659,6 +683,7 @@ impl SerialConfigurationEditor {
                     .h(px(PORT_ROW_HEIGHT))
                     .flex_none()
                     .px_3()
+                    .when(scrolls, |row| row.pr(px(12.) + Scrollbar::width()))
                     .gap_3()
                     .items_center()
                     .cursor_pointer()
@@ -745,9 +770,10 @@ impl SerialConfigurationEditor {
     }
 
     /// The baud rate: a field you type into, with the standard rates in a
-    /// list behind the caret at its end. Beside it, what the field holds — a
-    /// hint while it is a listed rate, a `Custom` tag when it is one the list
-    /// does not have, and the reason when it is not a rate at all.
+    /// list behind the caret at its end. Beside it, in the other column, what
+    /// the field holds — a hint while it is a listed rate, a `Custom` tag
+    /// when it is one the list does not have, and the reason when it is not
+    /// a rate at all. Each fits its column on one line.
     fn render_baud_rate(
         &mut self,
         palette: WorkbenchPalette,
@@ -786,10 +812,7 @@ impl SerialConfigurationEditor {
                 menu
             });
 
-        let field = Input::new(&self.baud_input)
-            .small()
-            .w(px(BAUD_FIELD_WIDTH))
-            .h(px(BAUD_FIELD_HEIGHT))
+        let field = field_frame(Input::new(&self.baud_input).small().w(px(BAUD_FIELD_WIDTH)))
             .ui_mono_token(LABEL)
             .bg(rgb(palette.input))
             .border_color(rgb(if error.is_some() {
@@ -830,17 +853,18 @@ impl SerialConfigurationEditor {
                 .items_center()
                 .gap_2()
                 .child(tag(palette, palette.category_signal, MICRO, "Custom"))
-                .child(caption(
-                    palette.muted,
-                    "Not a standard rate · needs device support",
-                )),
+                .child(caption(palette.muted, "The device has to support it")),
         };
 
         Self::section(
             palette,
             "Baud rate",
             None,
-            h_flex().items_center().gap_3().child(field).child(aside),
+            h_flex()
+                .items_center()
+                .gap(px(COLUMN_GAP))
+                .child(field)
+                .child(aside),
         )
         .into_any_element()
     }
@@ -900,14 +924,14 @@ impl SerialConfigurationEditor {
                 .gap_3()
                 .child(
                     h_flex()
-                        .gap_3()
+                        .gap(px(COLUMN_GAP))
                         .items_start()
                         .child(Self::labelled(palette, "Data bits", data_bits))
                         .child(Self::labelled(palette, "Parity", parity)),
                 )
                 .child(
                     h_flex()
-                        .gap_3()
+                        .gap(px(COLUMN_GAP))
                         .items_start()
                         .child(Self::labelled(palette, "Stop bits", stop_bits))
                         .child(Self::labelled(palette, "Flow control", flow_control)),
@@ -1050,18 +1074,15 @@ impl SerialConfigurationEditor {
             .into_any_element()
     }
 
-    /// The tab, in two rows under one eyebrow: its name beside its group,
-    /// the name taking the width the group field leaves, and under them its
-    /// colour — the bright dozen over the deep dozen, so a column holds two
-    /// colours that read as kin.
+    /// The tab, in two rows under one eyebrow: its name beside its group, a
+    /// column each, and under them its colour — the bright dozen over the
+    /// deep dozen, so a column holds two colours that read as kin.
     fn render_tab_section(
         &mut self,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let name = Input::new(&self.alias_input)
-            .small()
-            .h(px(BAUD_FIELD_HEIGHT))
+        let name = field_frame(Input::new(&self.alias_input).small())
             .text_token(LABEL)
             .font_weight(FontWeight::NORMAL)
             .bg(rgb(palette.input))
@@ -1095,7 +1116,7 @@ impl SerialConfigurationEditor {
                 .child(
                     h_flex()
                         .items_center()
-                        .gap_3()
+                        .gap(px(COLUMN_GAP))
                         .child(div().flex_1().min_w_0().child(name))
                         .child(group),
                 )
@@ -1459,26 +1480,29 @@ mod tests {
     };
 
     /// A tall window shows up to four rows, and a list that fits is exactly
-    /// as tall as its rows.
+    /// as tall as its rows. The window the workbench opens at has room for
+    /// three, and shows two and a half when there are more.
     #[test]
     fn the_list_is_as_tall_as_its_rows_until_they_stop_fitting() {
-        assert_eq!(port_list_height(1, 800.), PORT_ROW_HEIGHT);
+        assert_eq!(port_list_height(1, 900.), PORT_ROW_HEIGHT);
+        assert_eq!(port_list_height(3, 900.), 3. * PORT_ROW_HEIGHT);
+        assert_eq!(port_list_height(9, 900.), 3.5 * PORT_ROW_HEIGHT);
         assert_eq!(port_list_height(3, 800.), 3. * PORT_ROW_HEIGHT);
-        assert_eq!(port_list_height(9, 800.), 3.5 * PORT_ROW_HEIGHT);
+        assert_eq!(port_list_height(9, 800.), 2.5 * PORT_ROW_HEIGHT);
     }
 
     /// The smallest window still gets a list of two rows. The dialog is
-    /// then a little over its share of the window, which the cap turns into
-    /// a body that scrolls by less than a row; a window not much taller
-    /// fits it whole.
+    /// then over its share of the window, which the cap turns into a body
+    /// that scrolls by less than two rows; a window not much taller fits it
+    /// whole.
     #[test]
     fn a_short_window_keeps_two_rows_and_a_reachable_footer() {
         let height = port_list_height(9, 640.);
         assert_eq!(height, 1.5 * PORT_ROW_HEIGHT);
         let over = DIALOG_FIXED_HEIGHT + height - 640. * DIALOG_MAX_HEIGHT_FRACTION;
-        assert!(over > 0. && over < PORT_ROW_HEIGHT, "over by {over}");
+        assert!(over > 0. && over < 2. * PORT_ROW_HEIGHT, "over by {over}");
         assert_eq!(port_list_height(9, 700.), 1.5 * PORT_ROW_HEIGHT);
-        assert!(DIALOG_FIXED_HEIGHT + height <= 700. * DIALOG_MAX_HEIGHT_FRACTION);
+        assert!(DIALOG_FIXED_HEIGHT + height <= 740. * DIALOG_MAX_HEIGHT_FRACTION);
     }
 
     #[test]

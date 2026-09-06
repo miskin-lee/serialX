@@ -1,7 +1,9 @@
 //! The title bar: the workbench's menu bar, laid out as VS Code lays out its
 //! own.
 //!
-//! Centre, the *command centre*: tab arrows and the output filter, sized the
+//! Centre, the *command centre*: tab arrows, the output filter and, at its
+//! right, the connect switch — the two things that belong to the session in
+//! front of you, side by side, and both change with the tab. It is sized the
 //! way VS Code sizes its own. Right, one switch: the side panel. Left, only
 //! what the platform puts there — the traffic lights on macOS, the
 //! application menus elsewhere. Which session is in front of you is said by
@@ -29,8 +31,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_menu::{NextTab, PreviousTab, ToggleSidePanel};
+use crate::app_menu::{NextTab, PreviousTab, ToggleConnection, ToggleSidePanel};
 use crate::controls::tag;
+use crate::icons::Glyph;
 use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, mix, tint};
 use crate::{SerialTabSnapshot, SerialWorkspace};
 
@@ -46,11 +49,14 @@ const CONTROL_HEIGHT: f32 = 26.;
 const FILTER_HEIGHT: f32 = 28.;
 /// Square size of the tab arrows, a step smaller than the icon buttons.
 const NAV_BUTTON: f32 = 24.;
-/// The centre group's share of the bar, as VS Code sizes its command centre,
-/// clamped so it neither swallows a wide window nor collapses on a narrow one.
-const CENTER_FRACTION: f32 = 0.38;
-const CENTER_MAX_WIDTH: f32 = 600.;
-const CENTER_MIN_WIDTH: f32 = 280.;
+/// The centre group's share of the bar, as VS Code sizes its command centre
+/// with a connect pill added, clamped so it neither swallows a wide window
+/// nor collapses on a narrow one.
+const CENTER_FRACTION: f32 = 0.42;
+const CENTER_MAX_WIDTH: f32 = 680.;
+const CENTER_MIN_WIDTH: f32 = 360.;
+/// How faint the filter box and the connect pill go without a tab.
+const IDLE_OPACITY: f32 = 0.6;
 /// What `TitleBar` pads on the left for the macOS traffic lights.
 const TRAFFIC_LIGHT_INSET: f32 = 80.;
 /// Width of the application menu bar on the platforms that draw it in the bar.
@@ -79,6 +85,7 @@ impl SerialWorkspace {
             Some(tab) => self.render_filter_box(tab, cx),
             None => Self::render_idle_filter_box(palette),
         };
+        let connect = self.render_connect_pill(active, cx);
 
         // Empty on macOS, where the traffic lights are all the left end holds.
         let left_column = h_flex()
@@ -126,7 +133,8 @@ impl SerialWorkspace {
                         this.select_next_tab(cx);
                     })),
             )
-            .child(div().flex_1().min_w_0().ml_1p5().child(filter_box));
+            .child(div().flex_1().min_w_0().ml_1p5().child(filter_box))
+            .child(div().flex_none().ml_1p5().child(connect));
 
         let right_column = h_flex()
             .flex_1()
@@ -176,6 +184,54 @@ impl SerialWorkspace {
                     .child(center_column)
                     .child(right_column),
             )
+            .into_any_element()
+    }
+
+    /// The pill at the filter's right: connect or disconnect the session in
+    /// front. Filled while the port is shut and outlined while it is open, so
+    /// the bar says the state as well as offering the switch. Without a tab
+    /// it stands faint and inert, keeping the filter box company.
+    fn render_connect_pill(
+        &mut self,
+        active: Option<&SerialTabSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let connected = active.is_some_and(|tab| tab.connected || tab.connecting);
+        let connecting = active.is_some_and(|tab| tab.connecting);
+        let tab_id = active.map(|tab| tab.id);
+
+        Button::new("toggle-connection")
+            .when(connected, |button| button.outline())
+            .when(!connected, |button| button.primary())
+            .small()
+            .compact()
+            .h(px(CONTROL_HEIGHT))
+            .rounded(px(CONTROL_HEIGHT / 2.))
+            .px_2p5()
+            .icon(if connected { Glyph::Cable } else { Glyph::Bolt })
+            .label(if connecting {
+                "Connecting…"
+            } else if connected {
+                "Disconnect"
+            } else {
+                "Connect"
+            })
+            .disabled(tab_id.is_none())
+            .when(tab_id.is_none(), |button| button.opacity(IDLE_OPACITY))
+            .tooltip_with_action(
+                if connected {
+                    "Disconnect this session"
+                } else {
+                    "Connect this session"
+                },
+                &ToggleConnection,
+                None,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(tab_id) = tab_id {
+                    this.toggle_connection(tab_id, cx);
+                }
+            }))
             .into_any_element()
     }
 
@@ -323,7 +379,7 @@ impl SerialWorkspace {
             .bg(rgb(palette.input))
             .border_1()
             .border_color(rgb(palette.input_border))
-            .opacity(0.6)
+            .opacity(IDLE_OPACITY)
             .child(
                 Icon::new(IconName::Search)
                     .size(px(13.))

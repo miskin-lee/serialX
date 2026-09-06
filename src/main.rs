@@ -40,7 +40,7 @@ use gpui_kit::*;
 use icons::WorkbenchAssets;
 use presets::PresetStore;
 use serial::*;
-use sidebar::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
+use sidebar::{SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH};
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
 use terminal::key_bytes;
@@ -86,6 +86,10 @@ pub struct SerialWorkspace {
     /// The dragged width of the side panel. Owned here rather than by the
     /// resizable group, so collapsing to the rail and back keeps the width.
     panel_layout: Entity<ResizableState>,
+    /// The composer in the side panel: one box for the workspace, sending
+    /// to whichever tab is in front, so what was typed survives a switch.
+    send_input: Entity<InputState>,
+    _send_subscription: Subscription,
     /// The terminal log as a place to type: while it holds focus, keys go to
     /// the port of the tab in front.
     terminal_focus: FocusHandle,
@@ -110,6 +114,16 @@ impl SerialWorkspace {
         let (update_tx, update_rx) = mpsc::channel();
         let menu_bar = AppMenuBar::new(cx);
         let panel_layout = cx.new(|_| ResizableState::default());
+        let send_input = cx.new(|cx| InputState::new(window, cx).placeholder(SEND_PLACEHOLDER));
+        let send_subscription = cx.subscribe_in(
+            &send_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                    this.send_to_active_tab(window, cx);
+                }
+            },
+        );
 
         let workspace = Self {
             tabs: Vec::new(),
@@ -128,6 +142,8 @@ impl SerialWorkspace {
             collapsed_groups: HashSet::new(),
             selected_saved: None,
             panel_layout,
+            send_input,
+            _send_subscription: send_subscription,
             terminal_focus: cx.focus_handle(),
             composing: None,
             terminal_metrics: TerminalMetrics::default(),
@@ -178,16 +194,6 @@ impl SerialWorkspace {
     }
 
     fn build_tab(id: usize, window: &mut Window, cx: &mut Context<Self>) -> SerialTabState {
-        let send_input = cx.new(|cx| InputState::new(window, cx).placeholder("Enter a command…"));
-        let send_subscription = cx.subscribe_in(
-            &send_input,
-            window,
-            move |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.send_current(id, window, cx);
-                }
-            },
-        );
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(FILTER_PLACEHOLDER)
@@ -203,13 +209,7 @@ impl SerialWorkspace {
                 }
             },
         );
-        let mut tab = SerialTabState::new(
-            id,
-            send_input,
-            send_subscription,
-            filter_input,
-            filter_subscription,
-        );
+        let mut tab = SerialTabState::new(id, filter_input, filter_subscription);
         Self::listen_to_port(id, tab.take_events(), cx);
         tab
     }
@@ -386,17 +386,17 @@ impl SerialWorkspace {
         }
     }
 
-    fn send_current(&mut self, tab_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(index) = self.tab_index(tab_id) else {
-            return;
-        };
-        let input = self.tabs[index].send_input.clone();
+    /// Sends what the composer holds, as a line, to the tab in front.
+    fn send_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.send_input.clone();
         let value = input.read(cx).value().trim().to_string();
         if value.is_empty() {
             return;
         }
 
-        let tab = &mut self.tabs[index];
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
         if !tab.connected {
             tab.note("Connect a serial port before sending data.");
             cx.notify();

@@ -265,7 +265,6 @@ pub(crate) struct SerialTabState {
     pub(crate) highlight: bool,
     pub(crate) auto_scroll: bool,
     pub(crate) terminal: Terminal,
-    pub(crate) send_input: Entity<InputState>,
     /// The title bar filter box and what it currently holds back.
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
@@ -274,15 +273,12 @@ pub(crate) struct SerialTabState {
     /// the task that feeds the terminal, the moment the tab is built.
     pub(crate) event_tx: smol::channel::Sender<SerialEvent>,
     event_rx: Option<smol::channel::Receiver<SerialEvent>>,
-    _input_subscription: Subscription,
     _filter_subscription: Subscription,
 }
 
 impl SerialTabState {
     pub(crate) fn new(
         id: usize,
-        send_input: Entity<InputState>,
-        input_subscription: Subscription,
         filter_input: Entity<InputState>,
         filter_subscription: Subscription,
     ) -> Self {
@@ -307,13 +303,11 @@ impl SerialTabState {
                 terminal.note("Configure the serial port, then connect.", &now());
                 terminal
             },
-            send_input,
             filter_input,
             filter: OutputFilter::default(),
             command_tx: None,
             event_tx,
             event_rx: Some(event_rx),
-            _input_subscription: input_subscription,
             _filter_subscription: filter_subscription,
         }
     }
@@ -375,8 +369,8 @@ impl Drop for SerialTabState {
 }
 
 /// What the render pass reads of a tab: its connection, and the switches
-/// that shape the terminal and the composer. The port and its tag are drawn
-/// from the tab itself, in the strip.
+/// that shape the terminal and the composer in the side panel. The port and
+/// its tag are drawn from the tab itself, in the strip.
 #[derive(Clone)]
 pub(crate) struct SerialTabSnapshot {
     pub(crate) id: usize,
@@ -387,7 +381,6 @@ pub(crate) struct SerialTabSnapshot {
     /// How many rows on screen the title bar filter matches, out of how
     /// many there are, while a filter is set.
     pub(crate) filter_counts: Option<(usize, usize)>,
-    pub(crate) send_input: Entity<InputState>,
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
 }
@@ -405,7 +398,6 @@ impl From<&SerialTabState> for SerialTabSnapshot {
                 let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
                 (matching, texts.len())
             }),
-            send_input: tab.send_input.clone(),
             filter_input: tab.filter_input.clone(),
             filter: tab.filter.clone(),
         }

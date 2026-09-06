@@ -17,11 +17,17 @@
 //! header, and the whole panel collapses to an icon rail that still carries the
 //! counts and reopens on a click. A collapsed section gives its height back to
 //! its neighbour, so the panel never holds a half-empty list above a full one.
+//!
+//! Along the panel's foot sits the composer: the one box commands are typed
+//! into, under the commands kept for reuse, so a line and the bookmark that
+//! saves it are a hand's width apart. It sends to whichever tab is in front,
+//! and says which.
 
 use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
+    input::Input,
     scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
@@ -30,6 +36,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_menu::SaveCurrentSession;
+use crate::controls::{Choice, ChoiceText, segmented};
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{StoredGroup, StoredSession};
@@ -47,6 +54,13 @@ pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 220.;
 pub(crate) const SIDEBAR_MAX_WIDTH: f32 = 560.;
 /// Width of the collapsed rail: one icon chip plus breathing room.
 const RAIL_WIDTH: f32 = 52.;
+/// Height of the composer at the panel's foot: the box, the row of switches
+/// under it, and the air around them.
+const COMPOSER_HEIGHT: f32 = 82.;
+/// Height of the box commands are typed into.
+const COMPOSER_INPUT_HEIGHT: f32 = 32.;
+/// What the composer says while it is empty.
+pub(crate) const SEND_PLACEHOLDER: &str = "Enter a command…";
 const SECTION_HEADER_HEIGHT: f32 = 38.;
 /// The most of the panel the saved sessions take while Quick send is open.
 const SESSIONS_SHARE: f32 = 0.5;
@@ -205,10 +219,7 @@ impl SerialWorkspace {
     }
 
     pub(crate) fn save_current_command(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let value = tab.send_input.read(cx).value().trim().to_string();
+        let value = self.send_input.read(cx).value().trim().to_string();
         if value.is_empty() {
             return;
         }
@@ -227,12 +238,12 @@ impl SerialWorkspace {
         else {
             return;
         };
-        let Some(tab_id) = self.active_tab().map(|tab| tab.id) else {
+        if self.active_tab().is_none() {
             return;
-        };
-        let input = self.tabs[self.active_tab].send_input.clone();
+        }
+        let input = self.send_input.clone();
         input.update(cx, |input, cx| input.set_value(command, window, cx));
-        self.send_current(tab_id, window, cx);
+        self.send_to_active_tab(window, cx);
     }
 
     fn remove_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
@@ -876,6 +887,125 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
+    /// The UTF-8 / HEX switch: the same segmented rail the session dialog
+    /// sets its framing with, so the two places a mode is picked look alike.
+    fn render_mode_switch(&mut self, hex_mode: bool, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        segmented(
+            "mode-switch",
+            palette,
+            ChoiceText::ui(MICRO),
+            vec![
+                Choice::new(
+                    "UTF-8",
+                    !hex_mode,
+                    cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
+                ),
+                Choice::new(
+                    "HEX",
+                    hex_mode,
+                    cx.listener(|this, _, _, cx| this.set_hex_mode(true, cx)),
+                ),
+            ],
+        )
+        .into_any_element()
+    }
+
+    /// The composer: the box on top, and under it the mode switch, where
+    /// the line will go, and the two buttons — bookmark and send. Without a
+    /// tab the box and the send button are put to rest; the bookmark still
+    /// works, since a command can be kept before there is anywhere to send it.
+    fn render_composer(
+        &mut self,
+        active: Option<&SerialTabSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let hex_mode = active.is_some_and(|tab| tab.hex_mode);
+        let (target, status) = match self.active_tab() {
+            Some(tab) => (
+                tab.title().to_string(),
+                if tab.connected {
+                    palette.success
+                } else if tab.connecting {
+                    palette.warning
+                } else {
+                    palette.faint
+                },
+            ),
+            None => ("No session open".to_string(), palette.faint),
+        };
+        let mode_switch = self.render_mode_switch(hex_mode, cx);
+
+        v_flex()
+            .h(px(COMPOSER_HEIGHT))
+            .flex_none()
+            .px_2()
+            .py_2()
+            .gap_1p5()
+            .border_t_1()
+            .border_color(rgb(palette.border))
+            .child(
+                Input::new(&self.send_input)
+                    .h(px(COMPOSER_INPUT_HEIGHT))
+                    .disabled(active.is_none())
+                    .prefix(
+                        Icon::new(if hex_mode {
+                            Glyph::Hex
+                        } else {
+                            Glyph::Terminal
+                        })
+                        .size(px(15.))
+                        .text_color(rgb(palette.muted)),
+                    )
+                    .cleanable(true),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(mode_switch)
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(Self::status_dot(6., status))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_token(CAPTION)
+                                    .text_color(rgb(palette.muted))
+                                    .child(target),
+                            ),
+                    )
+                    .child(
+                        Button::new("save-command")
+                            .ghost()
+                            .small()
+                            .icon(Glyph::Bookmark)
+                            .tooltip("Save this command to Quick send")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_current_command(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("send-command")
+                            .primary()
+                            .small()
+                            .icon(Glyph::Send)
+                            .disabled(active.is_none())
+                            .tooltip("Send to the session in front")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.send_to_active_tab(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// One rail button: the section's glyph, with its count riding the corner.
     fn rail_button(
         &mut self,
@@ -987,8 +1117,11 @@ impl SerialWorkspace {
 
         let palette = self.interface_theme.palette();
         let has_active_tab = active_tab.is_some();
-        let sessions = self.render_saved_sessions(has_active_tab, panel_height, cx);
+        // The composer has the foot of the panel; the lists share the rest.
+        let sessions =
+            self.render_saved_sessions(has_active_tab, panel_height - COMPOSER_HEIGHT, cx);
         let commands = self.render_quick_send(has_active_tab, cx);
+        let composer = self.render_composer(active_tab.as_ref(), cx);
 
         // The width is the resizable panel's to set; the column fills it.
         v_flex()
@@ -999,6 +1132,7 @@ impl SerialWorkspace {
             .bg(rgb(palette.panel))
             .child(sessions)
             .child(commands)
+            .child(composer)
             .into_any_element()
     }
 }

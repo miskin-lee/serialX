@@ -1,16 +1,15 @@
 //! The centre column: everything between the title bar and the window's
 //! bottom edge.
 //!
-//! The workbench is laid out as three stacked bands — the tab strip, the
-//! terminal log, and the composer. The strip and the composer have fixed
-//! heights so the log is the only thing that grows, which keeps the composer
-//! parked under the cursor no matter how much traffic arrives.
+//! The workbench is two stacked bands — the tab strip and the terminal log.
+//! The strip has a fixed height so the log is the only thing that grows.
+//! What acts on the session in front lives elsewhere: connect beside the
+//! filter in the title bar, and the composer at the foot of the side panel.
 
 use gpui_kit::component::{
-    Icon, IconName, Sizable,
+    IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
-    input::Input,
     kbd::Kbd,
     tooltip::Tooltip,
     v_flex,
@@ -19,14 +18,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
-use crate::app_menu::{NewSerialTab, ToggleConnection};
-use crate::controls::{Choice, ChoiceText, segmented};
+use crate::app_menu::NewSerialTab;
 use crate::icons::Glyph;
 use crate::filter::OutputFilter;
 use crate::terminal::{CaretShape, RenderContent};
 use crate::theme::{
-    BODY, CAPTION, LABEL, MICRO, MONO_SMALL, TerminalPalette, Typography, WORDMARK,
-    WorkbenchPalette, fonts, tint,
+    BODY, CAPTION, LABEL, MONO_SMALL, TerminalPalette, Typography, WORDMARK, WorkbenchPalette,
+    fonts, tint,
 };
 use crate::{SerialTabSnapshot, SerialTabState, SerialWorkspace};
 
@@ -48,8 +46,6 @@ const TAG_RING_ACTIVE: f32 = 0.45;
 /// faint enough to sit nearly flat, strong enough to read as the tag.
 const TAG_PLATE_REST: f32 = 0.1;
 const TAG_PLATE_HOVER: f32 = 0.18;
-/// Height of the composer below the terminal.
-const COMPOSER_HEIGHT: f32 = 52.;
 /// Width of the timestamp gutter, wide enough for `14:32:40.018`.
 const TIME_GUTTER: f32 = 82.;
 /// Side padding of a log row, and the gap between its gutter and its text.
@@ -85,17 +81,18 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    /// The band above the terminal: one tab per session on the left, and at
-    /// the right end the one control the session in front of you needs at
-    /// hand — connect or disconnect. Pausing, clearing and the log's two
-    /// switches live in the menus with their shortcuts, so the strip holds
-    /// nothing that is not about *which* session and whether it is open.
+    /// The band above the terminal: one tab per session, and the way to a
+    /// new one. Connecting is done beside the filter in the title bar, and
+    /// pausing, clearing and the log's switches live in the menus with their
+    /// shortcuts, so the strip holds nothing that is not about *which*
+    /// session.
     pub(crate) fn render_tab_strip(
         &mut self,
         active: Option<&SerialTabSnapshot>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let active = active?;
+        // No strip without a tab: the empty state has the whole column.
+        active?;
         let palette = self.interface_theme.palette();
         let active_index = self.active_tab;
 
@@ -105,7 +102,6 @@ impl SerialWorkspace {
             .enumerate()
             .map(|(index, tab)| Self::render_tab(index, tab, index == active_index, palette, cx))
             .collect::<Vec<_>>();
-        let actions = self.render_session_actions(active, cx);
 
         Some(
             h_flex()
@@ -135,7 +131,6 @@ impl SerialWorkspace {
                                 })),
                         ),
                 )
-                .child(actions)
                 .into_any_element(),
         )
     }
@@ -244,136 +239,9 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
-    /// The one control at the right end of the strip: connect or disconnect
-    /// the session in front of you. A pill, filled while the port is shut
-    /// and outlined while it is open, so the strip says the state as well
-    /// as offering the switch.
-    fn render_session_actions(
-        &mut self,
-        tab: &SerialTabSnapshot,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let tab_id = tab.id;
-        let connected = tab.connected || tab.connecting;
-
-        h_flex()
-            .flex_none()
-            .items_center()
-            .child(
-                Button::new(("toggle-connection", tab_id))
-                    .when(connected, |button| button.outline())
-                    .when(!connected, |button| button.primary())
-                    .small()
-                    .compact()
-                    .h(px(TAB_HEIGHT))
-                    .rounded(px(TAB_HEIGHT / 2.))
-                    .px_2p5()
-                    .icon(if connected { Glyph::Cable } else { Glyph::Bolt })
-                    .label(if tab.connecting {
-                        "Connecting…"
-                    } else if tab.connected {
-                        "Disconnect"
-                    } else {
-                        "Connect"
-                    })
-                    .tooltip_with_action(
-                        if connected {
-                            "Disconnect"
-                        } else {
-                            "Connect"
-                        },
-                        &ToggleConnection,
-                        None,
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_connection(tab_id, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// The UTF-8 / HEX switch: the same segmented rail the session dialog
-    /// sets its framing with, so the two places a mode is picked look alike.
-    fn render_mode_switch(&mut self, hex_mode: bool, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.interface_theme.palette();
-        segmented(
-            "mode-switch",
-            palette,
-            ChoiceText::ui(MICRO),
-            vec![
-                Choice::new(
-                    "UTF-8",
-                    !hex_mode,
-                    cx.listener(|this, _, _, cx| this.set_hex_mode(false, cx)),
-                ),
-                Choice::new(
-                    "HEX",
-                    hex_mode,
-                    cx.listener(|this, _, _, cx| this.set_hex_mode(true, cx)),
-                ),
-            ],
-        )
-        .into_any_element()
-    }
-
-    /// The send band. Lives under the log rather than in the sidebar, so the
-    /// thing you type into sits directly below the thing it prints to.
-    fn render_composer(&mut self, tab: &SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let palette = self.interface_theme.palette();
-        let tab_id = tab.id;
-        let mode_switch = self.render_mode_switch(tab.hex_mode, cx);
-
-        h_flex()
-            .h(px(COMPOSER_HEIGHT))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .bg(rgb(palette.editor))
-            .border_t_1()
-            .border_color(rgb(palette.border))
-            .child(mode_switch)
-            .child(
-                div().flex_1().min_w_0().child(
-                    Input::new(&tab.send_input)
-                        .h(px(32.))
-                        .prefix(
-                            Icon::new(if tab.hex_mode {
-                                Glyph::Hex
-                            } else {
-                                Glyph::Terminal
-                            })
-                            .size(px(15.))
-                            .text_color(rgb(palette.muted)),
-                        )
-                        .cleanable(true),
-                ),
-            )
-            .child(
-                Button::new(("save-command", tab_id))
-                    .ghost()
-                    .small()
-                    .icon(Glyph::Bookmark)
-                    .tooltip("Save this command to Quick Send")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.save_current_command(cx);
-                    })),
-            )
-            .child(
-                Button::new(("send-command", tab_id))
-                    .primary()
-                    .small()
-                    .icon(Glyph::Send)
-                    .tooltip("Send")
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.send_current(tab_id, window, cx);
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// The terminal and the composer. The terminal is a place to type as
-    /// well as to read: a click gives it focus, and from then on keys go to
-    /// the port of this tab; the wheel moves through the scrollback.
+    /// The terminal. It is a place to type as well as to read: a click gives
+    /// it focus, and from then on keys go to the port of this tab; the wheel
+    /// moves through the scrollback.
     pub(crate) fn render_active_tab(
         &mut self,
         tab: SerialTabSnapshot,
@@ -381,7 +249,6 @@ impl SerialWorkspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
-        let composer = self.render_composer(&tab, cx);
         let focused = self.terminal_focus.is_focused(window) && window.is_window_active();
         if focused {
             self.start_blinking(window, cx);
@@ -412,7 +279,6 @@ impl SerialWorkspace {
                     }))
                     .child(terminal),
             )
-            .child(composer)
             .into_any_element()
     }
 

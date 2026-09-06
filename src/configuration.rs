@@ -11,11 +11,24 @@
 //! Last, the tab itself: a name, which stands in for the port's path wherever
 //! the session is listed, and two rows of colour swatches, twenty-four in all,
 //! for telling this session's tab from the others; a new session is offered
-//! the first colour no open tab wears. In the corner of that section, the
-//! group the session files under in the side panel: a list of the groups
-//! there are, with an offer to make one. A summary line at the foot restates
-//! the choice in the `115200 8N1` shorthand the rest of the workbench prints,
-//! behind a tag glyph in the chosen colour, with the group named at its end.
+//! the first colour no open tab wears. Beside the name, the group the
+//! session files under in the side panel: a field that opens the list of
+//! the groups there are, with an offer to make one. A summary line at the
+//! foot restates the choice in the `115200 8N1` shorthand the rest of the
+//! workbench prints, behind a tag glyph in the chosen colour, with the group
+//! named at its end.
+//!
+//! The dialog is modal, and says so: a press outside it — on the workbench
+//! or the side panel — closes nothing, and the dialog flashes instead, the
+//! way a window that will not yield does. Its own surface is the kit's to
+//! lay out, so where it stands is read back from the parts this module
+//! hands it: the header's icon, the content, and the footer.
+
+use std::{
+    cell::Cell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
@@ -29,6 +42,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use smol::Timer;
 
 use crate::controls::{Choice, ChoiceText, dialog_footer, eyebrow, segmented, tag};
 use crate::groups::GroupPrompt;
@@ -37,7 +51,7 @@ use crate::presets::{StoredGroup, StoredSession};
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
     BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TAG_HUE_COUNT, TITLE, TagColor, Typography,
-    WorkbenchPalette, tint,
+    WorkbenchPalette, mix, tint,
 };
 use crate::{
     BAUD_RATES, DATA_BITS, FLOW_CONTROLS, PARITIES, PortItem, PortKind, STOP_BITS,
@@ -58,10 +72,23 @@ const BAUD_LIST_MAX_HEIGHT: f32 = 320.;
 /// How far the caret's right edge sits in from the field's. The list hangs
 /// from the caret, so it is narrowed by this much to line up with the field.
 const BAUD_LIST_INSET: f32 = 8.;
+/// Width of the group field: enough for the folder, a short name and the
+/// caret, and no more, so the name field beside it gets the rest of the
+/// row. A longer group name truncates in the field and reads whole in the
+/// list, which opens wider.
+const GROUP_FIELD_WIDTH: f32 = 136.;
 /// The narrowest the list of groups opens: room for a name of some length.
 const GROUP_LIST_MIN_WIDTH: f32 = 180.;
-/// What the group picker says while the session is in no group.
+/// What the group field says while the session is in no group.
 const NO_GROUP: &str = "No group";
+/// The dialog's padding, from its edge to what it holds.
+const DIALOG_PADDING: f32 = 20.;
+/// How long the dialog flashes when pressed past, and how many times its
+/// ring pulses in that while.
+const FLASH_DURATION: Duration = Duration::from_millis(700);
+const FLASH_PULSES: f32 = 2.;
+/// How often the window is rendered while the dialog flashes.
+const FLASH_TICK: Duration = Duration::from_millis(16);
 /// Height of one device row.
 const PORT_ROW_HEIGHT: f32 = 44.;
 /// The most device rows the list shows before it scrolls.
@@ -69,11 +96,16 @@ const PORT_ROWS_MAX: usize = 4;
 /// The fewest it shows when the window is short, so the list stays a list.
 const PORT_ROWS_MIN: usize = 2;
 /// The dialog's share of the window height, so the footer stays reachable on
-/// the smallest window the workbench allows.
+/// the smallest window the workbench allows. The device list gives way
+/// first; when even its two rows will not fit, the dialog is capped at this
+/// share and its body scrolls for the rest.
 const DIALOG_MAX_HEIGHT_FRACTION: f32 = 0.9;
+/// The gap between sections.
+const SECTION_GAP: f32 = 14.;
 /// What the dialog stands at with an empty device list: padding, header, the
-/// other four sections, the summary and the footer.
-const DIALOG_FIXED_HEIGHT: f32 = 510.;
+/// other four sections — the Tab section two rows deep — the summary and the
+/// footer.
+const DIALOG_FIXED_HEIGHT: f32 = 542.;
 /// What the name field says while it is empty and no device is chosen.
 const NAME_FALLBACK: &str = "Name";
 /// A tag swatch: the disc, the hit target around it that also carries the
@@ -135,9 +167,59 @@ enum ConfigurationField {
     FlowControl,
 }
 
+/// Where the dialog stands on screen, read back from the parts this module
+/// hands it as they are laid out: the icon that starts the header, the
+/// content, and the footer. The surface around them is the kit's, and its
+/// edge is those parts' edge plus the padding.
+#[derive(Default)]
+struct DialogFrame {
+    header_top: Cell<Option<Pixels>>,
+    content: Cell<Option<Bounds<Pixels>>>,
+    footer_bottom: Cell<Option<Pixels>>,
+}
+
+impl DialogFrame {
+    /// Wraps a part so its place is recorded as it is laid out.
+    fn measuring(
+        part: impl IntoElement,
+        record: impl Fn(Bounds<Pixels>) + 'static,
+    ) -> Div {
+        div()
+            .on_children_prepainted(move |bounds, _, _| {
+                if let Some(bounds) = bounds.first() {
+                    record(*bounds);
+                }
+            })
+            .child(part)
+    }
+
+    /// Whether a point is on the dialog. Until every part has been laid
+    /// out, everything counts as on it: better a flash missed than one
+    /// for a press on the dialog itself.
+    fn contains(&self, position: Point<Pixels>) -> bool {
+        let (Some(top), Some(content), Some(bottom)) = (
+            self.header_top.get(),
+            self.content.get(),
+            self.footer_bottom.get(),
+        ) else {
+            return true;
+        };
+        let padding = px(DIALOG_PADDING);
+        Bounds::from_corners(
+            point(content.left() - padding, top - padding),
+            point(content.right() + padding, bottom + padding),
+        )
+        .contains(&position)
+    }
+}
+
 struct SerialConfigurationEditor {
     target: ConfigurationTarget,
     theme: InterfaceTheme,
+    /// Where the dialog stands, for telling a press past it from one on it.
+    frame: Rc<DialogFrame>,
+    /// When a press past the dialog last set it flashing.
+    flash: Option<Instant>,
     /// The workspace the dialog was opened from: where a group made from
     /// here is kept.
     workspace: WeakEntity<SerialWorkspace>,
@@ -233,6 +315,8 @@ impl SerialConfigurationEditor {
         Self {
             target,
             theme,
+            frame: Rc::default(),
+            flash: None,
             workspace,
             ports,
             selected_port,
@@ -246,6 +330,53 @@ impl SerialConfigurationEditor {
             _baud_subscription: baud_subscription,
             baud_error: None,
         }
+    }
+
+    /// A press somewhere other than on this content: past the dialog, it
+    /// closes nothing, so the dialog flashes to say it is waiting. On the
+    /// dialog's own chrome it is nothing to answer.
+    ///
+    /// The flash is drawn by the dialog's builder, which runs with the
+    /// window's render, so a ticker keeps the window rendering until the
+    /// flash is over; a press during one starts it again and the ticker
+    /// already running sees it through.
+    fn pressed_outside(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.frame.contains(position) {
+            return;
+        }
+        let flashing = self.flash_progress().is_some();
+        self.flash = Some(Instant::now());
+        cx.notify();
+        if flashing {
+            return;
+        }
+        cx.spawn_in(window, async move |editor, cx| {
+            loop {
+                Timer::after(FLASH_TICK).await;
+                let flashing = editor
+                    .update_in(cx, |editor, window, _| {
+                        window.refresh();
+                        editor.flash_progress().is_some()
+                    })
+                    .unwrap_or(false);
+                if !flashing {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// How far along the flash is, from 0 to 1, or none once it is over.
+    fn flash_progress(&self) -> Option<f32> {
+        let elapsed = self.flash?.elapsed();
+        (elapsed < FLASH_DURATION)
+            .then(|| elapsed.as_secs_f32() / FLASH_DURATION.as_secs_f32())
     }
 
     /// The name as typed, or none when the field is empty or only spaces.
@@ -807,10 +938,12 @@ impl SerialConfigurationEditor {
             .into_any_element()
     }
 
-    /// The group picker: a pill naming the group, or `No group`, that opens
-    /// the list of groups with a way to make one at its foot. It sits in the
-    /// Tab section's corner, where the Device section keeps its rescan.
-    fn render_group_picker(
+    /// The group field: a folder, the group's name or `No group`, and a
+    /// caret, drawn as the baud rate field is drawn and standing at its
+    /// size. The whole field opens the list of groups, with a way to make
+    /// one at its foot; the list hangs from the field's left edge and is
+    /// at least as wide.
+    fn render_group_field(
         &mut self,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
@@ -827,13 +960,51 @@ impl SerialConfigurationEditor {
 
         Button::new("config-group")
             .ghost()
-            .xsmall()
-            .icon(Icon::new(Glyph::Folder).text_color(rgb(ink)))
-            .label(name.unwrap_or_else(|| NO_GROUP.to_string()))
-            .dropdown_caret(true)
+            .with_size(px(BAUD_FIELD_HEIGHT))
+            .w(px(GROUP_FIELD_WIDTH))
+            .h(px(BAUD_FIELD_HEIGHT))
+            .pl_2p5()
+            .pr_2()
+            .bg(rgb(palette.input))
+            .border_1()
+            .border_color(rgb(palette.input_border))
+            .rounded(px(8.))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                Icon::new(Glyph::Folder)
+                                    .size(px(14.))
+                                    .text_color(rgb(ink)),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_token(LABEL)
+                                    .font_weight(FontWeight::NORMAL)
+                                    .text_color(rgb(ink))
+                                    .child(name.unwrap_or_else(|| NO_GROUP.to_string())),
+                            ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(px(12.))
+                            .text_color(rgb(palette.muted)),
+                    ),
+            )
             .tooltip("The group this session files under in the side panel")
-            .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
-                menu = menu.min_w(px(GROUP_LIST_MIN_WIDTH));
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                menu = menu.min_w(px(GROUP_FIELD_WIDTH.max(GROUP_LIST_MIN_WIDTH)));
                 let pick = |group: Option<u64>| {
                     let editor = editor.clone();
                     move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
@@ -868,12 +1039,10 @@ impl SerialConfigurationEditor {
             .into_any_element()
     }
 
-    /// The tab: its name and its colour, side by side under one eyebrow, and
-    /// its group in the eyebrow's corner. The name field takes what the
-    /// swatches leave; the swatches are the bright dozen over the deep dozen,
-    /// so a column holds two colours that read as kin. Two rows beside the
-    /// field, rather than under it, keep the footer on screen at the
-    /// smallest window.
+    /// The tab, in two rows under one eyebrow: its name beside its group,
+    /// the name taking the width the group field leaves, and under them its
+    /// colour — the bright dozen over the deep dozen, so a column holds two
+    /// colours that read as kin.
     fn render_tab_section(
         &mut self,
         palette: WorkbenchPalette,
@@ -889,6 +1058,7 @@ impl SerialConfigurationEditor {
             .rounded(px(8.))
             .px_2p5()
             .cleanable(true);
+        let group = self.render_group_field(palette, cx);
 
         let mut rows = Vec::with_capacity(SWATCH_ROWS);
         for (row, hues) in TagColor::HUES.chunks(SWATCH_COLUMNS).enumerate() {
@@ -905,18 +1075,25 @@ impl SerialConfigurationEditor {
             );
         }
 
-        let picker = self.render_group_picker(palette, cx);
-
         Self::section(
             palette,
             "Tab",
-            Some(picker),
-            h_flex()
-                .h(px(TAG_BLOCK_HEIGHT))
-                .items_center()
-                .gap_3()
-                .child(div().flex_1().min_w_0().child(name))
-                .child(v_flex().gap(px(SWATCH_GAP)).children(rows)),
+            None,
+            v_flex()
+                .gap_2p5()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_3()
+                        .child(div().flex_1().min_w_0().child(name))
+                        .child(group),
+                )
+                .child(
+                    v_flex()
+                        .h(px(TAG_BLOCK_HEIGHT))
+                        .gap(px(SWATCH_GAP))
+                        .children(rows),
+                ),
         )
         .into_any_element()
     }
@@ -995,13 +1172,26 @@ impl Render for SerialConfigurationEditor {
         // The device list is the one part that gives way on a short window,
         // so the rest of the form and the footer never leave the screen.
         let viewport_height: f32 = window.viewport_size().height.into();
-        v_flex()
-            .gap_4()
-            .child(self.render_devices(palette, viewport_height, cx))
-            .child(self.render_baud_rate(palette, cx))
-            .child(self.render_framing(palette, cx))
-            .child(self.render_tab_section(palette, cx))
-            .child(self.render_summary(palette, cx))
+        let frame = self.frame.clone();
+        // The content's place is one of the three the frame is read from;
+        // a press anywhere but on the content is then held against the
+        // whole frame, so the chrome around it counts as the dialog too.
+        div()
+            .on_children_prepainted(move |bounds, _, _| {
+                frame.content.set(bounds.first().copied());
+            })
+            .on_mouse_down_out(cx.listener(|editor, event: &MouseDownEvent, window, cx| {
+                editor.pressed_outside(event.position, window, cx);
+            }))
+            .child(
+                v_flex()
+                    .gap(px(SECTION_GAP))
+                    .child(self.render_devices(palette, viewport_height, cx))
+                    .child(self.render_baud_rate(palette, cx))
+                    .child(self.render_framing(palette, cx))
+                    .child(self.render_tab_section(palette, cx))
+                    .child(self.render_summary(palette, cx)),
+            )
     }
 }
 
@@ -1079,17 +1269,36 @@ impl SerialWorkspace {
             ),
         };
         let palette = theme.palette();
+        let frame = editor.read(cx).frame.clone();
 
         // `Dialog` only renders a footer it is handed; the alert variant
         // supplies the modal behaviour (Esc cancels, Enter confirms, the
         // backdrop does not dismiss) and the footer below supplies the buttons.
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        // The builder runs with every render, so the flash is drawn from
+        // here: the ring and the surface warm to the accent and back, twice.
+        window.open_alert_dialog(cx, move |alert, window, cx| {
             let workspace = workspace.clone();
             let editor = editor_for_submit.clone();
+            let flash = editor_for_dialog.read(cx).flash_progress();
+            let glow = flash.map_or(0., |progress| {
+                (progress * FLASH_PULSES * std::f32::consts::PI).sin().abs()
+            });
+            let header_frame = frame.clone();
+            let footer_frame = frame.clone();
+            let viewport_height: f32 = window.viewport_size().height.into();
             alert
                 .width(px(DIALOG_WIDTH))
-                .p_5()
-                .icon(icon_chip(Glyph::Port, palette.category_device, 36.))
+                .max_h(px(viewport_height * DIALOG_MAX_HEIGHT_FRACTION))
+                .p(px(DIALOG_PADDING))
+                .when(glow > 0., |alert| {
+                    alert
+                        .border_color(rgb(mix(palette.border, palette.accent, glow)))
+                        .bg(rgb(mix(palette.editor, palette.accent, 0.08 * glow)))
+                })
+                .icon(DialogFrame::measuring(
+                    icon_chip(Glyph::Port, palette.category_device, 36.),
+                    move |bounds| header_frame.header_top.set(Some(bounds.top())),
+                ))
                 .title(
                     div()
                         .text_token(TITLE)
@@ -1099,7 +1308,10 @@ impl SerialWorkspace {
                 .description(blurb)
                 .close_button(true)
                 .child(editor_for_dialog.clone())
-                .footer(dialog_footer(palette, confirm, confirm_glyph))
+                .footer(DialogFrame::measuring(
+                    dialog_footer(palette, confirm, confirm_glyph),
+                    move |bounds| footer_frame.footer_bottom.set(Some(bounds.bottom())),
+                ))
                 .on_ok(move |_, window, cx| {
                     // A field that does not hold a rate keeps the dialog
                     // open, with the field in focus, rather than opening the
@@ -1204,12 +1416,18 @@ mod tests {
         assert_eq!(port_list_height(9, 800.), 3.5 * PORT_ROW_HEIGHT);
     }
 
-    /// The smallest window still gets a list, and the dialog still fits.
+    /// The smallest window still gets a list of two rows. The dialog is
+    /// then a little over its share of the window, which the cap turns into
+    /// a body that scrolls by less than a row; a window not much taller
+    /// fits it whole.
     #[test]
     fn a_short_window_keeps_two_rows_and_a_reachable_footer() {
         let height = port_list_height(9, 640.);
         assert_eq!(height, 1.5 * PORT_ROW_HEIGHT);
-        assert!(DIALOG_FIXED_HEIGHT + height <= 640. * DIALOG_MAX_HEIGHT_FRACTION);
+        let over = DIALOG_FIXED_HEIGHT + height - 640. * DIALOG_MAX_HEIGHT_FRACTION;
+        assert!(over > 0. && over < PORT_ROW_HEIGHT, "over by {over}");
+        assert_eq!(port_list_height(9, 700.), 1.5 * PORT_ROW_HEIGHT);
+        assert!(DIALOG_FIXED_HEIGHT + height <= 700. * DIALOG_MAX_HEIGHT_FRACTION);
     }
 
     #[test]

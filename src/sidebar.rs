@@ -69,6 +69,9 @@ const GROUP_EMPTY_HEIGHT: f32 = 26.;
 const GROUP_GUIDE_INSET: f32 = 11.;
 /// The gap between the guide and the cards it groups.
 const GROUP_BODY_GAP: f32 = 8.;
+/// A row's button, sized the way an explorer's row actions are: a glyph of
+/// sixteen pixels in a target of twenty-two, large enough to read and to hit.
+const ROW_ACTION_SIZE: f32 = 22.;
 /// Resting opacity of a row's buttons. Visible enough to find, quiet enough
 /// not to compete with the row they act on.
 const ROW_ACTION_REST: f32 = 0.35;
@@ -436,7 +439,7 @@ impl SerialWorkspace {
     ) -> Button {
         Button::new(id)
             .ghost()
-            .xsmall()
+            .with_size(px(ROW_ACTION_SIZE))
             .icon(glyph)
             .tooltip(tooltip)
             .on_click(move |event, window, cx| {
@@ -674,7 +677,7 @@ impl SerialWorkspace {
                     .child(
                         Button::new("new-session-group")
                             .ghost()
-                            .xsmall()
+                            .with_size(px(ROW_ACTION_SIZE))
                             .icon(Glyph::FolderPlus)
                             .tooltip("New group")
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -685,7 +688,7 @@ impl SerialWorkspace {
                     .child(
                         Button::new("save-active-session")
                             .ghost()
-                            .xsmall()
+                            .with_size(px(ROW_ACTION_SIZE))
                             .icon(IconName::Plus)
                             .tooltip_with_action("Save the active session", &SaveCurrentSession, None)
                             .disabled(!has_active_tab)

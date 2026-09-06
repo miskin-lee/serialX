@@ -50,7 +50,10 @@ use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
 use terminal::key_bytes;
 use title_bar::{FILTER_PLACEHOLDER, TITLE_BAR_HEIGHT, traffic_light_position};
 use workbench::TerminalMetrics;
-use updater::{CheckResult, UpdateEvent, UpdateInfo, spawn_update_check, spawn_update_install};
+use updater::{
+    CheckResult, InstallError, ReadyUpdate, UpdateEvent, UpdateInfo, open_package, relaunch,
+    spawn_update_check, spawn_update_install,
+};
 
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
 /// Half a period of the cursor's blink: this long on, this long off.
@@ -61,7 +64,10 @@ enum UpdateStatus {
     UpToDate,
     Available(UpdateInfo),
     Downloading { version: String, downloaded: u64 },
-    InstallerLaunched,
+    /// The package is verified and is being put in place.
+    Installing { version: String },
+    /// In place: runs on the next start, or now if the user relaunches.
+    Ready(ReadyUpdate),
     Failed,
 }
 
@@ -694,22 +700,20 @@ impl SerialWorkspace {
                         };
                     }
                 }
-                UpdateEvent::InstallerLaunched(Ok(version)) => {
-                    self.update_status = UpdateStatus::InstallerLaunched;
-                    #[cfg(target_os = "windows")]
-                    cx.quit();
-                    #[cfg(not(target_os = "windows"))]
-                    window.push_notification(
-                        Notification::success(format!(
-                            "The serialX v{version} installer is open. Follow the system prompts to finish updating."
-                        ))
-                        .title("Software Update"),
-                        cx,
-                    );
+                UpdateEvent::Installing => {
+                    if let UpdateStatus::Downloading { version, .. } = &self.update_status {
+                        self.update_status = UpdateStatus::Installing {
+                            version: version.clone(),
+                        };
+                    }
                 }
-                UpdateEvent::InstallerLaunched(Err(message)) => {
+                UpdateEvent::InstallCompleted(Ok(update)) => {
+                    self.update_status = UpdateStatus::Ready(update.clone());
+                    Self::show_update_ready_dialog(update, window, cx);
+                }
+                UpdateEvent::InstallCompleted(Err(error)) => {
                     self.update_status = UpdateStatus::Failed;
-                    Self::show_update_error_dialog(message, window, cx);
+                    Self::show_install_error_dialog(error, window, cx);
                 }
             }
         }
@@ -750,6 +754,16 @@ impl SerialWorkspace {
                     cx,
                 );
             }
+            UpdateStatus::Installing { version } => {
+                window.push_notification(
+                    Notification::info(format!("Installing serialX v{version}…"))
+                        .title("Software Update"),
+                    cx,
+                );
+            }
+            UpdateStatus::Ready(update) => {
+                Self::show_update_ready_dialog(update.clone(), window, cx);
+            }
             UpdateStatus::Checking => {
                 self.manual_update_check = true;
                 window.push_notification(
@@ -786,7 +800,7 @@ impl SerialWorkspace {
                 .icon(Icon::new(IconName::RotateCw).size_5())
                 .title(format!("serialX v{latest_version} is available"))
                 .description(format!(
-                    "Current version: v{}\nPackage: {package_name}\n\nDownload and install now?",
+                    "Current version: v{}\nPackage: {package_name}\n\nDownload and install it in place now? serialX keeps running until you choose to relaunch.",
                     env!("CARGO_PKG_VERSION")
                 ))
                 .button_props(
@@ -822,6 +836,62 @@ impl SerialWorkspace {
                 .title("serialX is up to date")
                 .description(format!("Current version: v{version}"))
                 .button_props(DialogButtonProps::default().ok_text("OK"))
+        });
+    }
+
+    fn show_update_ready_dialog(update: ReadyUpdate, window: &mut Window, cx: &mut App) {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let update = update.clone();
+            alert
+                .icon(Icon::new(IconName::CircleCheck).size_5())
+                .title(format!("serialX v{} is ready", update.version))
+                .description(format!("{}\n\nRelaunch now?", update.summary()))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Relaunch Now")
+                        .show_cancel(true)
+                        .cancel_text("Later"),
+                )
+                .on_ok(move |_, window, cx| {
+                    // The helper waits for this process to end, then starts
+                    // the new version; quitting is what hands over to it.
+                    match relaunch(&update) {
+                        Ok(()) => cx.quit(),
+                        Err(message) => Self::show_update_error_dialog(message, window, cx),
+                    }
+                    true
+                })
+        });
+    }
+
+    fn show_install_error_dialog(error: InstallError, window: &mut Window, cx: &mut App) {
+        let InstallError { message, package } = error;
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let alert = alert
+                .icon(Icon::new(IconName::CircleX).size_5())
+                .title("Unable to Install Update");
+            let Some(package) = package.clone() else {
+                return alert
+                    .description(message.clone())
+                    .button_props(DialogButtonProps::default().ok_text("Close"));
+            };
+            alert
+                .description(format!(
+                    "{message}\n\nThe verified package is at {}. Open it to finish the update by hand.",
+                    package.display()
+                ))
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Close")
+                        .show_cancel(true)
+                        .cancel_text("Open Package"),
+                )
+                .on_cancel(move |_, window, cx| {
+                    if let Err(message) = open_package(&package) {
+                        Self::show_update_error_dialog(message, window, cx);
+                    }
+                    true
+                })
         });
     }
 

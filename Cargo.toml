@@ -1,6 +1,6 @@
 [package]
 name = "serialx"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
 description = "A polished serial port workspace built with GPUI"
 license = "GPL-3.0-only"

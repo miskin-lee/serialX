@@ -27,16 +27,15 @@
 //! drawn as it asked. The grid is never touched, so the filter, the copy
 //! and the scrollback all see the bytes as sent.
 //!
-//! The screen is read as a log. A terminal puts a cleared screen's prompt
-//! at the top and leaves the rest blank; here the rows a clear left empty
-//! under the cursor are given to the scrollback, so what the device printed
-//! before stays in view above the prompt and the newest line sits at the
-//! bottom. To the same end, an erase that would wipe the whole screen —
-//! `ESC [ J` from the home position, which is what `clear` sends to a
-//! vt100 — moves the screen into the scrollback the way `ESC [ 2 J` does
-//! instead of overwriting it, and `ESC [ 3 J`, the request to discard the
-//! scrollback, is not honoured: what the device said is the user's to
-//! keep, and the workbench's own Clear is what wipes it.
+//! A clear from the device clears. `clear` on the other end sends an
+//! erase of the whole screen — `ESC [ 2 J`, or `ESC [ J` from the home
+//! position on a vt100 — and here that wipes the log: the screen, the
+//! scrollback and the stamps go, the same as the workbench's own Clear, so
+//! a `clear` typed at the device's prompt leaves the terminal as empty as
+//! it leaves any other. `ESC [ 3 J`, the request to discard the scrollback
+//! alone, does that alone. The alternate screen is left to itself: a
+//! full-screen program clearing its own screen is not clearing the log,
+//! which is there again when the program ends.
 
 use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
@@ -166,12 +165,12 @@ impl Terminal {
         std::mem::take(&mut *self.outbox.0.borrow_mut())
     }
 
-    /// Runs the bytes through the emulation, with the erases that would
-    /// wipe the screen turned into ones that keep it: an erase to the end
-    /// of the screen from the home position becomes a clear of the whole
-    /// screen, which the emulation moves into the scrollback, and an erase
-    /// of the scrollback is dropped. An erase a read cut short is held
-    /// back until the next read completes it.
+    /// Runs the bytes through the emulation, watching for the erases that
+    /// take lines away, since the stamps have to lose the same lines: an
+    /// erase of the whole screen — or of the screen below the cursor, from
+    /// the home position — wipes the log, and an erase of the scrollback
+    /// drops the stamps of the lines it held. An erase a read cut short is
+    /// held back until the next read completes it.
     fn advance(&mut self, bytes: &[u8]) {
         let joined;
         let bytes = if self.held.is_empty() {
@@ -197,11 +196,19 @@ impl Terminal {
                 }
                 Erase::Screen { length, mode } => {
                     self.parser.advance(&mut self.term, &bytes[start..at]);
+                    let sequence = &bytes[at..at + length];
                     let home = self.term.grid().cursor.point == Point::new(Line(0), Column(0));
+                    let alternate = self.term.mode().contains(TermMode::ALT_SCREEN);
                     match mode {
-                        0 if home => self.parser.advance(&mut self.term, b"\x1b[2J"),
-                        3 => {}
-                        _ => self.parser.advance(&mut self.term, &bytes[at..at + length]),
+                        _ if alternate => self.parser.advance(&mut self.term, sequence),
+                        2 => self.wipe(),
+                        0 if home => self.wipe(),
+                        3 => {
+                            let keep = self.stamped_on_screen();
+                            self.parser.advance(&mut self.term, sequence);
+                            self.keep_last_stamps(keep);
+                        }
+                        _ => self.parser.advance(&mut self.term, sequence),
                     }
                     at += length;
                     start = at;
@@ -209,6 +216,40 @@ impl Terminal {
             }
         }
         self.parser.advance(&mut self.term, &bytes[start..]);
+    }
+
+    /// Wipes the screen and the scrollback, as `clear` asks. The line the
+    /// cursor is on keeps its stamp, since what the device prints next —
+    /// its prompt — lands there; every other line is gone with its time.
+    fn wipe(&mut self) {
+        let keep = usize::from(!self.unstamped);
+        self.parser.advance(&mut self.term, b"\x1b[2J\x1b[3J");
+        self.keep_last_stamps(keep);
+    }
+
+    /// How many lines on screen, from the top row down to the cursor's,
+    /// have a stamp: the rows that begin a line, less the cursor's while
+    /// it is still empty.
+    fn stamped_on_screen(&self) -> usize {
+        let grid = self.term.grid();
+        let history = grid.history_size() as i32;
+        let cursor_line = grid.cursor.point.line.0.max(0);
+        let hard = (0..=cursor_line)
+            .filter(|&line| {
+                let above = Line(line - 1);
+                line - 1 < -history
+                    || !grid[above]
+                        .last()
+                        .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
+            })
+            .count();
+        hard.saturating_sub(usize::from(self.unstamped))
+    }
+
+    /// Drops every stamp but the newest `count`.
+    fn keep_last_stamps(&mut self, count: usize) {
+        let drop = self.stamps.len().saturating_sub(count);
+        self.stamps.drain(..drop);
     }
 
     /// Prints a line of the workbench's own — a port opening, a scan —
@@ -238,8 +279,6 @@ impl Terminal {
             self.term.resize(size);
             if following {
                 self.scroll_to_bottom();
-            } else {
-                self.settle();
             }
         }
     }
@@ -252,45 +291,14 @@ impl Terminal {
     /// Moves the view through the scrollback: positive is back in time.
     pub(crate) fn scroll(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
-        self.settle();
     }
 
     pub(crate) fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
-        self.settle();
     }
 
     pub(crate) fn is_at_bottom(&self) -> bool {
-        self.term.grid().display_offset() <= self.floor()
-    }
-
-    /// Rows at the bottom of the screen with nothing on them, below the
-    /// cursor: what a clear leaves under the prompt.
-    fn slack(&self) -> usize {
-        let grid = self.term.grid();
-        let lines = grid.screen_lines();
-        let cursor = grid.cursor.point.line.0.max(0) as usize;
-        let last = (cursor + 1..lines)
-            .rev()
-            .find(|&line| !grid[Line(line as i32)].is_clear())
-            .unwrap_or(cursor);
-        lines - 1 - last
-    }
-
-    /// The least the view is scrolled back: as many of the empty rows as
-    /// the scrollback has lines to fill. Zero on a screen written to the
-    /// bottom, and always on the alternate screen, which has no scrollback.
-    fn floor(&self) -> usize {
-        self.slack().min(self.term.grid().history_size())
-    }
-
-    /// Lifts a view that has dropped below the floor back onto it.
-    fn settle(&mut self) {
-        let floor = self.floor();
-        let offset = self.term.grid().display_offset();
-        if offset < floor {
-            self.term.scroll_display(Scroll::Delta((floor - offset) as i32));
-        }
+        self.term.grid().display_offset() == 0
     }
 
     pub(crate) fn mode(&self) -> TermMode {
@@ -901,76 +909,67 @@ mod tests {
         assert_eq!(terminal.cursor_position(), Some((2, 0)));
     }
 
-    /// `clear` on an xterm: home, then erase the whole screen. The
-    /// emulation moves the screen into the scrollback; the view keeps
-    /// it in sight above the prompt instead of leaving the screen blank
-    /// under it, and goes on filling from the bottom.
+    /// `clear` on an xterm: home, then erase the whole screen. The log
+    /// goes with it — the screen, the scrollback and their times — and the
+    /// prompt that follows starts at the top of an empty terminal.
     #[test]
-    fn a_cleared_screen_stays_in_view_above_the_prompt() {
+    fn a_clear_from_the_device_wipes_the_log() {
         let mut terminal = terminal(20, 4);
         terminal.receive(b"one\r\ntwo\r\n", "1");
         terminal.receive(b"\x1b[H\x1b[2J$ ", "2");
         assert_eq!(
             rows(&terminal),
-            vec![stamped("1", "one"), stamped("1", "two"), stamped("2", "$"), plain("")]
+            vec![stamped("2", "$"), plain(""), plain(""), plain("")]
         );
-        assert_eq!(terminal.cursor_position(), Some((2, 2)));
+        assert_eq!(terminal.cursor_position(), Some((0, 2)));
         assert!(terminal.is_at_bottom());
+        // There is nothing above the prompt to scroll back to.
+        terminal.scroll(3);
+        assert!(terminal.is_at_bottom());
+        assert_eq!(rows(&terminal)[0], stamped("2", "$"));
         terminal.receive(b"ls\r\nREADME\r\n", "3");
         assert_eq!(
             rows(&terminal),
-            vec![stamped("1", "two"), stamped("2", "$ ls"), stamped("3", "README"), plain("")]
+            vec![stamped("2", "$ ls"), stamped("3", "README"), plain(""), plain("")]
         );
-        assert_eq!(terminal.cursor_position(), Some((3, 0)));
-        terminal.receive(b"$ ", "4");
-        terminal.receive(b"exit\r\n", "4");
-        assert_eq!(
-            rows(&terminal),
-            vec![stamped("2", "$ ls"), stamped("3", "README"), stamped("4", "$ exit"), plain("")]
-        );
-        assert!(terminal.is_at_bottom());
     }
 
-    /// The wheel moves through the lines above a cleared screen the way
-    /// it moves through any scrollback, and stops where the log ends.
+    /// The lines a clear took out of the scrollback stay out: the wheel
+    /// finds nothing above the prompt, and what comes after scrolls as any
+    /// log does.
     #[test]
-    fn a_cleared_screen_scrolls_like_the_rest_of_the_log() {
+    fn a_clear_empties_the_scrollback() {
         let mut terminal = terminal(20, 3);
         for index in 1..=6 {
             terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
-        terminal.receive(b"\x1b[H\x1b[2J", "7");
-        assert_eq!(
-            rows(&terminal),
-            vec![stamped("5", "line 5"), stamped("6", "line 6"), stamped("7", "")]
-        );
-        terminal.scroll(1);
-        assert!(!terminal.is_at_bottom());
-        assert_eq!(
-            rows(&terminal),
-            vec![stamped("4", "line 4"), stamped("5", "line 5"), stamped("6", "line 6")]
-        );
-        assert_eq!(terminal.cursor_position(), None);
-        terminal.scroll(-10);
-        assert!(terminal.is_at_bottom());
-        assert_eq!(rows(&terminal)[2], stamped("7", ""));
-        // A view scrolled back holds still while the screen fills below it.
         terminal.scroll(2);
-        terminal.receive(b"$ ok\r\n", "8");
-        assert_eq!(rows(&terminal)[0], stamped("3", "line 3"));
-        terminal.scroll_to_bottom();
-        assert_eq!(rows(&terminal)[1], stamped("7", "$ ok"));
+        assert!(!terminal.is_at_bottom());
+        terminal.receive(b"\x1b[H\x1b[2J", "7");
+        assert!(terminal.is_at_bottom());
+        assert_eq!(rows(&terminal), vec![stamped("7", ""), plain(""), plain("")]);
+        terminal.scroll(1);
+        assert_eq!(rows(&terminal), vec![stamped("7", ""), plain(""), plain("")]);
+        for index in 8..=11 {
+            terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
+        }
+        assert_eq!(rows(&terminal)[0], stamped("10", "line 10"));
+        terminal.scroll(10);
+        assert_eq!(
+            rows(&terminal),
+            vec![stamped("7", "line 8"), stamped("9", "line 9"), stamped("10", "line 10")]
+        );
     }
 
-    /// A view made taller after a clear shows more of the log; made
-    /// shorter, it keeps the bottom.
+    /// A view made taller shows more of the log, pulled back out of the
+    /// scrollback with its times; made shorter, it keeps the bottom.
     #[test]
     fn a_resized_view_keeps_the_bottom_of_the_log() {
         let mut terminal = terminal(20, 3);
         for index in 1..=6 {
             terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
-        terminal.receive(b"\x1b[H\x1b[2J$ ", "7");
+        terminal.receive(b"$ ", "7");
         terminal.resize(20, 5);
         assert_eq!(
             rows(&terminal),
@@ -988,26 +987,29 @@ mod tests {
         assert!(terminal.is_at_bottom());
     }
 
-    /// `clear` on a vt100: home, then erase to the end of the screen,
-    /// which would overwrite the screen in place. It is taken for the
-    /// clear it is, and the screen goes into the scrollback.
+    /// `clear` on a vt100: home, then erase to the end of the screen. From
+    /// the home position that is the whole screen, and it is taken for the
+    /// clear it is; from anywhere else it erases just what it says.
     #[test]
-    fn an_erase_from_the_top_keeps_the_screen() {
+    fn an_erase_from_the_top_is_a_clear() {
         let mut terminal = terminal(20, 3);
         terminal.receive(b"one\r\ntwo\r\n", "1");
         terminal.receive(b"\x1b[H\x1b[J$ ", "2");
-        assert_eq!(
-            rows(&terminal),
-            vec![stamped("1", "one"), stamped("1", "two"), stamped("2", "$")]
-        );
-        // From anywhere else it erases just what it says.
+        assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain(""), plain("")]);
         terminal.receive(b"abc\x1b[2D\x1b[J", "3");
-        assert_eq!(rows(&terminal)[2], stamped("2", "$ a"));
-        terminal.receive(b"\r\n", "3");
+        assert_eq!(rows(&terminal)[0], stamped("2", "$ a"));
+        terminal.receive(b"\r\nnext", "4");
         assert_eq!(
             rows(&terminal),
-            vec![stamped("1", "two"), stamped("2", "$ a"), plain("")]
+            vec![stamped("2", "$ a"), stamped("4", "next"), plain("")]
         );
+        // Below the cursor, from the top of a screen that has scrolled, is
+        // the whole screen again.
+        terminal.receive(b"\r\nmore\r\n", "5");
+        terminal.receive(b"\x1b[H\x1b[0J# ", "6");
+        assert_eq!(rows(&terminal), vec![stamped("6", "#"), plain(""), plain("")]);
+        terminal.scroll(5);
+        assert!(terminal.is_at_bottom());
     }
 
     #[test]
@@ -1017,25 +1019,56 @@ mod tests {
         terminal.receive(b"[", "2");
         assert_eq!(rows(&terminal)[0], stamped("1", "one"));
         terminal.receive(b"J$ ", "3");
-        assert_eq!(
-            rows(&terminal),
-            vec![stamped("1", "one"), stamped("1", "two"), stamped("1", "$")]
-        );
+        assert_eq!(rows(&terminal), vec![stamped("1", "$"), plain(""), plain("")]);
         // What is held back is only ever an erase in the making.
         terminal.receive(b"\x1b[1", "4");
         terminal.receive(b"mbold\x1b[0", "4");
         terminal.receive(b"m\r\n", "4");
         let content = terminal.render(&TerminalPalette::DARK, false);
-        assert_eq!(content.rows[1].text, "$ bold");
-        assert!(content.rows[1].runs.iter().any(|run| run.text == "bold" && run.style.bold));
+        assert_eq!(content.rows[0].text, "$ bold");
+        assert!(content.rows[0].runs.iter().any(|run| run.text == "bold" && run.style.bold));
     }
 
+    /// `ESC [ 3 J` on its own empties the scrollback and leaves the screen,
+    /// and the times of the lines on screen stay with them.
     #[test]
-    fn the_device_cannot_wipe_the_scrollback() {
+    fn the_device_can_empty_the_scrollback_alone() {
         let mut terminal = terminal(20, 2);
         terminal.receive(b"one\r\ntwo\r\n", "1");
-        terminal.receive(b"\x1b[H\x1b[2J\x1b[3J$ ", "2");
-        assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "$")]);
+        terminal.receive(b"three", "2");
+        terminal.scroll(1);
+        assert_eq!(rows(&terminal), vec![stamped("1", "one"), stamped("1", "two")]);
+        terminal.receive(b"\x1b[3J", "3");
+        assert!(terminal.is_at_bottom());
+        assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "three")]);
+        terminal.scroll(1);
+        assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "three")]);
+    }
+
+    /// `clear` as ncurses sends it to an xterm: home, the screen, and the
+    /// scrollback too. Nothing is left, in whichever reads it arrives.
+    #[test]
+    fn a_full_clear_leaves_nothing() {
+        let mut terminal = terminal(20, 2);
+        terminal.receive(b"one\r\ntwo\r\nthree\r\n", "1");
+        terminal.receive(b"\x1b[H\x1b[2J", "2");
+        terminal.receive(b"\x1b[3J$ ", "2");
+        assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain("")]);
+        terminal.scroll(1);
+        assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain("")]);
+    }
+
+    /// A full-screen program clears the alternate screen as it draws; the
+    /// log under it is untouched, and comes back when the program ends.
+    #[test]
+    fn the_alternate_screen_clears_itself_and_not_the_log() {
+        let mut terminal = terminal(20, 2);
+        terminal.receive(b"one\r\ntwo\r\n", "1");
+        terminal.receive(b"\x1b[?1049h\x1b[H\x1b[2Jmenu", "2");
+        assert_eq!(rows(&terminal)[0].1, "menu");
+        terminal.receive(b"\x1b[2J\x1b[3J", "3");
+        terminal.receive(b"\x1b[?1049l", "4");
+        assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "")]);
         terminal.scroll(1);
         assert_eq!(rows(&terminal), vec![stamped("1", "one"), stamped("1", "two")]);
     }
@@ -1053,7 +1086,7 @@ mod tests {
         terminal.receive(b"\x1b[H\x1b[2J$ ", "2");
         assert_eq!(
             rows(&terminal),
-            vec![stamped("1", "one"), stamped("2", "$"), plain(""), plain("")]
+            vec![stamped("2", "$"), plain(""), plain(""), plain("")]
         );
     }
 

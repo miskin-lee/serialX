@@ -2,6 +2,7 @@
 
 mod app_icon;
 mod app_menu;
+mod commands;
 mod configuration;
 mod controls;
 mod filter;
@@ -1070,6 +1071,16 @@ fn main() {
         });
         options.window_bounds = Some(WindowBounds::centered(size(px(1280.), px(800.)), cx));
         options.window_min_size = Some(size(px(960.), px(640.)));
+
+        // serialX is its one window: closing it — the red light on macOS,
+        // where an application would otherwise linger in the Dock with
+        // nothing to show — quits, ports and all.
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {

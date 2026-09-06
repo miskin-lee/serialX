@@ -1,8 +1,10 @@
-//! Groups of saved sessions: the folders the side panel files them under.
+//! Groups: the folders the side panel files saved sessions and commands
+//! under.
 //!
 //! A group is only a name, so one small prompt makes one or renames one. The
-//! session dialog opens the same prompt when none of the groups there are
-//! fits the session being made, and takes the new group as its pick.
+//! session dialog and the command dialog open the same prompt when none of
+//! the groups there are fits what is being saved, and take the new group as
+//! their pick.
 
 use std::rc::Rc;
 
@@ -15,6 +17,7 @@ use gpui_kit::*;
 use crate::SerialWorkspace;
 use crate::controls::dialog_footer;
 use crate::icons::{Glyph, icon_chip};
+use crate::presets::Library;
 use crate::theme::{LABEL, TITLE, Typography};
 
 /// Width of the prompt: a name, and a sentence about where it goes.
@@ -22,11 +25,11 @@ const PROMPT_WIDTH: f32 = 420.;
 /// Height of the name field, the same as the session dialog's fields.
 const FIELD_HEIGHT: f32 = 30.;
 
-/// What the prompt is for: a group there is not yet, or a new name for one
-/// there is.
+/// What the prompt is for: a group there is not yet, in one of the two
+/// libraries, or a new name for one there is.
 #[derive(Clone, Copy)]
 pub(crate) enum GroupPrompt {
-    New,
+    New(Library),
     Rename(u64),
 }
 
@@ -40,26 +43,40 @@ impl SerialWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current = match prompt {
-            GroupPrompt::New => None,
+        let (current, library) = match prompt {
+            GroupPrompt::New(library) => (None, library),
             GroupPrompt::Rename(id) => match self.presets.group(id) {
-                Some(group) => Some(group.name.clone()),
+                Some(group) => (Some(group.name.clone()), group.library),
                 // The group went while the button was under the pointer.
                 None => return,
             },
         };
         let palette = self.interface_theme.palette();
-        let (title, blurb, confirm) = match prompt {
-            GroupPrompt::New => (
+        let (title, blurb, confirm) = match (prompt, library) {
+            (GroupPrompt::New(_), Library::Sessions) => (
                 "New group",
                 "A folder in the saved sessions list. Pick it for a session in the session dialog.",
                 "Create Group",
             ),
-            GroupPrompt::Rename(_) => (
+            (GroupPrompt::New(_), Library::Commands) => (
+                "New group",
+                "A folder in the Quick send list. Pick it for a command as you save one.",
+                "Create Group",
+            ),
+            (GroupPrompt::Rename(_), Library::Sessions) => (
                 "Rename group",
                 "The sessions in it stay where they are.",
                 "Rename",
             ),
+            (GroupPrompt::Rename(_), Library::Commands) => (
+                "Rename group",
+                "The commands in it stay where they are.",
+                "Rename",
+            ),
+        };
+        let hue = match library {
+            Library::Sessions => palette.category_session,
+            Library::Commands => palette.category_command,
         };
 
         let input = cx.new(|cx| {
@@ -80,7 +97,7 @@ impl SerialWorkspace {
             alert
                 .width(px(PROMPT_WIDTH))
                 .p_5()
-                .icon(icon_chip(Glyph::Folder, palette.category_session, 36.))
+                .icon(icon_chip(Glyph::Folder, hue, 36.))
                 .title(
                     div()
                         .text_token(TITLE)
@@ -113,7 +130,9 @@ impl SerialWorkspace {
                     let saved = workspace
                         .update(cx, |workspace, cx| {
                             let id = match prompt {
-                                GroupPrompt::New => workspace.presets.add_group(&name),
+                                GroupPrompt::New(library) => {
+                                    workspace.presets.add_group(library, &name)
+                                }
                                 GroupPrompt::Rename(id) => {
                                     workspace.presets.rename_group(id, &name);
                                     Some(id)
@@ -144,7 +163,11 @@ impl SerialWorkspace {
     /// Unfolds the list down to a group, so one just made or renamed is in
     /// view.
     pub(crate) fn reveal_group(&mut self, id: u64) {
-        self.sessions_collapsed = false;
+        match self.presets.group(id).map(|group| group.library) {
+            Some(Library::Sessions) => self.sessions_collapsed = false,
+            Some(Library::Commands) => self.commands_collapsed = false,
+            None => return,
+        }
         self.collapsed_groups.remove(&id);
     }
 }

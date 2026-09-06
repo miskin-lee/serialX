@@ -49,7 +49,7 @@ use crate::controls::{
 };
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
-use crate::presets::{StoredGroup, StoredSession};
+use crate::presets::{Library, StoredGroup, StoredSession};
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
     BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TAG_HUE_COUNT, TITLE, TagColor, Typography,
@@ -490,7 +490,7 @@ impl SerialConfigurationEditor {
         let editor = cx.weak_entity();
         let _ = self.workspace.update(cx, |workspace, cx| {
             workspace.open_group_prompt(
-                GroupPrompt::New,
+                GroupPrompt::New(Library::Sessions),
                 move |group, _, cx| {
                     let _ = editor.update(cx, |editor, cx| editor.adopt_group(group, cx));
                 },
@@ -503,7 +503,12 @@ impl SerialConfigurationEditor {
     /// Takes the workspace's groups again and picks one of them.
     fn adopt_group(&mut self, group: u64, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
-            self.groups = workspace.read(cx).presets.groups.clone();
+            self.groups = workspace
+                .read(cx)
+                .presets
+                .groups_in(Library::Sessions)
+                .cloned()
+                .collect();
         }
         self.group = Some(group);
         cx.notify();
@@ -1238,12 +1243,17 @@ impl SerialWorkspace {
         // offered a colour no open tab wears, so the strip tells its sessions
         // apart from the start, and starts in no group.
         let (color, group) = match (target, saved) {
-            (ConfigurationTarget::SavedSession(_), Some(saved)) => {
-                (saved.color, self.presets.resolve_group(saved.group))
-            }
+            (ConfigurationTarget::SavedSession(_), Some(saved)) => (
+                saved.color,
+                self.presets.resolve_group(Library::Sessions, saved.group),
+            ),
             _ => (suggest_tag(self.tabs.iter().map(|tab| tab.color)), None),
         };
-        let groups = self.presets.groups.clone();
+        let groups = self
+            .presets
+            .groups_in(Library::Sessions)
+            .cloned()
+            .collect::<Vec<_>>();
         let workspace = cx.weak_entity();
         let editor = cx.new(|cx| {
             SerialConfigurationEditor::new(
@@ -1388,7 +1398,9 @@ impl SerialWorkspace {
                                 alias,
                                 group,
                             );
-                            if let Some(group) = workspace.presets.resolve_group(group) {
+                            if let Some(group) =
+                                workspace.presets.resolve_group(Library::Sessions, group)
+                            {
                                 workspace.reveal_group(group);
                             }
                             cx.notify();
@@ -1416,7 +1428,7 @@ impl SerialWorkspace {
         tab.configuration = configuration.sanitized();
         tab.color = color;
         tab.alias = alias;
-        tab.group = self.presets.resolve_group(group);
+        tab.group = self.presets.resolve_group(Library::Sessions, group);
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {

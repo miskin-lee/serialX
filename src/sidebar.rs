@@ -3,15 +3,16 @@
 //! Two stacked sections, each a header over a scrolling list of cards. Rows are
 //! cards rather than table lines so a saved item reads as an object you can act
 //! on, and every one is anchored by a coloured glyph in the manner of VS Code's
-//! Material Icon Theme: a command is green, and a session wears its own tag
-//! colour, so the card and the tab it opens match.
+//! Material Icon Theme: a command is a green prompt, and a session wears its
+//! own tag colour, so the card and the tab it opens match.
 //!
-//! Saved sessions file under groups — folders, each a row with a chevron over
-//! its cards, the way an explorer shows a directory — with the sessions in no
-//! group at the top level beneath them. A card opens on a double-click, as a
-//! session does in any session manager; a single click only picks it out, and
-//! its two buttons edit it and forget it, so nothing happens by a slip of the
-//! pointer.
+//! Both lists file under groups — folders, each a row with a chevron over
+//! its cards, the way an explorer shows a directory — with the cards in no
+//! group at the top level beneath them. A session card opens on a
+//! double-click, as a session does in any session manager; a single click
+//! only picks it out, and its two buttons edit it and forget it, so nothing
+//! happens by a slip of the pointer. A command card sends on a click, since
+//! sending is what it is for, and its two buttons edit and forget it too.
 //!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
@@ -36,10 +37,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_menu::SaveCurrentSession;
+use crate::commands::CommandTarget;
 use crate::controls::{Choice, ChoiceText, segmented, spaced_caps};
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, icon_chip};
-use crate::presets::{StoredCommand, StoredGroup, StoredSession};
+use crate::presets::{Library, StoredCommand, StoredGroup, StoredSession};
 use crate::theme::{
     CAPTION, EYEBROW, LABEL, MICRO, MONO_SMALL, TagColor, Typography, WorkbenchPalette, tint,
 };
@@ -100,13 +102,6 @@ const ROW_ACTION_REST: f32 = 0.35;
 const SELECTED_PLATE: f32 = 0.07;
 const SELECTED_RING: f32 = 0.55;
 
-/// Which of the two libraries a header or rail button stands for.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PanelSection {
-    Sessions,
-    Commands,
-}
-
 impl SerialWorkspace {
     pub(crate) fn save_active_session(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else {
@@ -130,7 +125,7 @@ impl SerialWorkspace {
         group: Option<u64>,
     ) {
         let label = format!("{} · {}", port_name, configuration.summary());
-        let group = self.presets.resolve_group(group);
+        let group = self.presets.resolve_group(Library::Sessions, group);
         self.presets
             .add_session(label, port_name, configuration, color, alias, group);
         self.sessions_collapsed = false;
@@ -176,7 +171,7 @@ impl SerialWorkspace {
         tab.configuration = saved.configuration.sanitized();
         tab.color = saved.color;
         tab.alias = saved.alias.clone();
-        tab.group = self.presets.resolve_group(saved.group);
+        tab.group = self.presets.resolve_group(Library::Sessions, saved.group);
         match tab
             .ports
             .iter()
@@ -220,21 +215,18 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    /// Removes a group. Its sessions stay, at the top of the list.
+    /// Removes a group. What it held stays, at the top of its list.
     fn remove_group(&mut self, group_id: u64, cx: &mut Context<Self>) {
         self.presets.remove_group(group_id);
         self.collapsed_groups.remove(&group_id);
         cx.notify();
     }
 
-    pub(crate) fn save_current_command(&mut self, cx: &mut Context<Self>) {
-        let value = self.send_input.read(cx).value().trim().to_string();
-        if value.is_empty() {
-            return;
-        }
-        self.presets.add_command(value);
-        self.commands_collapsed = false;
-        cx.notify();
+    /// Opens the command dialog on what the composer holds, so the line
+    /// can be kept under a name and in a group.
+    pub(crate) fn save_current_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.send_input.read(cx).value().to_string();
+        self.open_command_dialog(CommandTarget::New, &draft, window, cx);
     }
 
     fn send_saved_command(&mut self, command_id: u64, window: &mut Window, cx: &mut Context<Self>) {
@@ -265,28 +257,37 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    fn toggle_section(&mut self, section: PanelSection, cx: &mut Context<Self>) {
+    fn toggle_section(&mut self, section: Library, cx: &mut Context<Self>) {
         match section {
-            PanelSection::Sessions => self.sessions_collapsed = !self.sessions_collapsed,
-            PanelSection::Commands => self.commands_collapsed = !self.commands_collapsed,
+            Library::Sessions => self.sessions_collapsed = !self.sessions_collapsed,
+            Library::Commands => self.commands_collapsed = !self.commands_collapsed,
         }
         cx.notify();
     }
 
     /// Expands the panel with one section showing, for the rail buttons.
-    fn reveal_section(&mut self, section: PanelSection, cx: &mut Context<Self>) {
+    fn reveal_section(&mut self, section: Library, cx: &mut Context<Self>) {
         self.side_panel_collapsed = false;
         match section {
-            PanelSection::Sessions => self.sessions_collapsed = false,
-            PanelSection::Commands => self.commands_collapsed = false,
+            Library::Sessions => self.sessions_collapsed = false,
+            Library::Commands => self.commands_collapsed = false,
         }
         cx.notify();
     }
 
-    fn is_collapsed(&self, section: PanelSection) -> bool {
+    fn is_collapsed(&self, section: Library) -> bool {
         match section {
-            PanelSection::Sessions => self.sessions_collapsed,
-            PanelSection::Commands => self.commands_collapsed,
+            Library::Sessions => self.sessions_collapsed,
+            Library::Commands => self.commands_collapsed,
+        }
+    }
+
+    /// A library's glyph and colour: what its section chip, its rail
+    /// button, its group folders and its empty prompt are drawn in.
+    fn library_mark(palette: WorkbenchPalette, library: Library) -> (Glyph, u32) {
+        match library {
+            Library::Sessions => (Glyph::Bookmark, palette.category_session),
+            Library::Commands => (Glyph::Prompt, palette.category_command),
         }
     }
 
@@ -306,7 +307,7 @@ impl SerialWorkspace {
     /// thing to ask anyone to hit.
     fn section_header(
         &mut self,
-        section: PanelSection,
+        section: Library,
         title: &'static str,
         count: usize,
         action: Option<AnyElement>,
@@ -314,15 +315,12 @@ impl SerialWorkspace {
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.is_collapsed(section);
-        let (glyph, category) = match section {
-            PanelSection::Sessions => (Glyph::Bookmark, palette.category_session),
-            PanelSection::Commands => (Glyph::Run, palette.category_command),
-        };
+        let (glyph, category) = Self::library_mark(palette, section);
 
         h_flex()
             .id(match section {
-                PanelSection::Sessions => "sessions-header",
-                PanelSection::Commands => "commands-header",
+                Library::Sessions => "sessions-header",
+                Library::Commands => "commands-header",
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_section(section, cx);
@@ -563,9 +561,9 @@ impl SerialWorkspace {
         .into_any_element()
     }
 
-    /// A group's row: a chevron, a folder, its name, how many it holds, and
-    /// the buttons to rename and remove it. The row folds its cards away,
-    /// like a directory in an explorer.
+    /// A group's row: a chevron, a folder in its library's colour, its
+    /// name, how many it holds, and the buttons to rename and remove it.
+    /// The row folds its cards away, like a directory in an explorer.
     fn render_group_row(
         &mut self,
         group: &StoredGroup,
@@ -575,6 +573,11 @@ impl SerialWorkspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let group_id = group.id;
+        let (_, hue) = Self::library_mark(palette, group.library);
+        let remove_tooltip = match group.library {
+            Library::Sessions => "Remove this group · its sessions are kept",
+            Library::Commands => "Remove this group · its commands are kept",
+        };
 
         h_flex()
             .id(("saved-group", group_id as usize))
@@ -603,7 +606,7 @@ impl SerialWorkspace {
             .child(
                 Icon::new(Glyph::Folder)
                     .size(px(15.))
-                    .text_color(rgb(palette.category_session)),
+                    .text_color(rgb(hue)),
             )
             .child(
                 div()
@@ -634,7 +637,7 @@ impl SerialWorkspace {
                     Self::row_action(
                         ("remove-group", group_id as usize),
                         Glyph::Trash,
-                        "Remove this group · its sessions are kept",
+                        remove_tooltip,
                         cx.listener(move |this, _, _, cx| {
                             this.remove_group(group_id, cx);
                         }),
@@ -645,19 +648,14 @@ impl SerialWorkspace {
     }
 
     /// The cards of one group, set in from its row behind a guide line that
-    /// hangs from the chevron, so the eye can follow the group down.
+    /// hangs from the chevron, so the eye can follow the group down. An
+    /// empty group shows `empty` in place of cards.
     fn render_group_body(
-        &mut self,
         group_id: u64,
-        members: &[StoredSession],
+        cards: Vec<AnyElement>,
+        empty: &'static str,
         palette: WorkbenchPalette,
-        cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cards = members
-            .iter()
-            .map(|saved| self.render_session_card(saved, palette, cx))
-            .collect::<Vec<_>>();
-
         v_flex()
             .id(("saved-group-body", group_id as usize))
             .flex_none()
@@ -675,26 +673,47 @@ impl SerialWorkspace {
                         .px_2()
                         .text_token(CAPTION)
                         .text_color(rgb(palette.faint))
-                        .child("Empty · pick this group in a session's dialog"),
+                        .child(empty),
                 )
             })
             .children(cards)
             .into_any_element()
     }
 
+    /// The height a group takes in its list: its row, and its body while
+    /// it is unfolded.
+    fn group_height(count: usize, folded: bool) -> f32 {
+        GROUP_ROW_HEIGHT
+            + if folded {
+                0.
+            } else {
+                match count {
+                    0 => GROUP_EMPTY_HEIGHT,
+                    count => count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP,
+                }
+            }
+    }
+
+    /// The saved sessions, given the panel's height and how much of it Quick
+    /// send wants, so the list can take its share.
     fn render_saved_sessions(
         &mut self,
         has_active_tab: bool,
         panel_height: f32,
+        quick_send_need: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.sessions_collapsed;
         let total = self.presets.sessions.len();
-        let groups = self.presets.groups.clone();
+        let groups = self
+            .presets
+            .groups_in(Library::Sessions)
+            .cloned()
+            .collect::<Vec<_>>();
 
         let header = self.section_header(
-            PanelSection::Sessions,
+            Library::Sessions,
             "Sessions",
             total,
             Some(
@@ -709,7 +728,12 @@ impl SerialWorkspace {
                             .tooltip("New group")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.open_group_prompt(GroupPrompt::New, |_, _, _| {}, window, cx);
+                                this.open_group_prompt(
+                                    GroupPrompt::New(Library::Sessions),
+                                    |_, _, _| {},
+                                    window,
+                                    cx,
+                                );
                             })),
                     )
                     .child(
@@ -741,14 +765,19 @@ impl SerialWorkspace {
                 .collect::<Vec<_>>();
             let folded = self.collapsed_groups.contains(&group.id);
             rows.push(self.render_group_row(group, members.len(), folded, palette, cx));
-            content += GROUP_ROW_HEIGHT;
             if !folded {
-                rows.push(self.render_group_body(group.id, &members, palette, cx));
-                content += match members.len() {
-                    0 => GROUP_EMPTY_HEIGHT,
-                    count => count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP,
-                };
+                let cards = members
+                    .iter()
+                    .map(|saved| self.render_session_card(saved, palette, cx))
+                    .collect();
+                rows.push(Self::render_group_body(
+                    group.id,
+                    cards,
+                    "Empty · pick this group in a session's dialog",
+                    palette,
+                ));
             }
+            content += Self::group_height(members.len(), folded);
         }
         let loose = self.presets.sessions_in(None).cloned().collect::<Vec<_>>();
         for saved in &loose {
@@ -767,15 +796,6 @@ impl SerialWorkspace {
         // the rest of the panel instead, through the flex chain down from
         // the panel.
         let fills = !collapsed && self.commands_collapsed;
-        let commands = self.presets.commands.len();
-        let quick_send_need = SECTION_HEADER_HEIGHT
-            + match commands {
-                0 => EMPTY_HINT_HEIGHT,
-                count => {
-                    SEARCH_ROW_HEIGHT + count as f32 * CARD_HEIGHT + (count - 1) as f32 * LIST_GAP
-                }
-            }
-            + LIST_PAD_BOTTOM;
         let cap = (panel_height * SESSIONS_SHARE)
             .max(panel_height - quick_send_need)
             .round()
@@ -817,27 +837,156 @@ impl SerialWorkspace {
             || command.command.to_lowercase().contains(query)
     }
 
-    fn render_quick_send(&mut self, has_active_tab: bool, cx: &mut Context<Self>) -> AnyElement {
+    /// One saved command. A click sends it to the session in front; the
+    /// pencil edits it and the bin forgets it. A named command shows its
+    /// name over the line it sends; one without goes by the line alone.
+    fn render_command_card(
+        &mut self,
+        saved: &StoredCommand,
+        has_active_tab: bool,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let command_id = saved.id;
+        let alias = saved.alias().map(str::to_owned);
+        let command = saved.command.clone();
+
+        Self::row_card(
+            palette,
+            ("saved-command", command_id as usize),
+            "saved-command",
+        )
+        // Without a session there is nowhere to send, so the row states
+        // that rather than swallowing the click.
+        .when(!has_active_tab, |row| row.cursor_default().opacity(0.55))
+        .when(has_active_tab, |row| {
+            row.tooltip(|window, cx| Tooltip::new("Click to send").build(window, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.send_saved_command(command_id, window, cx);
+                }))
+        })
+        .child(icon_chip(Glyph::Prompt, palette.category_command, 28.))
+        .child(
+            v_flex()
+                .min_w_0()
+                .flex_1()
+                .when_some(alias, |body, alias| {
+                    body.child(
+                        div()
+                            .truncate()
+                            .text_token(LABEL)
+                            .text_color(rgb(palette.strong_foreground))
+                            .child(alias),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .ui_mono_token(MONO_SMALL)
+                            .text_color(rgb(palette.faint))
+                            .child(command.clone()),
+                    )
+                })
+                .when(saved.alias().is_none(), |body| {
+                    body.child(
+                        div()
+                            .truncate()
+                            .ui_mono_token(LABEL)
+                            .text_color(rgb(palette.strong_foreground))
+                            .child(command),
+                    )
+                }),
+        )
+        .child(Self::row_actions(
+            "saved-command",
+            vec![
+                Self::row_action(
+                    ("edit-command", command_id as usize),
+                    Glyph::Pencil,
+                    "Edit this command",
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_command_dialog(
+                            CommandTarget::Saved(command_id),
+                            "",
+                            window,
+                            cx,
+                        );
+                    }),
+                ),
+                Self::row_action(
+                    ("remove-command", command_id as usize),
+                    Glyph::Trash,
+                    "Forget this command",
+                    cx.listener(move |this, _, _, cx| {
+                        this.remove_saved_command(command_id, cx);
+                    }),
+                ),
+            ],
+        ))
+        .into_any_element()
+    }
+
+    /// Quick send: the header with its two buttons — a new group, a new
+    /// command — the search box, and the cards, filed under their groups
+    /// with the ones in none beneath. While a search is on, the cards that
+    /// answer it are listed flat, groups set aside, and the count is of
+    /// them. Returns the section and the height its rows want, for the
+    /// saved sessions to leave it.
+    fn render_quick_send(
+        &mut self,
+        has_active_tab: bool,
+        cx: &mut Context<Self>,
+    ) -> (AnyElement, f32) {
         let palette = self.interface_theme.palette();
         let collapsed = self.commands_collapsed;
         let query = self.command_query.clone();
         let searching = !query.is_empty();
         let total = self.presets.commands.len();
-        let saved_commands = self
-            .presets
-            .commands
-            .iter()
-            .filter(|command| Self::command_matches(command, &query))
-            .cloned()
-            .collect::<Vec<_>>();
-        let workspace = cx.weak_entity();
 
-        // While a search is on, the count is of what it found.
         let header = self.section_header(
-            PanelSection::Commands,
+            Library::Commands,
             "Quick send",
-            if searching { saved_commands.len() } else { total },
-            None,
+            if searching {
+                self.presets
+                    .commands
+                    .iter()
+                    .filter(|command| Self::command_matches(command, &query))
+                    .count()
+            } else {
+                total
+            },
+            Some(
+                h_flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Button::new("new-command-group")
+                            .ghost()
+                            .with_size(px(ROW_ACTION_SIZE))
+                            .icon(Glyph::FolderPlus)
+                            .tooltip("New group")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_group_prompt(
+                                    GroupPrompt::New(Library::Commands),
+                                    |_, _, _| {},
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new("new-command")
+                            .ghost()
+                            .with_size(px(ROW_ACTION_SIZE))
+                            .icon(IconName::Plus)
+                            .tooltip("New command")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_command_dialog(CommandTarget::New, "", window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            ),
             cx,
         );
         // The box sits over the list once there is something to search.
@@ -857,7 +1006,70 @@ impl SerialWorkspace {
             )
         });
 
-        v_flex()
+        // The rows' heights are summed as they are made, for the sessions
+        // list to know how much of the panel to leave.
+        let mut rows = Vec::new();
+        let mut content = 0.;
+        if searching {
+            let matches = self
+                .presets
+                .commands
+                .iter()
+                .filter(|command| Self::command_matches(command, &query))
+                .cloned()
+                .collect::<Vec<_>>();
+            for saved in &matches {
+                rows.push(self.render_command_card(saved, has_active_tab, palette, cx));
+                content += CARD_HEIGHT;
+            }
+        } else {
+            let groups = self
+                .presets
+                .groups_in(Library::Commands)
+                .cloned()
+                .collect::<Vec<_>>();
+            for group in &groups {
+                let members = self
+                    .presets
+                    .commands_in(Some(group.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let folded = self.collapsed_groups.contains(&group.id);
+                rows.push(self.render_group_row(group, members.len(), folded, palette, cx));
+                if !folded {
+                    let cards = members
+                        .iter()
+                        .map(|saved| self.render_command_card(saved, has_active_tab, palette, cx))
+                        .collect();
+                    rows.push(Self::render_group_body(
+                        group.id,
+                        cards,
+                        "Empty · pick this group as you save a command",
+                        palette,
+                    ));
+                }
+                content += Self::group_height(members.len(), folded);
+            }
+            let loose = self.presets.commands_in(None).cloned().collect::<Vec<_>>();
+            for saved in &loose {
+                rows.push(self.render_command_card(saved, has_active_tab, palette, cx));
+                content += CARD_HEIGHT;
+            }
+        }
+        let no_match = searching && rows.is_empty();
+        let content = if total == 0 {
+            EMPTY_HINT_HEIGHT
+        } else if no_match {
+            CARD_HEIGHT
+        } else {
+            content + rows.len().saturating_sub(1) as f32 * LIST_GAP
+        };
+        let need = SECTION_HEADER_HEIGHT
+            + if total > 0 { SEARCH_ROW_HEIGHT } else { 0. }
+            + content
+            + LIST_PAD_BOTTOM;
+
+        let section = v_flex()
             .when(!collapsed, |section| section.flex_1().min_h_0())
             .when(collapsed, |section| section.flex_none())
             .border_t_1()
@@ -875,12 +1087,12 @@ impl SerialWorkspace {
                         .when(total == 0, |list| {
                             list.child(Self::empty_hint(
                                 palette,
-                                Glyph::Run,
+                                Glyph::Prompt,
                                 "No saved commands yet",
-                                "Type a command below, then save it with the bookmark.",
+                                "Type a command below and keep it with the bookmark, or start one with +.",
                             ))
                         })
-                        .when(total > 0 && saved_commands.is_empty(), |list| {
+                        .when(no_match, |list| {
                             list.child(
                                 div()
                                     .h(px(CARD_HEIGHT))
@@ -892,63 +1104,11 @@ impl SerialWorkspace {
                                     .child("No command matches the search"),
                             )
                         })
-                        .children(saved_commands.into_iter().map(|saved| {
-                            let send_workspace = workspace.clone();
-                            let remove_workspace = workspace.clone();
-                            let command_id = saved.id;
-
-                            Self::row_card(
-                                palette,
-                                ("saved-command", command_id as usize),
-                                "saved-command",
-                            )
-                            // Without a session there is nowhere to send, so the
-                            // row states that rather than swallowing the click.
-                            .when(!has_active_tab, |row| row.cursor_default().opacity(0.55))
-                            .when(has_active_tab, |row| {
-                                row.on_click(move |_, window, cx| {
-                                    let _ = send_workspace.update(cx, |this, cx| {
-                                        this.send_saved_command(command_id, window, cx);
-                                    });
-                                })
-                            })
-                            .child(icon_chip(Glyph::Run, palette.category_command, 28.))
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_token(LABEL)
-                                            .text_color(rgb(palette.strong_foreground))
-                                            .child(saved.label),
-                                    )
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .ui_mono_token(MONO_SMALL)
-                                            .text_color(rgb(palette.faint))
-                                            .child(saved.command),
-                                    ),
-                            )
-                            .child(Self::row_actions(
-                                "saved-command",
-                                vec![Self::row_action(
-                                    ("remove-command", command_id as usize),
-                                    Glyph::Trash,
-                                    "Forget this command",
-                                    move |_, _, cx| {
-                                        let _ = remove_workspace.update(cx, |this, cx| {
-                                            this.remove_saved_command(command_id, cx);
-                                        });
-                                    },
-                                )],
-                            ))
-                        })),
+                        .children(rows),
                 )
             })
-            .into_any_element()
+            .into_any_element();
+        (section, need)
     }
 
     /// The UTF-8 / HEX switch: the same segmented rail the session dialog
@@ -1051,8 +1211,8 @@ impl SerialWorkspace {
                             .small()
                             .icon(Glyph::Bookmark)
                             .tooltip("Save this command to Quick send")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.save_current_command(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_current_command(window, cx);
                             })),
                     )
                     .child(
@@ -1073,19 +1233,18 @@ impl SerialWorkspace {
     /// One rail button: the section's glyph, with its count riding the corner.
     fn rail_button(
         &mut self,
-        section: PanelSection,
-        glyph: Glyph,
-        category: u32,
+        section: Library,
         tooltip: &'static str,
         count: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
+        let (glyph, category) = Self::library_mark(palette, section);
 
         div()
             .id(match section {
-                PanelSection::Sessions => "rail-sessions",
-                PanelSection::Commands => "rail-commands",
+                Library::Sessions => "rail-sessions",
+                Library::Commands => "rail-commands",
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.reveal_section(section, cx);
@@ -1135,22 +1294,8 @@ impl SerialWorkspace {
         let sessions = self.presets.sessions.len();
         let commands = self.presets.commands.len();
 
-        let sessions_button = self.rail_button(
-            PanelSection::Sessions,
-            Glyph::Bookmark,
-            palette.category_session,
-            "Saved sessions",
-            sessions,
-            cx,
-        );
-        let commands_button = self.rail_button(
-            PanelSection::Commands,
-            Glyph::Run,
-            palette.category_command,
-            "Quick send",
-            commands,
-            cx,
-        );
+        let sessions_button = self.rail_button(Library::Sessions, "Saved sessions", sessions, cx);
+        let commands_button = self.rail_button(Library::Commands, "Quick send", commands, cx);
 
         v_flex()
             .w(px(RAIL_WIDTH))
@@ -1181,10 +1326,15 @@ impl SerialWorkspace {
 
         let palette = self.interface_theme.palette();
         let has_active_tab = active_tab.is_some();
-        // The composer has the foot of the panel; the lists share the rest.
-        let sessions =
-            self.render_saved_sessions(has_active_tab, panel_height - COMPOSER_HEIGHT, cx);
-        let commands = self.render_quick_send(has_active_tab, cx);
+        // The composer has the foot of the panel; the lists share the rest,
+        // and Quick send says first how much of it its rows want.
+        let (commands, quick_send_need) = self.render_quick_send(has_active_tab, cx);
+        let sessions = self.render_saved_sessions(
+            has_active_tab,
+            panel_height - COMPOSER_HEIGHT,
+            quick_send_need,
+            cx,
+        );
         let composer = self.render_composer(active_tab.as_ref(), cx);
 
         // The width is the resizable panel's to set; the column fills it.

@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use crate::SerialConfiguration;
 use crate::theme::TagColor;
 
+/// Which of the side panel's two libraries a thing belongs to: the saved
+/// sessions, or the commands kept for Quick send. Groups are of one or the
+/// other, so a folder of sessions never turns up among the commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Library {
+    #[default]
+    Sessions,
+    Commands,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredSession {
     pub(crate) id: u64,
@@ -23,20 +34,37 @@ pub(crate) struct StoredSession {
     pub(crate) group: Option<u64>,
 }
 
-/// A folder in the saved sessions list. It is only a name: which sessions
-/// it holds is said by the sessions themselves, so a session moves by
-/// changing one field, and a group can go without taking anything with it.
+/// A folder in one of the lists. It is only a name: which sessions or
+/// commands it holds is said by those themselves, so one moves by changing
+/// one field, and a group can go without taking anything with it.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredGroup {
     pub(crate) id: u64,
     pub(crate) name: String,
+    /// Which list the folder is in. Absent in files written when only the
+    /// sessions had groups.
+    #[serde(default)]
+    pub(crate) library: Library,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct StoredCommand {
     pub(crate) id: u64,
+    /// What the card is headed: the name the command was given, or the
+    /// command itself when it was given none.
     pub(crate) label: String,
     pub(crate) command: String,
+    /// The group the command is filed under, by id; none leaves it at the
+    /// top of the list. Absent in files written before commands had groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) group: Option<u64>,
+}
+
+impl StoredCommand {
+    /// The name the command was given, or none when it goes by its text.
+    pub(crate) fn alias(&self) -> Option<&str> {
+        (self.label != self.command).then_some(self.label.as_str())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -82,7 +110,7 @@ impl PresetStore {
         alias: Option<String>,
         group: Option<u64>,
     ) {
-        let group = self.resolve_group(group);
+        let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.label == label) {
             saved.port_name = port_name;
             saved.configuration = configuration;
@@ -118,7 +146,7 @@ impl PresetStore {
         alias: Option<String>,
         group: Option<u64>,
     ) {
-        let group = self.resolve_group(group);
+        let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
             saved.label = format!("{} · {}", port_name, configuration.summary());
             saved.port_name = port_name;
@@ -130,21 +158,25 @@ impl PresetStore {
         }
     }
 
-    /// Makes a group, and says which it is. A name that is already a
-    /// group's names that group rather than a second one like it; a blank
-    /// name makes nothing.
-    pub(crate) fn add_group(&mut self, name: &str) -> Option<u64> {
+    /// Makes a group in a library, and says which it is. A name that is
+    /// already a group's there names that group rather than a second one
+    /// like it; a blank name makes nothing.
+    pub(crate) fn add_group(&mut self, library: Library, name: &str) -> Option<u64> {
         let name = name.trim();
         if name.is_empty() {
             return None;
         }
-        if let Some(group) = self.groups.iter().find(|group| group.name == name) {
+        if let Some(group) = self
+            .groups_in(library)
+            .find(|group| group.name == name)
+        {
             return Some(group.id);
         }
         let id = self.take_id();
         self.groups.push(StoredGroup {
             id,
             name: name.to_string(),
+            library,
         });
         self.persist();
         Some(id)
@@ -161,13 +193,18 @@ impl PresetStore {
         }
     }
 
-    /// Removes a group. The sessions in it are kept, and move to the top of
-    /// the list.
+    /// Removes a group. What was in it is kept, and moves to the top of its
+    /// list.
     pub(crate) fn remove_group(&mut self, id: u64) {
         self.groups.retain(|group| group.id != id);
         for session in &mut self.sessions {
             if session.group == Some(id) {
                 session.group = None;
+            }
+        }
+        for command in &mut self.commands {
+            if command.group == Some(id) {
+                command.group = None;
             }
         }
         self.persist();
@@ -177,11 +214,18 @@ impl PresetStore {
         self.groups.iter().find(|group| group.id == id)
     }
 
-    /// A group reference that points at a group there is: one that does not
-    /// — a group removed under an open tab, a hand-edited file — counts as
-    /// no group at all.
-    pub(crate) fn resolve_group(&self, group: Option<u64>) -> Option<u64> {
-        group.filter(|id| self.group(*id).is_some())
+    /// The groups of one library, in the order they were made.
+    pub(crate) fn groups_in(&self, library: Library) -> impl Iterator<Item = &StoredGroup> {
+        self.groups
+            .iter()
+            .filter(move |group| group.library == library)
+    }
+
+    /// A group reference that points at a group there is, in the library
+    /// it is meant for: one that does not — a group removed under an open
+    /// tab, a hand-edited file — counts as no group at all.
+    pub(crate) fn resolve_group(&self, library: Library, group: Option<u64>) -> Option<u64> {
+        group.filter(|id| self.group(*id).is_some_and(|group| group.library == library))
     }
 
     /// The sessions filed under a group, or, for none, the ones at the top
@@ -189,20 +233,86 @@ impl PresetStore {
     pub(crate) fn sessions_in(&self, group: Option<u64>) -> impl Iterator<Item = &StoredSession> {
         self.sessions
             .iter()
-            .filter(move |session| self.resolve_group(session.group) == group)
+            .filter(move |session| self.resolve_group(Library::Sessions, session.group) == group)
     }
 
-    pub(crate) fn add_command(&mut self, command: String) {
-        if command.is_empty() || self.commands.iter().any(|saved| saved.command == command) {
-            return;
+    /// The commands filed under a group, or, for none, the ones at the top
+    /// of the list.
+    pub(crate) fn commands_in(&self, group: Option<u64>) -> impl Iterator<Item = &StoredCommand> {
+        self.commands
+            .iter()
+            .filter(move |command| self.resolve_group(Library::Commands, command.group) == group)
+    }
+
+    pub(crate) fn command(&self, id: u64) -> Option<&StoredCommand> {
+        self.commands.iter().find(|command| command.id == id)
+    }
+
+    /// Keeps a command, under a name if it was given one, and says which
+    /// it is. The same command saved again into the same group is the one
+    /// card, renamed, rather than a second card that sends the same thing;
+    /// a blank command is nothing to keep.
+    pub(crate) fn add_command(
+        &mut self,
+        alias: Option<String>,
+        command: String,
+        group: Option<u64>,
+    ) -> Option<u64> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return None;
+        }
+        let group = self.resolve_group(Library::Commands, group);
+        let label = Self::command_label(alias, &command);
+        if let Some(saved) = self
+            .commands
+            .iter_mut()
+            .find(|saved| saved.command == command && saved.group == group)
+        {
+            saved.label = label;
+            let id = saved.id;
+            self.persist();
+            return Some(id);
         }
         let id = self.take_id();
         self.commands.push(StoredCommand {
             id,
-            label: command.clone(),
+            label,
             command,
+            group,
         });
         self.persist();
+        Some(id)
+    }
+
+    /// Changes a saved command: its name, its text, or where it is filed.
+    /// A blank command leaves the card as it was.
+    pub(crate) fn update_command(
+        &mut self,
+        id: u64,
+        alias: Option<String>,
+        command: String,
+        group: Option<u64>,
+    ) {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return;
+        }
+        let group = self.resolve_group(Library::Commands, group);
+        if let Some(saved) = self.commands.iter_mut().find(|saved| saved.id == id) {
+            saved.label = Self::command_label(alias, &command);
+            saved.command = command;
+            saved.group = group;
+            self.persist();
+        }
+    }
+
+    /// A card's heading: the name, or the command when the name is blank.
+    fn command_label(alias: Option<String>, command: &str) -> String {
+        match alias.map(|alias| alias.trim().to_string()) {
+            Some(alias) if !alias.is_empty() => alias,
+            _ => command.to_string(),
+        }
     }
 
     pub(crate) fn remove_command(&mut self, id: u64) {
@@ -250,6 +360,7 @@ fn default_commands() -> Vec<StoredCommand> {
         id,
         label: label.into(),
         command: command.into(),
+        group: None,
     })
     .collect()
 }
@@ -289,7 +400,7 @@ fn store_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PresetStore, TagColor};
+    use super::{Library, PresetStore, TagColor};
     use crate::SerialConfiguration;
 
     #[test]
@@ -345,7 +456,7 @@ mod tests {
     #[test]
     fn sessions_file_under_a_group_and_come_back_there() {
         let mut store = PresetStore::default();
-        let group = store.add_group("  Motor boards ").expect("a group");
+        let group = store.add_group(Library::Sessions, "  Motor boards ").expect("a group");
         assert_eq!(store.group(group).unwrap().name, "Motor boards");
 
         store.add_session(
@@ -384,10 +495,15 @@ mod tests {
     #[test]
     fn group_names_are_unique_and_never_blank() {
         let mut store = PresetStore::default();
-        let first = store.add_group("Sensors").unwrap();
-        assert_eq!(store.add_group("Sensors"), Some(first));
-        assert_eq!(store.add_group("   "), None);
+        let first = store.add_group(Library::Sessions, "Sensors").unwrap();
+        assert_eq!(store.add_group(Library::Sessions, "Sensors"), Some(first));
+        assert_eq!(store.add_group(Library::Sessions, "   "), None);
         assert_eq!(store.groups.len(), 1);
+        // The same name in the other library is another group.
+        let commands = store.add_group(Library::Commands, "Sensors").unwrap();
+        assert_ne!(commands, first);
+        assert_eq!(store.groups_in(Library::Sessions).count(), 1);
+        assert_eq!(store.groups_in(Library::Commands).count(), 1);
 
         store.rename_group(first, "Field sensors");
         assert_eq!(store.group(first).unwrap().name, "Field sensors");
@@ -400,7 +516,7 @@ mod tests {
     #[test]
     fn removing_a_group_keeps_its_sessions() {
         let mut store = PresetStore::default();
-        let group = store.add_group("Bench").unwrap();
+        let group = store.add_group(Library::Sessions, "Bench").unwrap();
         store.add_session(
             "/dev/tty.a · 115200 8N1".into(),
             "/dev/tty.a".into(),
@@ -425,6 +541,74 @@ mod tests {
             Some(999),
         );
         assert_eq!(store.sessions[1].group, None);
-        assert_eq!(store.resolve_group(Some(999)), None);
+        assert_eq!(store.resolve_group(Library::Sessions, Some(999)), None);
+        // Nor is a pointer at a group of the other library.
+        let commands = store.add_group(Library::Commands, "Bench").unwrap();
+        assert_eq!(store.resolve_group(Library::Sessions, Some(commands)), None);
+    }
+
+    /// A command is kept under the name it was given, or under its own
+    /// text; saved again into the same group it is renamed, not doubled.
+    #[test]
+    fn commands_are_named_and_not_doubled() {
+        let mut store = PresetStore::default();
+        let id = store
+            .add_command(Some(" Factory reset ".into()), " AT+RESTORE ".into(), None)
+            .expect("a command");
+        let saved = store.command(id).unwrap();
+        assert_eq!(
+            (saved.label.as_str(), saved.command.as_str()),
+            ("Factory reset", "AT+RESTORE")
+        );
+        assert_eq!(saved.alias(), Some("Factory reset"));
+
+        let again = store.add_command(None, "AT+RESTORE".into(), None);
+        assert_eq!(again, Some(id));
+        assert_eq!(store.command(id).unwrap().label, "AT+RESTORE");
+        assert_eq!(store.command(id).unwrap().alias(), None);
+        assert_eq!(store.add_command(Some("Blank".into()), "  ".into(), None), None);
+        assert_eq!(store.commands.len(), 4);
+        // A default card saved again under a name is that card, renamed.
+        let reset = store.add_command(Some("Reboot".into()), "AT+RST".into(), None);
+        assert_eq!(reset, Some(3));
+        assert_eq!(store.commands.len(), 4);
+        assert_eq!(store.command(3).unwrap().label, "Reboot");
+        assert!(!serde_json::to_string(&store).unwrap().contains(r#""group""#));
+    }
+
+    /// Commands file under groups of their own, and come back there; a
+    /// group removed leaves them at the top of the list.
+    #[test]
+    fn commands_file_under_their_own_groups() {
+        let mut store = PresetStore::default();
+        let bench = store.add_group(Library::Commands, "Bench").unwrap();
+        let sessions = store.add_group(Library::Sessions, "Bench").unwrap();
+        let id = store
+            .add_command(Some("Status".into()), "AT+STATUS?".into(), Some(bench))
+            .unwrap();
+        // The same command in another group is another card.
+        assert_ne!(store.commands[0].id, id);
+        let stray = store
+            .add_command(None, "AT+GMR".into(), Some(sessions))
+            .unwrap();
+        assert_eq!(store.command(stray).unwrap().group, None);
+
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains(r#""library":"commands""#));
+        let restored: PresetStore = serde_json::from_str(&json).unwrap();
+        let in_bench: Vec<_> = restored
+            .commands_in(Some(bench))
+            .map(|command| command.label.as_str())
+            .collect();
+        assert_eq!(in_bench, ["Status"]);
+        assert_eq!(restored.commands_in(None).count(), 4);
+
+        let mut store = restored;
+        store.update_command(id, None, "AT+STATUS?".into(), None);
+        assert_eq!(store.command(id).unwrap().label, "AT+STATUS?");
+        store.update_command(id, Some("Status".into()), "AT+STATUS?".into(), Some(bench));
+        store.remove_group(bench);
+        assert_eq!(store.command(id).unwrap().group, None);
+        assert_eq!(store.commands_in(None).count(), 5);
     }
 }

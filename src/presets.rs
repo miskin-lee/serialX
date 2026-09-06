@@ -73,7 +73,7 @@ pub(crate) struct PresetStore {
     pub(crate) sessions: Vec<StoredSession>,
     #[serde(default)]
     pub(crate) groups: Vec<StoredGroup>,
-    #[serde(default = "default_commands")]
+    #[serde(default)]
     pub(crate) commands: Vec<StoredCommand>,
     #[serde(default = "default_next_id")]
     next_id: u64,
@@ -84,7 +84,7 @@ impl Default for PresetStore {
         Self {
             sessions: Vec::new(),
             groups: Vec::new(),
-            commands: default_commands(),
+            commands: Vec::new(),
             next_id: default_next_id(),
         }
     }
@@ -98,7 +98,31 @@ impl PresetStore {
         let Ok(content) = fs::read_to_string(path) else {
             return Self::default();
         };
-        serde_json::from_str(&content).unwrap_or_default()
+        let mut store: Self = serde_json::from_str(&content).unwrap_or_default();
+        if store.shed_seed_commands() {
+            store.persist();
+        }
+        store
+    }
+
+    /// Drops the commands a store used to be seeded with, so a workbench
+    /// that still carries them comes up as clean as a new one does now. A
+    /// seed is known by its id — the first hundred were kept for them, and
+    /// the user's own start past that — and by still saying what it was
+    /// made to say, at the top of the list: one renamed, rewritten or
+    /// filed under a group is the user's now, and stays. Says whether
+    /// anything went.
+    fn shed_seed_commands(&mut self) -> bool {
+        let before = self.commands.len();
+        self.commands.retain(|command| {
+            !SEED_COMMANDS.iter().any(|(id, label, text)| {
+                command.id == *id
+                    && command.label == *label
+                    && command.command == *text
+                    && command.group.is_none()
+            })
+        });
+        self.commands.len() != before
     }
 
     pub(crate) fn add_session(
@@ -345,25 +369,21 @@ impl PresetStore {
     }
 }
 
+/// Ids the user's own things start from. The ones below were the seed
+/// commands', and are still left to them so a store that carries them can
+/// tell them apart; see `shed_seed_commands`.
 fn default_next_id() -> u64 {
     100
 }
 
-fn default_commands() -> Vec<StoredCommand> {
-    [
-        (1, "Status", "AT+STATUS?"),
-        (2, "Version", "AT+VERSION?"),
-        (3, "Reset", "AT+RST"),
-    ]
-    .into_iter()
-    .map(|(id, label, command)| StoredCommand {
-        id,
-        label: label.into(),
-        command: command.into(),
-        group: None,
-    })
-    .collect()
-}
+/// What every store began with through 0.1.6: three AT lines, under ids
+/// below the hundred the user's own start from. Nothing starts with them
+/// now; they are kept only so a store that still holds them can shed them.
+const SEED_COMMANDS: [(u64, &str, &str); 3] = [
+    (1, "Status", "AT+STATUS?"),
+    (2, "Version", "AT+VERSION?"),
+    (3, "Reset", "AT+RST"),
+];
 
 /// Where the workspace file lives, per platform. None under `cargo test`, so
 /// a test that saves a preset exercises the store without touching the file
@@ -407,9 +427,33 @@ mod tests {
     fn default_presets_round_trip() {
         let json = serde_json::to_string(&PresetStore::default()).unwrap();
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.commands.len(), 3);
-        assert_eq!(restored.commands[0].command, "AT+STATUS?");
+        assert!(restored.sessions.is_empty());
         assert!(restored.groups.is_empty());
+        assert!(restored.commands.is_empty(), "a new store starts empty");
+        assert_eq!(restored.next_id, 100);
+    }
+
+    /// A store written while Quick send was seeded still holds the three AT
+    /// lines. Loading sheds the ones left as they were; one the user renamed,
+    /// rewrote or filed away is theirs, and so is anything they made.
+    #[test]
+    fn seed_commands_are_shed_and_the_users_kept() {
+        let json = r#"{"sessions":[],"groups":[{"id":50,"name":"Bench","library":"commands"}],
+            "commands":[
+                {"id":1,"label":"Status","command":"AT+STATUS?"},
+                {"id":2,"label":"Firmware","command":"AT+VERSION?"},
+                {"id":3,"label":"Reset","command":"AT+RST","group":50},
+                {"id":101,"label":"ls -la","command":"ls -la"}],
+            "next_id":103}"#;
+        let mut store: PresetStore = serde_json::from_str(json).unwrap();
+        assert!(store.shed_seed_commands());
+        let kept = store
+            .commands
+            .iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert_eq!(kept, [2, 3, 101]);
+        assert!(!store.shed_seed_commands(), "a second pass finds nothing");
     }
 
     /// A session saved before tags existed has no `color` field and has to
@@ -567,12 +611,15 @@ mod tests {
         assert_eq!(store.command(id).unwrap().label, "AT+RESTORE");
         assert_eq!(store.command(id).unwrap().alias(), None);
         assert_eq!(store.add_command(Some("Blank".into()), "  ".into(), None), None);
-        assert_eq!(store.commands.len(), 4);
-        // A default card saved again under a name is that card, renamed.
-        let reset = store.add_command(Some("Reboot".into()), "AT+RST".into(), None);
-        assert_eq!(reset, Some(3));
-        assert_eq!(store.commands.len(), 4);
-        assert_eq!(store.command(3).unwrap().label, "Reboot");
+        assert_eq!(store.commands.len(), 1);
+        // A card saved again under a name is that card, renamed.
+        let reset = store.add_command(None, "AT+RST".into(), None).unwrap();
+        assert_eq!(
+            store.add_command(Some("Reboot".into()), "AT+RST".into(), None),
+            Some(reset)
+        );
+        assert_eq!(store.commands.len(), 2);
+        assert_eq!(store.command(reset).unwrap().label, "Reboot");
         assert!(!serde_json::to_string(&store).unwrap().contains(r#""group""#));
     }
 
@@ -583,11 +630,14 @@ mod tests {
         let mut store = PresetStore::default();
         let bench = store.add_group(Library::Commands, "Bench").unwrap();
         let sessions = store.add_group(Library::Sessions, "Bench").unwrap();
+        let loose = store
+            .add_command(Some("Status".into()), "AT+STATUS?".into(), None)
+            .unwrap();
         let id = store
             .add_command(Some("Status".into()), "AT+STATUS?".into(), Some(bench))
             .unwrap();
         // The same command in another group is another card.
-        assert_ne!(store.commands[0].id, id);
+        assert_ne!(loose, id);
         let stray = store
             .add_command(None, "AT+GMR".into(), Some(sessions))
             .unwrap();
@@ -601,7 +651,7 @@ mod tests {
             .map(|command| command.label.as_str())
             .collect();
         assert_eq!(in_bench, ["Status"]);
-        assert_eq!(restored.commands_in(None).count(), 4);
+        assert_eq!(restored.commands_in(None).count(), 2);
 
         let mut store = restored;
         store.update_command(id, None, "AT+STATUS?".into(), None);
@@ -609,6 +659,6 @@ mod tests {
         store.update_command(id, Some("Status".into()), "AT+STATUS?".into(), Some(bench));
         store.remove_group(bench);
         assert_eq!(store.command(id).unwrap().group, None);
-        assert_eq!(store.commands_in(None).count(), 5);
+        assert_eq!(store.commands_in(None).count(), 3);
     }
 }

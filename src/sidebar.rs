@@ -13,6 +13,9 @@
 //! only picks it out, and its two buttons edit it and forget it, so nothing
 //! happens by a slip of the pointer. A command card sends on a click, since
 //! sending is what it is for, and its two buttons edit and forget it too.
+//! New things come from a right-click, on a section's header or anywhere in
+//! its list: the menu offers what the section can be given — the session in
+//! front, a command, a group — so the headers carry no buttons of their own.
 //!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
@@ -32,6 +35,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     input::Input,
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
@@ -314,11 +318,14 @@ impl SerialWorkspace {
     }
 
     /// A library's glyph and colour: what its section chip, its rail
-    /// button, its group folders and its empty prompt are drawn in.
+    /// button and its group folders are drawn in. Quick send takes the
+    /// paper plane, for what the section does, and leaves the prompt to
+    /// the cards, for what they are — a header that wore the cards' own
+    /// glyph read as one more of them.
     fn library_mark(palette: WorkbenchPalette, library: Library) -> (Glyph, u32) {
         match library {
             Library::Sessions => (Glyph::Bookmark, palette.category_session),
-            Library::Commands => (Glyph::Prompt, palette.category_command),
+            Library::Commands => (Glyph::Send, palette.category_command),
         }
     }
 
@@ -330,9 +337,72 @@ impl SerialWorkspace {
             .any(|tab| tab.selected_port().name == port_name)
     }
 
+    /// What a right-click in a section offers: the things the section can
+    /// be given. For the saved sessions, the tab in front — under the same
+    /// action as the menu bar's Save Session, so the shortcut shows — and a
+    /// group; for Quick send, a command and a group. The one menu goes on
+    /// the section's header and on its list, so a click on either, or on
+    /// the space under the last card, finds it.
+    fn library_menu(
+        &self,
+        library: Library,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let workspace = cx.weak_entity();
+        move |menu, _, cx| {
+            let menu = match library {
+                Library::Sessions => {
+                    // Read at the time of the click, not of the last render,
+                    // so the item is right about whether there is a tab.
+                    let has_active_tab = workspace
+                        .update(cx, |this, _| this.active_tab().is_some())
+                        .unwrap_or(false);
+                    menu.item(
+                        PopupMenuItem::new("Save the active session")
+                            .icon(Icon::new(IconName::Plus))
+                            .action(Box::new(SaveCurrentSession))
+                            .disabled(!has_active_tab),
+                    )
+                }
+                Library::Commands => {
+                    let workspace = workspace.clone();
+                    menu.item(
+                        PopupMenuItem::new("New command…")
+                            .icon(Icon::new(IconName::Plus))
+                            .on_click(move |_, window, cx| {
+                                let _ = workspace.update(cx, |this, cx| {
+                                    this.open_command_dialog(
+                                        CommandTarget::New,
+                                        "",
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                }
+            };
+            let workspace = workspace.clone();
+            menu.separator().item(
+                PopupMenuItem::new("New group…")
+                    .icon(Icon::new(Glyph::FolderPlus))
+                    .on_click(move |_, window, cx| {
+                        let _ = workspace.update(cx, |this, cx| {
+                            this.open_group_prompt(
+                                GroupPrompt::New(library),
+                                |_, _, _| {},
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+            )
+        }
+    }
+
     /// A section header: a disclosure chevron, the section's chip in its
     /// colour, the title in tracked small caps the way an explorer names
-    /// its views, a count, an action.
+    /// its views, a count. A right-click on it opens the section's menu.
     ///
     /// The whole strip is the disclosure target — a 12px chevron is a poor
     /// thing to ask anyone to hit.
@@ -341,12 +411,12 @@ impl SerialWorkspace {
         section: Library,
         title: &'static str,
         count: usize,
-        action: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let collapsed = self.is_collapsed(section);
         let (glyph, category) = Self::library_mark(palette, section);
+        let menu = self.library_menu(section, cx);
 
         h_flex()
             .id(match section {
@@ -359,9 +429,6 @@ impl SerialWorkspace {
             .h(px(SECTION_HEADER_HEIGHT))
             .flex_none()
             .px_2()
-            .pr_1p5()
-            .gap_1()
-            .justify_between()
             .cursor_pointer()
             .hover(|header| header.bg(rgb(palette.hover)))
             .child(
@@ -387,7 +454,7 @@ impl SerialWorkspace {
                     )
                     .child(Self::count_pill(palette, count)),
             )
-            .children(action)
+            .context_menu(menu)
             .into_any_element()
     }
 
@@ -729,7 +796,6 @@ impl SerialWorkspace {
     /// send wants, so the list can take its share.
     fn render_saved_sessions(
         &mut self,
-        has_active_tab: bool,
         panel_height: f32,
         quick_send_need: f32,
         cx: &mut Context<Self>,
@@ -743,46 +809,8 @@ impl SerialWorkspace {
             .cloned()
             .collect::<Vec<_>>();
 
-        let header = self.section_header(
-            Library::Sessions,
-            "Sessions",
-            total,
-            Some(
-                h_flex()
-                    .items_center()
-                    .gap_0p5()
-                    .child(
-                        Button::new("new-session-group")
-                            .ghost()
-                            .with_size(px(ROW_ACTION_SIZE))
-                            .icon(Glyph::FolderPlus)
-                            .tooltip("New group")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_group_prompt(
-                                    GroupPrompt::New(Library::Sessions),
-                                    |_, _, _| {},
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("save-active-session")
-                            .ghost()
-                            .with_size(px(ROW_ACTION_SIZE))
-                            .icon(IconName::Plus)
-                            .tooltip_with_action("Save the active session", &SaveCurrentSession, None)
-                            .disabled(!has_active_tab)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.save_active_session(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            ),
-            cx,
-        );
+        let header = self.section_header(Library::Sessions, "Sessions", total, cx);
+        let menu = self.library_menu(Library::Sessions, cx);
 
         // Groups first, each over its cards, then the sessions in none. The
         // rows' heights are summed as they are made, for the list's own.
@@ -851,10 +879,11 @@ impl SerialWorkspace {
                                 palette,
                                 Glyph::Bookmark,
                                 "No saved sessions yet",
-                                "Save the active session with +, or start a group with the folder.",
+                                "Right-click here to save the active session, or to start a group.",
                             ))
                         })
-                        .children(rows),
+                        .children(rows)
+                        .context_menu(menu),
                 )
             })
             .into_any_element()
@@ -956,12 +985,11 @@ impl SerialWorkspace {
         .into_any_element()
     }
 
-    /// Quick send: the header with its two buttons — a new group, a new
-    /// command — the search box, and the cards, filed under their groups
-    /// with the ones in none beneath. While a search is on, the cards that
-    /// answer it are listed flat, groups set aside, and the count is of
-    /// them. Returns the section and the height its rows want, for the
-    /// saved sessions to leave it.
+    /// Quick send: the header, the search box, and the cards, filed under
+    /// their groups with the ones in none beneath. While a search is on,
+    /// the cards that answer it are listed flat, groups set aside, and the
+    /// count is of them. Returns the section and the height its rows want,
+    /// for the saved sessions to leave it.
     fn render_quick_send(
         &mut self,
         has_active_tab: bool,
@@ -985,41 +1013,9 @@ impl SerialWorkspace {
             } else {
                 total
             },
-            Some(
-                h_flex()
-                    .items_center()
-                    .gap_0p5()
-                    .child(
-                        Button::new("new-command-group")
-                            .ghost()
-                            .with_size(px(ROW_ACTION_SIZE))
-                            .icon(Glyph::FolderPlus)
-                            .tooltip("New group")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_group_prompt(
-                                    GroupPrompt::New(Library::Commands),
-                                    |_, _, _| {},
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        Button::new("new-command")
-                            .ghost()
-                            .with_size(px(ROW_ACTION_SIZE))
-                            .icon(IconName::Plus)
-                            .tooltip("New command")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_command_dialog(CommandTarget::New, "", window, cx);
-                            })),
-                    )
-                    .into_any_element(),
-            ),
             cx,
         );
+        let menu = self.library_menu(Library::Commands, cx);
         // The box sits over the list once there is something to search.
         let search = (total > 0).then(|| {
             div().flex_none().px_2().pb_2().child(
@@ -1120,7 +1116,7 @@ impl SerialWorkspace {
                                 palette,
                                 Glyph::Prompt,
                                 "No saved commands yet",
-                                "Type a command below and keep it with the bookmark, or start one with +.",
+                                "Type a command below and keep it with the bookmark, or right-click here to start one.",
                             ))
                         })
                         .when(no_match, |list| {
@@ -1135,7 +1131,8 @@ impl SerialWorkspace {
                                     .child("No command matches the search"),
                             )
                         })
-                        .children(rows),
+                        .children(rows)
+                        .context_menu(menu),
                 )
             })
             .into_any_element();
@@ -1360,12 +1357,8 @@ impl SerialWorkspace {
         // The composer has the foot of the panel; the lists share the rest,
         // and Quick send says first how much of it its rows want.
         let (commands, quick_send_need) = self.render_quick_send(has_active_tab, cx);
-        let sessions = self.render_saved_sessions(
-            has_active_tab,
-            panel_height - COMPOSER_HEIGHT,
-            quick_send_need,
-            cx,
-        );
+        let sessions =
+            self.render_saved_sessions(panel_height - COMPOSER_HEIGHT, quick_send_need, cx);
         let composer = self.render_composer(active_tab.as_ref(), cx);
 
         // The width is the resizable panel's to set; the column fills it.

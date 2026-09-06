@@ -237,7 +237,7 @@ impl SerialWorkspace {
 
     /// The accent-tinted pill a switched-on control wears: a wash of the
     /// accent rather than a solid fill, so it reads as on without shouting.
-    fn accent_pill(palette: WorkbenchPalette, cx: &App) -> ButtonCustomVariant {
+    pub(crate) fn accent_pill(palette: WorkbenchPalette, cx: &App) -> ButtonCustomVariant {
         ButtonCustomVariant::new(cx)
             .color(tint(palette.accent, 0.14).into())
             .foreground(rgb(palette.accent).into())
@@ -344,7 +344,8 @@ impl SerialWorkspace {
 
     /// One of the two switches inside the box, drawn like the toggles in VS
     /// Code's find widget: a bare glyph that takes the accent when it is on.
-    fn filter_switch(
+    /// The side panel's search boxes borrow it for their `Aa`.
+    pub(crate) fn filter_switch(
         id: impl Into<ElementId>,
         glyph: &'static str,
         on: bool,

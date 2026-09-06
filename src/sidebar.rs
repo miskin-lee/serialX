@@ -13,9 +13,11 @@
 //! only picks it out, and its two buttons edit it and forget it, so nothing
 //! happens by a slip of the pointer. A command card sends on a click, since
 //! sending is what it is for, and its two buttons edit and forget it too.
-//! New things come from a right-click, on a section's header or anywhere in
-//! its list: the menu offers what the section can be given — the session in
-//! front, a command, a group — so the headers carry no buttons of their own.
+//! A group comes from a right-click, on a section's header or anywhere in
+//! its list; the session in front is saved from the Session menu, and a
+//! command from the composer's bookmark, so the headers carry no buttons of
+//! their own. Each list has a search box over it once it holds anything,
+//! with the title bar filter's `Aa` switch for a search that minds case.
 //!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
@@ -34,7 +36,7 @@ use gpui_kit::component::{
     Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     h_flex,
-    input::Input,
+    input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
     tooltip::Tooltip,
@@ -43,7 +45,6 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_menu::SaveCurrentSession;
 use crate::commands::CommandTarget;
 use crate::controls::{Choice, ChoiceText, segmented, spaced_caps};
 use crate::groups::GroupPrompt;
@@ -68,11 +69,13 @@ const DIVIDER_LIT_WIDTH: f32 = 3.;
 const RAIL_WIDTH: f32 = 52.;
 /// The chip beside a section's title, in the section's colour.
 const SECTION_CHIP: f32 = 20.;
-/// The search box over the Quick send list, and the row it sits in.
-const SEARCH_HEIGHT: f32 = 26.;
-const SEARCH_ROW_HEIGHT: f32 = 34.;
-/// What the search box says while it is empty.
-pub(crate) const COMMAND_SEARCH_PLACEHOLDER: &str = "Search commands";
+/// The search box over a list — the height of the title bar's filter box,
+/// the same kind of thing — and the row it sits in with the air under it.
+const SEARCH_HEIGHT: f32 = 28.;
+const SEARCH_ROW_HEIGHT: f32 = 36.;
+/// What the search boxes say while they are empty.
+const SESSION_SEARCH_PLACEHOLDER: &str = "Search sessions";
+const COMMAND_SEARCH_PLACEHOLDER: &str = "Search commands";
 /// Height of the composer at the panel's foot: the box, the row of switches
 /// under it, and the air around them.
 const COMPOSER_HEIGHT: f32 = 82.;
@@ -137,7 +140,91 @@ pub(crate) fn panel_divider(palette: WorkbenchPalette) -> ResizeHandleRenderer {
     )
 }
 
+/// The search box over a list: what it says, and how that is read. The text
+/// is kept as typed and folded at match time, unless the box's `Aa` switch
+/// is on — the same switch, meaning the same, as in the title bar's filter.
+pub(crate) struct ListSearch {
+    pub(crate) input: Entity<InputState>,
+    _subscription: Subscription,
+    pub(crate) query: String,
+    pub(crate) match_case: bool,
+}
+
+impl ListSearch {
+    /// Makes the box for one library, and keeps `query` at what it says.
+    pub(crate) fn new(
+        library: Library,
+        window: &mut Window,
+        cx: &mut Context<SerialWorkspace>,
+    ) -> Self {
+        let placeholder = match library {
+            Library::Sessions => SESSION_SEARCH_PLACEHOLDER,
+            Library::Commands => COMMAND_SEARCH_PLACEHOLDER,
+        };
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(placeholder)
+                .clean_on_escape()
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.search_mut(library).query = input.read(cx).value().trim().to_string();
+                    cx.notify();
+                }
+            },
+        );
+        Self {
+            input,
+            _subscription: subscription,
+            query: String::new(),
+            match_case: false,
+        }
+    }
+
+    fn searching(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    /// Whether `text` holds what the box says.
+    fn matches(&self, text: &str) -> bool {
+        contains_query(text, &self.query, self.match_case)
+    }
+}
+
+/// Whether `text` holds `query`: as written when case matters, and with both
+/// folded when it does not. An empty query is held by anything.
+fn contains_query(text: &str, query: &str, match_case: bool) -> bool {
+    if match_case {
+        text.contains(query)
+    } else {
+        text.to_lowercase().contains(&query.to_lowercase())
+    }
+}
+
 impl SerialWorkspace {
+    fn search(&self, library: Library) -> &ListSearch {
+        match library {
+            Library::Sessions => &self.session_search,
+            Library::Commands => &self.command_search,
+        }
+    }
+
+    pub(crate) fn search_mut(&mut self, library: Library) -> &mut ListSearch {
+        match library {
+            Library::Sessions => &mut self.session_search,
+            Library::Commands => &mut self.command_search,
+        }
+    }
+
+    fn toggle_search_case(&mut self, library: Library, cx: &mut Context<Self>) {
+        let search = self.search_mut(library);
+        search.match_case = !search.match_case;
+        cx.notify();
+    }
+
     pub(crate) fn save_active_session(&mut self, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -337,53 +424,19 @@ impl SerialWorkspace {
             .any(|tab| tab.selected_port().name == port_name)
     }
 
-    /// What a right-click in a section offers: the things the section can
-    /// be given. For the saved sessions, the tab in front — under the same
-    /// action as the menu bar's Save Session, so the shortcut shows — and a
-    /// group; for Quick send, a command and a group. The one menu goes on
-    /// the section's header and on its list, so a click on either, or on
-    /// the space under the last card, finds it.
+    /// What a right-click in a section offers: a new group, the one thing
+    /// a section can be given that nothing else in the window makes. The
+    /// one menu goes on the section's header and on its list, so a click
+    /// on either, or on the space under the last card, finds it.
     fn library_menu(
         &self,
         library: Library,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let workspace = cx.weak_entity();
-        move |menu, _, cx| {
-            let menu = match library {
-                Library::Sessions => {
-                    // Read at the time of the click, not of the last render,
-                    // so the item is right about whether there is a tab.
-                    let has_active_tab = workspace
-                        .update(cx, |this, _| this.active_tab().is_some())
-                        .unwrap_or(false);
-                    menu.item(
-                        PopupMenuItem::new("Save the active session")
-                            .icon(Icon::new(IconName::Plus))
-                            .action(Box::new(SaveCurrentSession))
-                            .disabled(!has_active_tab),
-                    )
-                }
-                Library::Commands => {
-                    let workspace = workspace.clone();
-                    menu.item(
-                        PopupMenuItem::new("New command…")
-                            .icon(Icon::new(IconName::Plus))
-                            .on_click(move |_, window, cx| {
-                                let _ = workspace.update(cx, |this, cx| {
-                                    this.open_command_dialog(
-                                        CommandTarget::New,
-                                        "",
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }),
-                    )
-                }
-            };
+        move |menu, _, _| {
             let workspace = workspace.clone();
-            menu.separator().item(
+            menu.item(
                 PopupMenuItem::new("New group…")
                     .icon(Icon::new(Glyph::FolderPlus))
                     .on_click(move |_, window, cx| {
@@ -398,6 +451,48 @@ impl SerialWorkspace {
                     }),
             )
         }
+    }
+
+    /// The search box over a list: a pill with the glass, the text, and the
+    /// `Aa` switch borrowed from the title bar's filter box, for a search
+    /// that minds case. Escape and the cross clear it.
+    fn render_search_box(&mut self, library: Library, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let search = self.search(library);
+        let (input, match_case) = (search.input.clone(), search.match_case);
+        let switch = Self::filter_switch(
+            match library {
+                Library::Sessions => "sessions-match-case",
+                Library::Commands => "commands-match-case",
+            },
+            "Aa",
+            match_case,
+            "Match case",
+            palette,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.toggle_search_case(library, cx);
+        }));
+        let input = Input::new(&input)
+            .small()
+            .text_token(CAPTION)
+            .rounded(px(SEARCH_HEIGHT / 2.))
+            .prefix(
+                Icon::new(IconName::Search)
+                    .size(px(13.))
+                    .text_color(rgb(palette.muted)),
+            )
+            .cleanable(true)
+            .suffix(switch);
+        div()
+            .flex_none()
+            .px_2()
+            .pb_2()
+            // `Input::h` is the multi-line box's own and shadows the style
+            // height, so the style's is named in full.
+            .child(Styled::h(input, px(SEARCH_HEIGHT)))
+            .into_any_element()
     }
 
     /// A section header: a disclosure chevron, the section's chip in its
@@ -792,8 +887,22 @@ impl SerialWorkspace {
             }
     }
 
-    /// The saved sessions, given the panel's height and how much of it Quick
-    /// send wants, so the list can take its share.
+    /// Whether a saved session answers the search box: its name, its port
+    /// or its rate and framing — what its card shows — holds the query.
+    fn session_matches(saved: &StoredSession, search: &ListSearch) -> bool {
+        search.matches(&saved.port_name)
+            || saved
+                .alias
+                .as_deref()
+                .is_some_and(|alias| search.matches(alias))
+            || search.matches(&saved.configuration.summary())
+    }
+
+    /// The saved sessions: the header, the search box, and the cards, filed
+    /// under their groups with the ones in none beneath. While a search is
+    /// on, the cards that answer it are listed flat, groups set aside, and
+    /// the count is of them. Given the panel's height and how much of it
+    /// Quick send wants, so the list can take its share.
     fn render_saved_sessions(
         &mut self,
         panel_height: f32,
@@ -803,62 +912,98 @@ impl SerialWorkspace {
         let palette = self.interface_theme.palette();
         let collapsed = self.sessions_collapsed;
         let total = self.presets.sessions.len();
-        let groups = self
-            .presets
-            .groups_in(Library::Sessions)
-            .cloned()
-            .collect::<Vec<_>>();
+        let searching = self.session_search.searching();
 
-        let header = self.section_header(Library::Sessions, "Sessions", total, cx);
+        let header = self.section_header(
+            Library::Sessions,
+            "Sessions",
+            if searching {
+                self.presets
+                    .sessions
+                    .iter()
+                    .filter(|saved| Self::session_matches(saved, &self.session_search))
+                    .count()
+            } else {
+                total
+            },
+            cx,
+        );
         let menu = self.library_menu(Library::Sessions, cx);
+        // The box sits over the list once there is something to search.
+        let search = (total > 0).then(|| self.render_search_box(Library::Sessions, cx));
 
-        // Groups first, each over its cards, then the sessions in none. The
-        // rows' heights are summed as they are made, for the list's own.
+        // Groups first, each over its cards, then the sessions in none — or,
+        // under a search, the cards that answer it. The rows' heights are
+        // summed as they are made, for the list's own.
         let mut rows = Vec::new();
         let mut content = 0.;
-        for group in &groups {
-            let members = self
+        if searching {
+            let matches = self
                 .presets
-                .sessions_in(Some(group.id))
+                .sessions
+                .iter()
+                .filter(|saved| Self::session_matches(saved, &self.session_search))
                 .cloned()
                 .collect::<Vec<_>>();
-            let folded = self.collapsed_groups.contains(&group.id);
-            rows.push(self.render_group_row(group, members.len(), folded, palette, cx));
-            if !folded {
-                let cards = members
-                    .iter()
-                    .map(|saved| self.render_session_card(saved, palette, cx))
-                    .collect();
-                rows.push(Self::render_group_body(
-                    group.id,
-                    cards,
-                    "Empty · pick this group in a session's dialog",
-                    palette,
-                ));
+            for saved in &matches {
+                rows.push(self.render_session_card(saved, palette, cx));
+                content += CARD_HEIGHT;
             }
-            content += Self::group_height(members.len(), folded);
-        }
-        let loose = self.presets.sessions_in(None).cloned().collect::<Vec<_>>();
-        for saved in &loose {
-            rows.push(self.render_session_card(saved, palette, cx));
-            content += CARD_HEIGHT;
-        }
-        let content = if rows.is_empty() {
-            EMPTY_HINT_HEIGHT
         } else {
-            content + (rows.len() - 1) as f32 * LIST_GAP
+            let groups = self
+                .presets
+                .groups_in(Library::Sessions)
+                .cloned()
+                .collect::<Vec<_>>();
+            for group in &groups {
+                let members = self
+                    .presets
+                    .sessions_in(Some(group.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let folded = self.collapsed_groups.contains(&group.id);
+                rows.push(self.render_group_row(group, members.len(), folded, palette, cx));
+                if !folded {
+                    let cards = members
+                        .iter()
+                        .map(|saved| self.render_session_card(saved, palette, cx))
+                        .collect();
+                    rows.push(Self::render_group_body(
+                        group.id,
+                        cards,
+                        "Empty · pick this group in a session's dialog",
+                        palette,
+                    ));
+                }
+                content += Self::group_height(members.len(), folded);
+            }
+            let loose = self.presets.sessions_in(None).cloned().collect::<Vec<_>>();
+            for saved in &loose {
+                rows.push(self.render_session_card(saved, palette, cx));
+                content += CARD_HEIGHT;
+            }
+        }
+        let no_match = searching && rows.is_empty();
+        let empty = !searching && rows.is_empty();
+        let content = if empty {
+            EMPTY_HINT_HEIGHT
+        } else if no_match {
+            CARD_HEIGHT
+        } else {
+            content + rows.len().saturating_sub(1) as f32 * LIST_GAP
         } + LIST_PAD_BOTTOM;
 
         // The list is as tall as its rows, up to what the panel can spare:
         // half of it at least, and all that Quick send does not need for its
-        // own rows. Past that it scrolls. With Quick send folded it takes
-        // the rest of the panel instead, through the flex chain down from
-        // the panel.
+        // own rows, less the header and the search box. Past that it
+        // scrolls. With Quick send folded it takes the rest of the panel
+        // instead, through the flex chain down from the panel.
         let fills = !collapsed && self.commands_collapsed;
         let cap = (panel_height * SESSIONS_SHARE)
             .max(panel_height - quick_send_need)
             .round()
-            - SECTION_HEADER_HEIGHT;
+            - SECTION_HEADER_HEIGHT
+            - if total > 0 { SEARCH_ROW_HEIGHT } else { 0. };
         let list_height = content.min(cap).max(0.);
         v_flex()
             .min_h_0()
@@ -866,7 +1011,7 @@ impl SerialWorkspace {
             .when(!fills, |section| section.flex_none())
             .child(header)
             .when(!collapsed, |section| {
-                section.child(
+                section.children(search).child(
                     v_flex()
                         .when(fills, |list| list.flex_1().min_h_0())
                         .when(!fills, |list| list.flex_none().h(px(list_height)))
@@ -874,13 +1019,16 @@ impl SerialWorkspace {
                         .pb_2()
                         .gap_1p5()
                         .overflow_y_scrollbar()
-                        .when(rows.is_empty(), |list| {
+                        .when(empty, |list| {
                             list.child(Self::empty_hint(
                                 palette,
                                 Glyph::Bookmark,
                                 "No saved sessions yet",
-                                "Right-click here to save the active session, or to start a group.",
+                                "Save the session in front from the Session menu, or right-click here for a group.",
                             ))
+                        })
+                        .when(no_match, |list| {
+                            list.child(Self::no_match_hint(palette, "No session matches the search"))
                         })
                         .children(rows)
                         .context_menu(menu),
@@ -889,12 +1037,22 @@ impl SerialWorkspace {
             .into_any_element()
     }
 
-    /// Whether a saved command answers to the search box: its name or its
-    /// text holds the query, case folded.
-    fn command_matches(command: &StoredCommand, query: &str) -> bool {
-        query.is_empty()
-            || command.label.to_lowercase().contains(query)
-            || command.command.to_lowercase().contains(query)
+    /// The line a list shows when a search finds nothing.
+    fn no_match_hint(palette: WorkbenchPalette, text: &'static str) -> impl IntoElement {
+        div()
+            .h(px(CARD_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_token(CAPTION)
+            .text_color(rgb(palette.faint))
+            .child(text)
+    }
+
+    /// Whether a saved command answers the search box: its name or its
+    /// text holds the query.
+    fn command_matches(command: &StoredCommand, search: &ListSearch) -> bool {
+        search.matches(&command.label) || search.matches(&command.command)
     }
 
     /// One saved command. A click sends it to the session in front; the
@@ -997,8 +1155,7 @@ impl SerialWorkspace {
     ) -> (AnyElement, f32) {
         let palette = self.interface_theme.palette();
         let collapsed = self.commands_collapsed;
-        let query = self.command_query.clone();
-        let searching = !query.is_empty();
+        let searching = self.command_search.searching();
         let total = self.presets.commands.len();
 
         let header = self.section_header(
@@ -1008,7 +1165,7 @@ impl SerialWorkspace {
                 self.presets
                     .commands
                     .iter()
-                    .filter(|command| Self::command_matches(command, &query))
+                    .filter(|command| Self::command_matches(command, &self.command_search))
                     .count()
             } else {
                 total
@@ -1017,21 +1174,7 @@ impl SerialWorkspace {
         );
         let menu = self.library_menu(Library::Commands, cx);
         // The box sits over the list once there is something to search.
-        let search = (total > 0).then(|| {
-            div().flex_none().px_2().pb_2().child(
-                Input::new(&self.command_search)
-                    .small()
-                    .h(px(SEARCH_HEIGHT))
-                    .text_token(CAPTION)
-                    .rounded(px(SEARCH_HEIGHT / 2.))
-                    .prefix(
-                        Icon::new(IconName::Search)
-                            .size(px(13.))
-                            .text_color(rgb(palette.muted)),
-                    )
-                    .cleanable(true),
-            )
-        });
+        let search = (total > 0).then(|| self.render_search_box(Library::Commands, cx));
 
         // The rows' heights are summed as they are made, for the sessions
         // list to know how much of the panel to leave.
@@ -1042,7 +1185,7 @@ impl SerialWorkspace {
                 .presets
                 .commands
                 .iter()
-                .filter(|command| Self::command_matches(command, &query))
+                .filter(|command| Self::command_matches(command, &self.command_search))
                 .cloned()
                 .collect::<Vec<_>>();
             for saved in &matches {
@@ -1084,7 +1227,8 @@ impl SerialWorkspace {
             }
         }
         let no_match = searching && rows.is_empty();
-        let content = if total == 0 {
+        let empty = !searching && rows.is_empty();
+        let content = if empty {
             EMPTY_HINT_HEIGHT
         } else if no_match {
             CARD_HEIGHT
@@ -1111,25 +1255,16 @@ impl SerialWorkspace {
                         .pb_2()
                         .gap_1p5()
                         .overflow_y_scrollbar()
-                        .when(total == 0, |list| {
+                        .when(empty, |list| {
                             list.child(Self::empty_hint(
                                 palette,
                                 Glyph::Prompt,
                                 "No saved commands yet",
-                                "Type a command below and keep it with the bookmark, or right-click here to start one.",
+                                "Type a command below and keep it with the bookmark, or right-click here for a group.",
                             ))
                         })
                         .when(no_match, |list| {
-                            list.child(
-                                div()
-                                    .h(px(CARD_HEIGHT))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .text_token(CAPTION)
-                                    .text_color(rgb(palette.faint))
-                                    .child("No command matches the search"),
-                            )
+                            list.child(Self::no_match_hint(palette, "No command matches the search"))
                         })
                         .children(rows)
                         .context_menu(menu),
@@ -1198,8 +1333,9 @@ impl SerialWorkspace {
             .border_t_1()
             .border_color(rgb(palette.border))
             .child(
-                Input::new(&self.send_input)
-                    .h(px(COMPOSER_INPUT_HEIGHT))
+                // `Input::h` is the multi-line box's own and shadows the
+                // style height, so the style's is named in full.
+                Styled::h(Input::new(&self.send_input), px(COMPOSER_INPUT_HEIGHT))
                     .disabled(active.is_none())
                     .prefix(
                         Icon::new(if hex_mode {
@@ -1372,5 +1508,22 @@ impl SerialWorkspace {
             .child(commands)
             .child(composer)
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_query;
+
+    /// A search folds case unless its `Aa` is on, and an empty one is held
+    /// by anything.
+    #[test]
+    fn a_search_minds_case_only_when_told_to() {
+        assert!(contains_query("AT+GMR", "gmr", false));
+        assert!(!contains_query("AT+GMR", "gmr", true));
+        assert!(contains_query("AT+GMR", "GMR", true));
+        assert!(contains_query("/dev/cu.usbserial", "USB", false));
+        assert!(contains_query("anything", "", true));
+        assert!(!contains_query("", "x", false));
     }
 }

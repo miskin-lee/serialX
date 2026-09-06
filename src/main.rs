@@ -39,11 +39,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use icons::WorkbenchAssets;
-use presets::PresetStore;
+use presets::{Library, PresetStore};
 use serial::*;
 use sidebar::{
-    COMMAND_SEARCH_PLACEHOLDER, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
-    SIDEBAR_WIDTH, panel_divider,
+    ListSearch, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH,
+    panel_divider,
 };
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
@@ -100,10 +100,9 @@ pub struct SerialWorkspace {
     /// to whichever tab is in front, so what was typed survives a switch.
     send_input: Entity<InputState>,
     _send_subscription: Subscription,
-    /// The search box over Quick send, and its text folded for matching.
-    command_search: Entity<InputState>,
-    _command_search_subscription: Subscription,
-    command_query: String,
+    /// The search boxes over the two lists.
+    session_search: ListSearch,
+    command_search: ListSearch,
     /// The terminal log as a place to type: while it holds focus, keys go to
     /// the port of the tab in front.
     terminal_focus: FocusHandle,
@@ -139,21 +138,8 @@ impl SerialWorkspace {
             },
         );
 
-        let command_search = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(COMMAND_SEARCH_PLACEHOLDER)
-                .clean_on_escape()
-        });
-        let command_search_subscription = cx.subscribe_in(
-            &command_search,
-            window,
-            |this, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.command_query = input.read(cx).value().trim().to_lowercase();
-                    cx.notify();
-                }
-            },
-        );
+        let session_search = ListSearch::new(Library::Sessions, window, cx);
+        let command_search = ListSearch::new(Library::Commands, window, cx);
 
         let workspace = Self {
             tabs: Vec::new(),
@@ -174,9 +160,8 @@ impl SerialWorkspace {
             panel_layout,
             send_input,
             _send_subscription: send_subscription,
+            session_search,
             command_search,
-            _command_search_subscription: command_search_subscription,
-            command_query: String::new(),
             terminal_focus: cx.focus_handle(),
             composing: None,
             terminal_metrics: TerminalMetrics::default(),

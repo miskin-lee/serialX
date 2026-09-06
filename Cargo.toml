@@ -21,8 +21,8 @@ sys-locale = "0.3.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage"] }
-objc2-foundation = { version = "0.3", features = ["NSData"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSMenu"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSDictionary", "NSObject", "NSString", "NSUserDefaults", "NSValue"] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"

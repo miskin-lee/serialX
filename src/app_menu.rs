@@ -75,15 +75,13 @@ fn application_menus() -> Vec<Menu> {
     let mut help = vec![
         MenuItem::action("serialX on GitHub", OpenRepository),
         MenuItem::action("Report an Issue…", ReportIssue),
+        MenuItem::separator(),
+        MenuItem::action("Check for Updates…", CheckForUpdates),
     ];
-    // macOS keeps these under the application menu; the other platforms have
-    // no such menu, so `Help` carries them as well.
+    // macOS keeps `About` under the application menu; the other platforms
+    // have no such menu, so `Help` carries it as well.
     if cfg!(not(target_os = "macos")) {
-        help.extend([
-            MenuItem::separator(),
-            MenuItem::action("Check for Updates…", CheckForUpdates),
-            MenuItem::action("About serialX", ShowAbout),
-        ]);
+        help.push(MenuItem::action("About serialX", ShowAbout));
     }
 
     vec![
@@ -91,19 +89,17 @@ fn application_menus() -> Vec<Menu> {
         // application menu has to come first for "Session" to keep its own name.
         Menu::new("serialX").items([
             MenuItem::action("About serialX", ShowAbout),
-            MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
             MenuItem::action("Quit serialX", QuitApplication),
         ]),
+        // Rescan and pause stay on their shortcuts and toolbar buttons; the
+        // menu lists only what you would go looking for by name.
         Menu::new("Session").items([
             MenuItem::action("New Session…", NewSerialTab),
             MenuItem::action("Save Session", SaveCurrentSession),
             MenuItem::action("Close Session", CloseSerialTab),
             MenuItem::separator(),
             MenuItem::action("Connect / Disconnect", ToggleConnection),
-            MenuItem::action("Rescan Ports", RefreshPorts),
-            MenuItem::separator(),
-            MenuItem::action("Pause / Resume Receiving", TogglePause),
             MenuItem::action("Clear Terminal", ClearTerminal),
             MenuItem::separator(),
             MenuItem::action("Previous Session", PreviousTab),
@@ -119,18 +115,56 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
             MenuItem::separator(),
-            MenuItem::submenu(Menu::new("Appearance").items([
+            MenuItem::submenu(Menu::new("Theme").items([
                 MenuItem::action("Light", UseLightTheme),
                 MenuItem::action("Dark", UseDarkTheme),
                 MenuItem::separator(),
-                MenuItem::action("Switch Appearance", ToggleTheme),
+                MenuItem::action("Switch Theme", ToggleTheme),
             ])),
         ]),
         Menu::new("Help").items(help),
     ]
 }
 
+/// AppKit appends "Enter Full Screen" to any menu titled `View` unless the
+/// application opts out before the menu bar is built. The green traffic light
+/// already covers full screen, so the menu keeps only what serialX put there.
+#[cfg(target_os = "macos")]
+fn suppress_automatic_full_screen_item() {
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
+
+    let key = NSString::from_str("NSFullScreenMenuItemEverywhere");
+    let value = NSNumber::numberWithBool(false);
+    let value: &AnyObject = &value;
+    let registration = NSDictionary::from_slices(&[&*key], &[value]);
+    // SAFETY: the registration domain takes string keys with property-list
+    // values, and this dictionary holds a string mapped to a number.
+    unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&registration) };
+}
+
+/// AppKit also puts a Spotlight search field at the top of whatever menu is
+/// titled `Help`, unless the application names a different help menu. Naming
+/// an empty one that never reaches the menu bar keeps ours plain.
+#[cfg(target_os = "macos")]
+fn suppress_help_search_field() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSMenu};
+
+    let Some(main_thread) = MainThreadMarker::new() else {
+        return;
+    };
+    let application = NSApplication::sharedApplication(main_thread);
+    application.setHelpMenu(Some(&NSMenu::new(main_thread)));
+}
+
 pub(crate) fn configure_application_menus(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    {
+        suppress_automatic_full_screen_item();
+        suppress_help_search_field();
+    }
+
     cx.bind_keys([
         KeyBinding::new(NEW_TAB_KEYSTROKE, NewSerialTab, None),
         KeyBinding::new(CLOSE_TAB_KEYSTROKE, CloseSerialTab, None),
@@ -327,20 +361,47 @@ mod tests {
     }
 
     #[test]
-    fn view_menu_folds_appearance_into_a_submenu() {
+    fn view_menu_folds_theme_into_a_submenu() {
         let menus = application_menus();
         let view = menus
             .iter()
             .find(|menu| menu.name == "View")
             .expect("a View menu");
-        let appearance = view
+        let theme = view
             .items
             .iter()
             .find_map(|item| match item {
-                MenuItem::Submenu(menu) if menu.name == "Appearance" => Some(menu),
+                MenuItem::Submenu(menu) if menu.name == "Theme" => Some(menu),
                 _ => None,
             })
-            .expect("an Appearance submenu");
-        assert_eq!(labels(appearance), ["Light", "Dark", "Switch Appearance"]);
+            .expect("a Theme submenu");
+        assert_eq!(labels(theme), ["Light", "Dark", "Switch Theme"]);
+    }
+
+    /// Updates are looked for under `Help` on every platform; the application
+    /// menu keeps only `About` and `Quit`.
+    #[test]
+    fn help_menu_carries_check_for_updates() {
+        let menus = application_menus();
+        let help = menus
+            .iter()
+            .find(|menu| menu.name == "Help")
+            .expect("a Help menu");
+        assert!(labels(help).iter().any(|label| label == "Check for Updates…"));
+        let application = menus.first().expect("an application menu");
+        assert!(!labels(application).iter().any(|label| label == "Check for Updates…"));
+    }
+
+    /// Rescan and pause live on the toolbar and their shortcuts, not the menu.
+    #[test]
+    fn session_menu_leaves_rescan_and_pause_to_the_toolbar() {
+        let menus = application_menus();
+        let session = menus
+            .iter()
+            .find(|menu| menu.name == "Session")
+            .expect("a Session menu");
+        let labels = labels(session);
+        assert!(!labels.iter().any(|label| label.starts_with("Rescan")));
+        assert!(!labels.iter().any(|label| label.starts_with("Pause")));
     }
 }

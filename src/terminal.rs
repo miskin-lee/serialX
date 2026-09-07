@@ -850,28 +850,6 @@ impl Terminal {
             .then_some((line as usize, grid.cursor.point.column.0))
     }
 
-    /// The text of each row on screen, for the filter to count.
-    pub(crate) fn visible_texts(&self) -> Vec<String> {
-        let content = self.term.renderable_content();
-        let offset = content.display_offset as i32;
-        let mut rows = vec![String::new(); self.size.lines];
-        for cell in content.display_iter {
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                continue;
-            }
-            if let Some(row) = rows.get_mut((cell.point.line.0 + offset) as usize) {
-                row.push(cell.c);
-            }
-        }
-        for row in &mut rows {
-            row.truncate(row.trim_end().len());
-        }
-        rows
-    }
-
     /// The rows of the line the cursor is on — the whole logical line,
     /// wrapped rows included — which is still being written and is drawn
     /// in plain ink; see [`render_rows`].

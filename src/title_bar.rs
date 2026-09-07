@@ -26,16 +26,14 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::Input,
-    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_menu::{NextTab, PreviousTab, ToggleConnection, ToggleSidePanel};
-use crate::controls::tag;
 use crate::filter::FilterMode;
 use crate::icons::Glyph;
-use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, mix, tint};
+use crate::theme::{LABEL, MICRO, Typography, WorkbenchPalette, mix, tint};
 use crate::{SerialTabSnapshot, SerialWorkspace};
 
 /// Height of the bar. Four more than the component default: a 26px pill needs
@@ -247,45 +245,25 @@ impl SerialWorkspace {
     }
 
     /// The command-centre box, wired to the active tab's filter. Its right
-    /// end reports how much of the log is showing, or why the pattern will
-    /// not compile, ahead of the three switches: match case, regular
-    /// expressions, and the mask that shows only the lines that match.
+    /// end says why the pattern will not compile, when it will not, ahead of
+    /// the three switches: match case, regular expressions, and the mask that
+    /// shows only the lines that match.
     fn render_filter_box(&mut self, tab: &SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
         let tab_id = tab.id;
         let filter = &tab.filter;
         let error = filter.error().map(str::to_owned);
-        let showing = tab.filter_counts;
 
-        let status = match (&error, showing) {
-            (Some(message), _) => Some(
-                div()
-                    .flex_none()
-                    .max_w(px(200.))
-                    .truncate()
-                    .text_token(MICRO)
-                    .text_color(rgb(palette.danger))
-                    .child(message.clone())
-                    .into_any_element(),
-            ),
-            (None, Some((visible, total))) => Some(
-                v_flex()
-                    .flex_none()
-                    .ui_mono_font()
-                    .child(tag(
-                        palette,
-                        if visible == 0 {
-                            palette.warning
-                        } else {
-                            palette.muted
-                        },
-                        MONO_SMALL,
-                        format!("{visible} / {total}"),
-                    ))
-                    .into_any_element(),
-            ),
-            (None, None) => None,
-        };
+        let status = error.clone().map(|message| {
+            div()
+                .flex_none()
+                .max_w(px(200.))
+                .truncate()
+                .text_token(MICRO)
+                .text_color(rgb(palette.danger))
+                .child(message)
+                .into_any_element()
+        });
 
         Input::new(&tab.filter_input)
             .small()

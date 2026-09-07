@@ -59,8 +59,6 @@ pub(crate) struct MaskState {
     shown: Vec<LogicalLine>,
     /// The rows of the lines shown, top to bottom.
     rows: Vec<MaskRow>,
-    /// How many lines the log holds, matching or not.
-    total: usize,
     /// How far up from the newest row the view is, in rows: zero at the
     /// bottom, following the output.
     offset: usize,
@@ -77,7 +75,6 @@ impl MaskState {
         if !filter.masking() {
             self.shown.clear();
             self.rows.clear();
-            self.total = 0;
             self.scanned = None;
             return;
         }
@@ -93,10 +90,8 @@ impl MaskState {
 
         self.shown.clear();
         self.rows.clear();
-        self.total = 0;
         let mut first = None;
         for line in terminal.logical_lines() {
-            self.total += 1;
             first.get_or_insert(line.number);
             let matched = match self.cached(line.number) {
                 Some(matched) if line.settled() => matched,
@@ -210,11 +205,6 @@ impl MaskState {
         self.shown
             .binary_search_by_key(&number, |line| line.number)
             .is_ok()
-    }
-
-    /// How many lines are shown, out of how many the log holds.
-    pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.shown.len(), self.total)
     }
 
     /// Moves the view through the rows shown: positive is back in time,
@@ -370,7 +360,7 @@ mod tests {
     }
 
     /// The mask shows the rows of the lines that match, a wrapped line
-    /// whole, and counts the lines of the log.
+    /// whole.
     #[test]
     fn the_mask_keeps_the_lines_that_match() {
         let mut terminal = Terminal::new(100);
@@ -382,7 +372,7 @@ mod tests {
         // Rows: -2 "ok", -1 "ERROR on", 0 "e", 1 "ok", 2 "ERR"; the
         // cursor's empty row under them is not a line.
         assert_eq!(lines(&mask, 4), vec![-1, 0, 2]);
-        assert_eq!(mask.counts(), (2, 4));
+        assert_eq!(mask.shown.len(), 2);
         assert!(mask.is_shown(2) && mask.is_shown(4));
         assert!(!mask.is_shown(1) && !mask.is_shown(3));
         assert_eq!(mask.line_at(0, 4), Some(-1));
@@ -391,7 +381,7 @@ mod tests {
         let mut off = masked();
         off.toggle_mode();
         mask.refresh(&terminal, &off);
-        assert_eq!(mask.counts(), (0, 0));
+        assert!(mask.shown.is_empty());
         assert_eq!(mask.line_at(0, 4), None);
     }
 
@@ -408,7 +398,7 @@ mod tests {
         let mut filter = masked();
         let mut mask = MaskState::default();
         mask.refresh(&terminal, &filter);
-        assert_eq!(mask.counts(), (6, 6));
+        assert_eq!(mask.shown.len(), 6);
         // Rows -5 to 0 hold `err 0` to `err 5`; the cursor's row is empty.
         assert_eq!(lines(&mask, 2), vec![-1, 0]);
         mask.scroll(3, 2);
@@ -426,11 +416,11 @@ mod tests {
         filter.toggle_regex();
         filter.set_pattern("err [0-3]");
         mask.refresh(&terminal, &filter);
-        assert_eq!(mask.counts(), (4, 9));
+        assert_eq!(mask.shown.len(), 4);
         mask.scroll_to_bottom();
         terminal.clear();
         mask.refresh(&terminal, &filter);
-        assert_eq!(mask.counts(), (0, 0));
+        assert!(mask.shown.is_empty());
         assert!(mask.cache.is_empty(), "a clear starts the numbering over");
     }
 }

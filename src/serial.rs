@@ -432,10 +432,6 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) connecting: bool,
     pub(crate) hex_mode: bool,
     pub(crate) line_ending: LineEnding,
-    /// How many rows on screen the title bar filter matches, out of how
-    /// many there are, while a filter is set — or, while its mask is on,
-    /// how many lines of the log it shows, out of how many there are.
-    pub(crate) filter_counts: Option<(usize, usize)>,
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
     pub(crate) find: FindView,
@@ -450,15 +446,6 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             connecting: tab.connecting,
             hex_mode: tab.hex_mode,
             line_ending: tab.line_ending(),
-            filter_counts: if tab.masking() {
-                Some(tab.mask.counts())
-            } else {
-                tab.filter.is_active().then(|| {
-                    let texts = tab.terminal.visible_texts();
-                    let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
-                    (matching, texts.len())
-                })
-            },
             filter_input: tab.filter_input.clone(),
             filter: tab.filter.clone(),
             find: FindView {

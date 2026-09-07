@@ -71,6 +71,22 @@ pub(crate) fn traffic_light_position() -> Point<Pixels> {
     )
 }
 
+/// Wraps a control in the bar so its press stays its own.
+///
+/// The bar takes any press it sees for the start of a window move, and any
+/// double click for a zoom — which is not what a press on a button, or in
+/// the filter box, means. Stopping the press here leaves the bar nothing to
+/// move the window from and nothing to count towards a double click, and
+/// what is inside the wrapper has already run: the bubble phase goes from
+/// the innermost element out. The bar is still dragged by everything else —
+/// the traffic lights' end, the gaps between the controls, the strip past
+/// the last one.
+fn keeps_its_press(control: impl IntoElement) -> Div {
+    div()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(control)
+}
+
 impl SerialWorkspace {
     pub(crate) fn render_title_bar(
         &mut self,
@@ -95,11 +111,10 @@ impl SerialWorkspace {
             .overflow_hidden()
             .when(cfg!(not(target_os = "macos")), |column| {
                 column.min_w(px(MENU_BAR_WIDTH)).child(
-                    div()
+                    keeps_its_press(self.menu_bar.clone())
                         .flex_none()
                         .w(px(MENU_BAR_WIDTH))
-                        .h(px(CONTROL_HEIGHT))
-                        .child(self.menu_bar.clone()),
+                        .h(px(CONTROL_HEIGHT)),
                 )
             });
 
@@ -111,29 +126,35 @@ impl SerialWorkspace {
             .items_center()
             .gap_0p5()
             .child(
-                Button::new("previous-tab")
-                    .ghost()
-                    .with_size(px(NAV_BUTTON))
-                    .icon(IconName::ArrowLeft)
-                    .disabled(!has_previous)
-                    .tooltip_with_action("Previous session", &PreviousTab, None)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_previous_tab(cx);
-                    })),
+                keeps_its_press(
+                    Button::new("previous-tab")
+                        .ghost()
+                        .with_size(px(NAV_BUTTON))
+                        .icon(IconName::ArrowLeft)
+                        .disabled(!has_previous)
+                        .tooltip_with_action("Previous session", &PreviousTab, None)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_previous_tab(cx);
+                        })),
+                )
+                .flex_none(),
             )
             .child(
-                Button::new("next-tab")
-                    .ghost()
-                    .with_size(px(NAV_BUTTON))
-                    .icon(IconName::ArrowRight)
-                    .disabled(!has_next)
-                    .tooltip_with_action("Next session", &NextTab, None)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.select_next_tab(cx);
-                    })),
+                keeps_its_press(
+                    Button::new("next-tab")
+                        .ghost()
+                        .with_size(px(NAV_BUTTON))
+                        .icon(IconName::ArrowRight)
+                        .disabled(!has_next)
+                        .tooltip_with_action("Next session", &NextTab, None)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.select_next_tab(cx);
+                        })),
+                )
+                .flex_none(),
             )
             .child(div().flex_1().min_w_0().ml_1p5().child(filter_box))
-            .child(div().flex_none().ml_1p5().child(connect));
+            .child(keeps_its_press(connect).flex_none().ml_1p5());
 
         let right_column = h_flex()
             .flex_1()
@@ -146,18 +167,21 @@ impl SerialWorkspace {
                 column.flex_basis(px(TRAFFIC_LIGHT_INSET))
             })
             .child(
-                Button::new("title-side-panel")
-                    .ghost()
-                    .with_size(px(CONTROL_HEIGHT))
-                    .icon(if self.side_panel_collapsed {
-                        IconName::PanelRightOpen
-                    } else {
-                        IconName::PanelRightClose
-                    })
-                    .tooltip_with_action("Show / hide the side panel", &ToggleSidePanel, None)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_side_panel(cx);
-                    })),
+                keeps_its_press(
+                    Button::new("title-side-panel")
+                        .ghost()
+                        .with_size(px(CONTROL_HEIGHT))
+                        .icon(if self.side_panel_collapsed {
+                            IconName::PanelRightOpen
+                        } else {
+                            IconName::PanelRightClose
+                        })
+                        .tooltip_with_action("Show / hide the side panel", &ToggleSidePanel, None)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_side_panel(cx);
+                        })),
+                )
+                .flex_none(),
             );
 
         // A faint light along the top edge, fading into the bar's own colour.
@@ -333,17 +357,9 @@ impl SerialWorkspace {
                     ),
             );
 
-        // The bar takes any press it sees for the start of a window move,
-        // and any double click for a zoom. In the box a press is a caret, a
-        // drag is a selection and a double click is a word, so the box keeps
-        // its presses to itself: without the press the bar has nothing to
-        // move the window from, and nothing to count towards a double click.
-        // What is inside the box runs first in the bubble phase, so the
-        // input and the switches are unaffected.
-        div()
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(field)
-            .into_any_element()
+        // In the box a press is a caret, a drag is a selection and a double
+        // click is a word, none of which the bar above may take for its own.
+        keeps_its_press(field).into_any_element()
     }
 
     /// One of the switches inside the box, drawn like the toggles in VS

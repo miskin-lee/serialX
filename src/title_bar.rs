@@ -265,7 +265,7 @@ impl SerialWorkspace {
                 .into_any_element()
         });
 
-        Input::new(&tab.filter_input)
+        let field = Input::new(&tab.filter_input)
             .small()
             .min_h(px(FILTER_HEIGHT))
             .text_token(LABEL)
@@ -331,7 +331,18 @@ impl SerialWorkspace {
                             this.toggle_filter_mode(cx);
                         })),
                     ),
-            )
+            );
+
+        // The bar takes any press it sees for the start of a window move,
+        // and any double click for a zoom. In the box a press is a caret, a
+        // drag is a selection and a double click is a word, so the box keeps
+        // its presses to itself: without the press the bar has nothing to
+        // move the window from, and nothing to count towards a double click.
+        // What is inside the box runs first in the bubble phase, so the
+        // input and the switches are unaffected.
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(field)
             .into_any_element()
     }
 

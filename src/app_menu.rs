@@ -142,11 +142,12 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
             MenuItem::separator(),
+            // The submenu names the two themes and nothing else: picking one
+            // is what the menu is for, and the shortcut switches between
+            // them without a line of its own.
             MenuItem::submenu(Menu::new("Theme").items([
                 MenuItem::action("Light", UseLightTheme),
                 MenuItem::action("Dark", UseDarkTheme),
-                MenuItem::separator(),
-                MenuItem::action("Switch Theme", ToggleTheme),
             ])),
         ]),
         Menu::new("Help").items(help),
@@ -444,7 +445,7 @@ mod tests {
                 _ => None,
             })
             .expect("a Theme submenu");
-        assert_eq!(labels(theme), ["Light", "Dark", "Switch Theme"]);
+        assert_eq!(labels(theme), ["Light", "Dark"]);
     }
 
     /// Updates are looked for under `Help` on every platform; the application

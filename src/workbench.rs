@@ -23,6 +23,7 @@ use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
 use crate::terminal::{CaretShape, RenderContent};
+use crate::presets::DEFAULT_TERMINAL_FONT_SIZE;
 use crate::theme::{
     BODY, CAPTION, LABEL, MONO_SMALL, TerminalPalette, Typography, WORDMARK, WorkbenchPalette,
     fonts, tint,
@@ -57,9 +58,10 @@ const ROW_GAP: f32 = 12.;
 /// through.
 const FIND_WASH: f32 = 0.28;
 const FIND_WASH_CURRENT: f32 = 0.55;
-/// The terminal's type: the mono family at this size, on lines this tall.
-const TERMINAL_FONT_SIZE: f32 = 12.5;
-const TERMINAL_LINE_HEIGHT: f32 = 18.;
+/// How tall a line stands against the type it holds: the 18px lines the log
+/// was always set on, over the 12.5pt type that sat on them. Kept as the
+/// ratio so a size the setting names brings its own leading with it.
+const TERMINAL_LEADING: f32 = 18. / DEFAULT_TERMINAL_FONT_SIZE;
 /// The cursor when it is drawn as a bar or an underline.
 const CARET_THICKNESS: f32 = 2.;
 /// Breathing room between the tab strip and the first line.
@@ -86,6 +88,10 @@ pub(crate) struct TerminalMetrics {
 }
 
 impl SerialWorkspace {
+    /// The type the log is set in, as the settings have it.
+    pub(crate) fn terminal_type(&self) -> TerminalType {
+        TerminalType::new(self.presets.settings.terminal_font_size)
+    }
 
     /// A small filled dot in the colour of the current connection state.
     pub(crate) fn status_dot(size: f32, color: u32) -> impl IntoElement {
@@ -301,7 +307,7 @@ impl SerialWorkspace {
                         }),
                     )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        let line_height = px(TERMINAL_LINE_HEIGHT);
+                        let line_height = px(this.terminal_type().line_height);
                         let delta = event.delta.pixel_delta(line_height).y / line_height;
                         this.scroll_terminal(delta, cx);
                     }))
@@ -345,18 +351,19 @@ impl SerialWorkspace {
         let interactive = tab.interactive;
         let fit = cx.entity();
         let paint = cx.entity();
+        let text = self.terminal_type();
 
         canvas(
             move |bounds, window, cx| {
-                let layout = TerminalLayout::measure(window, digits);
+                let layout = TerminalLayout::measure(window, digits, text);
                 let columns = (bounds.size.width - layout.gutter - px(ROW_INSET)) / layout.cell_width;
-                let lines = bounds.size.height / px(TERMINAL_LINE_HEIGHT);
+                let lines = bounds.size.height / px(text.line_height);
                 let columns = columns.floor().max(0.) as usize;
                 let lines = lines.floor().max(0.) as usize;
                 fit.update(cx, |this, _| {
                     this.terminal_metrics = TerminalMetrics {
                         cell_width: f32::from(layout.cell_width),
-                        line_height: TERMINAL_LINE_HEIGHT,
+                        line_height: text.line_height,
                         text_left: f32::from(layout.gutter),
                         origin_x: f32::from(bounds.origin.x),
                         origin_y: f32::from(bounds.origin.y),
@@ -537,10 +544,44 @@ fn terminal_font(bold: bool, italic: bool) -> Font {
     }
 }
 
+/// The terminal's type as the settings have it: the size the log is set in,
+/// with everything measured in type scaled to it — the leading, the line
+/// numbers and timestamps in the gutter, and the column they need. So a
+/// larger size grows the whole log rather than leaving small numbers under
+/// big text.
+#[derive(Clone, Copy)]
+pub(crate) struct TerminalType {
+    /// The size the cells are set in.
+    font_size: f32,
+    /// How tall a row stands, in whole pixels so rows land on the grid.
+    line_height: f32,
+    /// The size the gutter's numbers and timestamps are set in.
+    gutter_size: f32,
+    /// Width of the timestamp column at that size.
+    time_gutter: f32,
+    /// The size against the default, for measurements taken at the default.
+    scale: f32,
+}
+
+impl TerminalType {
+    fn new(font_size: f32) -> Self {
+        let scale = font_size / DEFAULT_TERMINAL_FONT_SIZE;
+        Self {
+            font_size,
+            line_height: (font_size * TERMINAL_LEADING).round(),
+            gutter_size: MONO_SMALL.size * scale,
+            time_gutter: (TIME_GUTTER * scale).round(),
+            scale,
+        }
+    }
+}
+
 /// How the terminal's cells and gutters map to pixels, measured from the
 /// fonts each frame.
 #[derive(Clone, Copy)]
 struct TerminalLayout {
+    /// The type the measurements were taken at.
+    text: TerminalType,
     /// A cell's width: the advance of `m` in the terminal's font.
     cell_width: Pixels,
     /// The line-number column, as wide as the digits it has to hold.
@@ -552,24 +593,25 @@ struct TerminalLayout {
 }
 
 impl TerminalLayout {
-    /// Measures for numbers `digits` wide.
-    fn measure(window: &Window, digits: usize) -> Self {
+    /// Measures for numbers `digits` wide, in the type given.
+    fn measure(window: &Window, digits: usize, text: TerminalType) -> Self {
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&terminal_font(false, false));
         let advance = |size: f32, glyph: char, fallback: f32| {
             text_system
                 .advance(font_id, px(size), glyph)
                 .map(|advance| advance.width)
-                .unwrap_or(px(fallback))
+                .unwrap_or(px(fallback * text.scale))
         };
-        let cell_width = advance(TERMINAL_FONT_SIZE, 'm', 7.5);
-        let number_width = advance(MONO_SMALL.size, '0', 6.6) * digits as f32;
+        let cell_width = advance(text.font_size, 'm', 7.5);
+        let number_width = advance(text.gutter_size, '0', 6.6) * digits as f32;
         let stamp_left = px(ROW_INSET) + number_width + px(ROW_GAP);
         Self {
+            text,
             cell_width,
             number_width,
             stamp_left,
-            gutter: stamp_left + px(TIME_GUTTER + ROW_GAP),
+            gutter: stamp_left + px(text.time_gutter + ROW_GAP),
         }
     }
 }
@@ -600,8 +642,8 @@ fn paint_terminal(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let line_height = px(TERMINAL_LINE_HEIGHT);
-    let font_size = px(TERMINAL_FONT_SIZE);
+    let line_height = px(layout.text.line_height);
+    let font_size = px(layout.text.font_size);
     let cell_width = layout.cell_width;
     let text_left = bounds.origin.x + layout.gutter;
     let text_system = window.text_system().clone();
@@ -664,7 +706,7 @@ fn paint_terminal(
         };
         text_system.shape_line(
             SharedString::from(text.to_owned()),
-            px(MONO_SMALL.size),
+            px(layout.text.gutter_size),
             &[run],
             None,
         )

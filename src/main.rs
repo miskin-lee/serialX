@@ -150,9 +150,9 @@ impl SerialWorkspace {
         let send_subscription = cx.subscribe_in(
             &send_input,
             window,
-            |this, _, event: &InputEvent, window, cx| {
+            |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
-                    this.send_to_active_tab(window, cx);
+                    this.send_to_active_tab(cx);
                 }
             },
         );
@@ -484,14 +484,22 @@ impl SerialWorkspace {
         }
     }
 
-    /// Sends what the composer holds to the tab in front, in the tab's
-    /// encoding and with the tab's line ending after it. A line that is
-    /// not the hex it claims to be stays in the box, with a note in the
-    /// log saying why: a typo sent as text would reach the device as
-    /// something else entirely.
-    fn send_to_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.send_input.clone();
-        let value = input.read(cx).value().trim().to_string();
+    /// Sends what the composer holds to the tab in front.
+    ///
+    /// What was sent stays in the box afterwards, so the same line can go
+    /// out again with a press rather than being typed afresh; the box is
+    /// empty only when the workspace opens.
+    fn send_to_active_tab(&mut self, cx: &mut Context<Self>) {
+        let line = self.send_input.read(cx).value().to_string();
+        self.send_line(&line, cx);
+    }
+
+    /// Sends one line to the tab in front, in the tab's encoding and with
+    /// the tab's line ending after it. A line that is not the hex it claims
+    /// to be goes nowhere, with a note in the log saying why: a typo sent
+    /// as text would reach the device as something else entirely.
+    pub(crate) fn send_line(&mut self, line: &str, cx: &mut Context<Self>) {
+        let value = line.trim().to_string();
         if value.is_empty() {
             return;
         }
@@ -523,7 +531,6 @@ impl SerialWorkspace {
             tab.scroll_to_bottom();
         }
 
-        input.update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
     }
 

@@ -85,25 +85,43 @@ pub(crate) const DEFAULT_SCROLLBACK_LINES: usize = 50_000;
 pub(crate) const MIN_SCROLLBACK_LINES: usize = 100;
 pub(crate) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
+/// The size the terminal's log is set in out of the box, in points: the
+/// size it was set in before the size could be set at all.
+pub(crate) const DEFAULT_TERMINAL_FONT_SIZE: f32 = 12.5;
+/// The least and the most the setting takes. Below eight points the log is
+/// there to squint at rather than to read; above thirty-two a window holds
+/// so few columns that a device's own line wraps.
+pub(crate) const MIN_TERMINAL_FONT_SIZE: f32 = 8.;
+pub(crate) const MAX_TERMINAL_FONT_SIZE: f32 = 32.;
+
 /// What is the workbench's to set rather than a session's, kept in the
 /// same file as the presets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Settings {
     /// Lines kept above the screen to scroll back through, per terminal.
     #[serde(default = "default_scrollback_lines")]
     pub(crate) scrollback_lines: usize,
+    /// The size the terminal's log is set in, in points. The leading and
+    /// the gutters follow it, so the whole log grows together.
+    #[serde(default = "default_terminal_font_size")]
+    pub(crate) terminal_font_size: f32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
         }
     }
 }
 
 fn default_scrollback_lines() -> usize {
     DEFAULT_SCROLLBACK_LINES
+}
+
+fn default_terminal_font_size() -> f32 {
+    DEFAULT_TERMINAL_FONT_SIZE
 }
 
 #[derive(Serialize, Deserialize)]
@@ -478,7 +496,10 @@ fn store_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_SCROLLBACK_LINES, Library, PresetStore, Settings, TagColor};
+    use super::{
+        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, PresetStore, Settings,
+        TagColor,
+    };
     use crate::SerialConfiguration;
 
     /// A file from before there were settings comes up with the defaults,
@@ -488,14 +509,17 @@ mod tests {
         let old = r#"{"sessions":[],"groups":[],"commands":[],"next_id":100}"#;
         let store: PresetStore = serde_json::from_str(old).unwrap();
         assert_eq!(store.settings.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
+        assert_eq!(store.settings.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
 
         let mut store = PresetStore::default();
         store.set_settings(Settings {
             scrollback_lines: 1_234,
+            terminal_font_size: 16.,
         });
         let json = serde_json::to_string(&store).unwrap();
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.settings.scrollback_lines, 1_234);
+        assert_eq!(restored.settings.terminal_font_size, 16.);
     }
 
     #[test]

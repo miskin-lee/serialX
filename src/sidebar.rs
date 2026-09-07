@@ -429,7 +429,9 @@ impl SerialWorkspace {
         self.open_command_dialog(CommandTarget::New, &draft, window, cx);
     }
 
-    fn send_saved_command(&mut self, command_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    /// Sends a card's command straight to the tab in front. It does not go
+    /// through the composer: what is being typed there is left alone.
+    fn send_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
         let Some(command) = self
             .presets
             .commands
@@ -442,9 +444,7 @@ impl SerialWorkspace {
         if self.active_tab().is_none() {
             return;
         }
-        let input = self.send_input.clone();
-        input.update(cx, |input, cx| input.set_value(command, window, cx));
-        self.send_to_active_tab(window, cx);
+        self.send_line(&command, cx);
     }
 
     fn remove_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
@@ -1103,8 +1103,8 @@ impl SerialWorkspace {
         .when(!has_active_tab, |row| row.cursor_default().opacity(0.55))
         .when(has_active_tab, |row| {
             row.tooltip(|window, cx| Tooltip::new("Click to send").build(window, cx))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.send_saved_command(command_id, window, cx);
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.send_saved_command(command_id, cx);
                 }))
         })
         .child(icon_chip(Glyph::Prompt, palette.category_command, 28.))
@@ -1560,8 +1560,8 @@ impl SerialWorkspace {
                     .icon(Icon::new(Glyph::Send).size(px(SEND_ICON_SIZE)))
                     .disabled(active.is_none())
                     .tooltip("Send to the session in front")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.send_to_active_tab(window, cx);
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.send_to_active_tab(cx);
                     })),
             );
 

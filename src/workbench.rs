@@ -318,7 +318,7 @@ impl SerialWorkspace {
     ///
     /// The gutter is measured here: a column of line numbers as wide as
     /// the highest number in the log, then the timestamps, each with air
-    /// after it, and either or both can be switched off.
+    /// after it.
     ///
     /// While a selection is being dragged out, the pointer is followed
     /// from here at the window rather than at the log, so the drag goes on
@@ -335,13 +335,9 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let filter = tab.filter.clone();
         let find = tab.find.clone();
-        let gutters = Gutters {
-            numbers: tab.line_numbers,
-            digits: self
-                .tab(tab_id)
-                .map_or(0, |tab| tab.terminal.number_digits()),
-            stamps: tab.timestamps,
-        };
+        let digits = self
+            .tab(tab_id)
+            .map_or(0, |tab| tab.terminal.number_digits());
         let focus = self.terminal_focus.clone();
         let composing = self.composing.clone();
         let cursor_shown = self.cursor_shown;
@@ -352,7 +348,7 @@ impl SerialWorkspace {
 
         canvas(
             move |bounds, window, cx| {
-                let layout = TerminalLayout::measure(window, gutters);
+                let layout = TerminalLayout::measure(window, digits);
                 let columns = (bounds.size.width - layout.gutter - px(ROW_INSET)) / layout.cell_width;
                 let lines = bounds.size.height / px(TERMINAL_LINE_HEIGHT);
                 let columns = columns.floor().max(0.) as usize;
@@ -541,31 +537,23 @@ fn terminal_font(bold: bool, italic: bool) -> Font {
     }
 }
 
-/// Which gutters a tab shows, and how many digits its numbers run to.
-#[derive(Clone, Copy)]
-struct Gutters {
-    numbers: bool,
-    digits: usize,
-    stamps: bool,
-}
-
 /// How the terminal's cells and gutters map to pixels, measured from the
 /// fonts each frame.
 #[derive(Clone, Copy)]
 struct TerminalLayout {
     /// A cell's width: the advance of `m` in the terminal's font.
     cell_width: Pixels,
-    /// The line-number column, zero while the numbers are off.
+    /// The line-number column, as wide as the digits it has to hold.
     number_width: Pixels,
     /// Where the timestamps start, from the terminal's left edge.
     stamp_left: Pixels,
     /// Where the cells start, from the terminal's left edge.
     gutter: Pixels,
-    gutters: Gutters,
 }
 
 impl TerminalLayout {
-    fn measure(window: &Window, gutters: Gutters) -> Self {
+    /// Measures for numbers `digits` wide.
+    fn measure(window: &Window, digits: usize) -> Self {
         let text_system = window.text_system();
         let font_id = text_system.resolve_font(&terminal_font(false, false));
         let advance = |size: f32, glyph: char, fallback: f32| {
@@ -575,25 +563,13 @@ impl TerminalLayout {
                 .unwrap_or(px(fallback))
         };
         let cell_width = advance(TERMINAL_FONT_SIZE, 'm', 7.5);
-        let number_width = if gutters.numbers {
-            advance(MONO_SMALL.size, '0', 6.6) * gutters.digits as f32
-        } else {
-            px(0.)
-        };
-        let mut left = px(ROW_INSET);
-        if gutters.numbers {
-            left += number_width + px(ROW_GAP);
-        }
-        let stamp_left = left;
-        if gutters.stamps {
-            left += px(TIME_GUTTER + ROW_GAP);
-        }
+        let number_width = advance(MONO_SMALL.size, '0', 6.6) * digits as f32;
+        let stamp_left = px(ROW_INSET) + number_width + px(ROW_GAP);
         Self {
             cell_width,
             number_width,
             stamp_left,
-            gutter: left,
-            gutters,
+            gutter: stamp_left + px(TIME_GUTTER + ROW_GAP),
         }
     }
 }
@@ -698,12 +674,12 @@ fn paint_terminal(
         let y = bounds.origin.y + line_height * index as f32;
         // The number sits against the right edge of its column, as an
         // editor's do, so the units line up.
-        if let (true, Some(number)) = (layout.gutters.numbers, row.number) {
+        if let Some(number) = row.number {
             let line = gutter_line(&number.to_string());
             let x = bounds.origin.x + px(ROW_INSET) + layout.number_width - line.width;
             let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
         }
-        if let (true, Some(stamp)) = (layout.gutters.stamps, &row.stamp) {
+        if let Some(stamp) = &row.stamp {
             let line = gutter_line(stamp);
             let _ = line.paint(
                 point(bounds.origin.x + layout.stamp_left, y),

@@ -271,12 +271,6 @@ pub(crate) struct SerialTabState {
     /// back does not forget which ending the device wanted for its text.
     pub(crate) text_line_ending: LineEnding,
     pub(crate) hex_line_ending: LineEnding,
-    pub(crate) timestamps: bool,
-    /// Whether the log's lines are numbered in the gutter.
-    pub(crate) line_numbers: bool,
-    /// Whether plain output is coloured by what it says — levels, times,
-    /// addresses — on top of any colour the device sent itself.
-    pub(crate) highlight: bool,
     pub(crate) auto_scroll: bool,
     pub(crate) terminal: Terminal,
     /// The title bar filter box and what it currently holds back.
@@ -323,9 +317,6 @@ impl SerialTabState {
             hex_mode: false,
             text_line_ending: LineEnding::default_for(false),
             hex_line_ending: LineEnding::default_for(true),
-            timestamps: true,
-            line_numbers: true,
-            highlight: true,
             auto_scroll: true,
             terminal: {
                 let mut terminal = Terminal::new(scrollback);
@@ -391,6 +382,16 @@ impl SerialTabState {
         }
     }
 
+    /// Lets the terminal have the read it was keeping back, nothing
+    /// having followed it within the hold, and sends back whatever it
+    /// answers with.
+    pub(crate) fn flush(&mut self) {
+        let answer = self.terminal.flush();
+        if !answer.is_empty() {
+            self.write(answer);
+        }
+    }
+
     /// Hands bytes to the port. Nothing happens when the tab is not open.
     pub(crate) fn write(&self, bytes: Vec<u8>) {
         if let Some(tx) = &self.command_tx {
@@ -431,8 +432,6 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) connecting: bool,
     pub(crate) hex_mode: bool,
     pub(crate) line_ending: LineEnding,
-    pub(crate) timestamps: bool,
-    pub(crate) line_numbers: bool,
     /// How many rows on screen the title bar filter matches, out of how
     /// many there are, while a filter is set — or, while its mask is on,
     /// how many lines of the log it shows, out of how many there are.
@@ -451,8 +450,6 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             connecting: tab.connecting,
             hex_mode: tab.hex_mode,
             line_ending: tab.line_ending(),
-            timestamps: tab.timestamps,
-            line_numbers: tab.line_numbers,
             filter_counts: if tab.masking() {
                 Some(tab.mask.counts())
             } else {

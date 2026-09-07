@@ -10,6 +10,12 @@
 //! terminal answers on its own (a device asking what it is talking to)
 //! comes back out of the same call, to be written to the port.
 //!
+//! What the port reads goes in as it comes, with one exception: a read
+//! that leaves the cursor at the head of a line — the newline a shell
+//! answers Enter with, its prompt a read behind — is kept back for the
+//! next read, or for a moment ([`Terminal::flush`]), so the two go in
+//! together and the cursor goes straight to the prompt.
+//!
 //! Timestamps are not something a terminal has, so they are kept here
 //! beside it. Every line the device ends gets the time its first byte
 //! arrived; when the grid is drawn, those times are laid against the rows
@@ -166,6 +172,14 @@ pub(crate) struct Terminal {
     /// The start of an escape sequence a read ended in the middle of,
     /// kept until the rest arrives and says whether it is an erase.
     held: Vec<u8>,
+    /// A read that left the cursor at the head of a line — its last byte
+    /// a `\r` or a `\n` — kept back with the time it arrived, for the next
+    /// read to go in with, or for [`Terminal::flush`] if none comes. A
+    /// shell answers Enter with the newline first and its prompt a moment
+    /// later, in a read of its own; shown as they come, the cursor lands
+    /// at the head of the line and then jumps to the prompt, at every
+    /// keystroke.
+    pending: Option<(Vec<u8>, String)>,
     /// Lines kept above the screen to scroll back through.
     scrollback: usize,
     /// The number of the oldest line still stamped, counting from one at
@@ -208,6 +222,7 @@ impl Terminal {
             stamps: VecDeque::new(),
             unstamped: true,
             held: Vec::new(),
+            pending: None,
             scrollback,
             first_number: 1,
             revision: 0,
@@ -273,10 +288,61 @@ impl Terminal {
         }
     }
 
-    /// Feeds what the port read, stamped with the time it arrived. Returns
-    /// what the terminal wants written back, usually nothing. A view that
-    /// was following the output goes on following it.
+    /// Takes what the port read, stamped with the time it arrived, and
+    /// returns what the terminal wants written back, usually nothing.
+    ///
+    /// A read that leaves the cursor at the head of a line is not fed yet
+    /// but kept, to go in with the next read — or on its own, from
+    /// [`Terminal::flush`], if none comes within the hold. What was kept
+    /// goes in first, so nothing is reordered.
     pub(crate) fn receive(&mut self, bytes: &[u8], time: &str) -> Vec<u8> {
+        self.feed_pending();
+        if matches!(bytes.last(), Some(b'\r' | b'\n')) {
+            self.pending = Some((bytes.to_vec(), time.to_owned()));
+        } else {
+            self.stamp_and_advance(bytes, time);
+        }
+        self.answers()
+    }
+
+    /// Feeds the read kept back, if there is one, and returns what the
+    /// terminal wants written back for it.
+    pub(crate) fn flush(&mut self) -> Vec<u8> {
+        self.feed_pending();
+        self.answers()
+    }
+
+    /// Whether a read is being kept back for the next.
+    pub(crate) fn holds(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Feeds bytes straight in, with no hold, after anything kept back:
+    /// the workbench's own lines, and a test's device. Returns what the
+    /// terminal wants written back.
+    pub(crate) fn feed(&mut self, bytes: &[u8], time: &str) -> Vec<u8> {
+        self.feed_pending();
+        self.stamp_and_advance(bytes, time);
+        self.answers()
+    }
+
+    fn feed_pending(&mut self) {
+        if let Some((bytes, time)) = self.pending.take() {
+            self.stamp_and_advance(&bytes, &time);
+        }
+    }
+
+    fn answers(&mut self) -> Vec<u8> {
+        std::mem::take(&mut *self.outbox.0.borrow_mut())
+    }
+
+    /// Runs bytes through the emulation, stamping the lines they begin
+    /// with `time`. A view that was following the output goes on
+    /// following it.
+    fn stamp_and_advance(&mut self, bytes: &[u8], time: &str) {
+        if bytes.is_empty() {
+            return;
+        }
         for &byte in bytes {
             if byte == b'\n' {
                 if self.unstamped {
@@ -295,7 +361,6 @@ impl Terminal {
             self.scroll_to_bottom();
         }
         self.revision += 1;
-        std::mem::take(&mut *self.outbox.0.borrow_mut())
     }
 
     /// Runs the bytes through the emulation, watching for the erases that
@@ -396,6 +461,7 @@ impl Terminal {
     /// greyed so it is not taken for the device's. It starts on a fresh
     /// line if the device left the cursor part way through one.
     pub(crate) fn note(&mut self, text: &str, time: &str) {
+        self.feed_pending();
         let mut bytes = Vec::with_capacity(text.len() + 16);
         if self.term.grid().cursor.point.column.0 != 0 {
             bytes.extend_from_slice(b"\r\n");
@@ -403,7 +469,7 @@ impl Terminal {
         bytes.extend_from_slice(b"\x1b[90m");
         bytes.extend_from_slice(text.as_bytes());
         bytes.extend_from_slice(b"\x1b[0m\r\n");
-        let _ = self.receive(&bytes, time);
+        let _ = self.feed(&bytes, time);
     }
 
     /// Fits the grid to the cells the view has room for. Lines already on
@@ -864,11 +930,10 @@ impl Terminal {
     }
 
     /// The screen as it is to be drawn, colours resolved against the theme.
-    /// With `highlight`, text the device left in the default colour takes
-    /// the colour of what it says once its line is finished; the line the
-    /// cursor is still on stays plain, and what the device coloured itself
-    /// is kept either way.
-    pub(crate) fn render(&self, palette: &TerminalPalette, highlight: bool) -> RenderContent {
+    /// Text the device left in the default colour takes the colour of what
+    /// it says once its line is finished; the line the cursor is still on
+    /// stays plain, and what the device coloured itself is kept.
+    pub(crate) fn render(&self, palette: &TerminalPalette) -> RenderContent {
         let grid = self.term.grid();
         let content = self.term.renderable_content();
         let offset = content.display_offset as i32;
@@ -912,7 +977,7 @@ impl Terminal {
                 (line, (!continuation).then(|| number_of(hard)))
             })
             .collect();
-        let rows = self.render_rows(&specs, palette, highlight);
+        let rows = self.render_rows(&specs, palette);
 
         let cursor = (content.cursor.shape != CursorShape::Hidden)
             .then(|| {
@@ -945,7 +1010,6 @@ impl Terminal {
         &self,
         specs: &[(i32, Option<i64>)],
         palette: &TerminalPalette,
-        highlight: bool,
     ) -> Vec<RenderRow> {
         let grid = self.term.grid();
         let colors = self.term.colors();
@@ -954,7 +1018,7 @@ impl Terminal {
             .selection
             .as_ref()
             .and_then(|selection| selection.to_range(&self.term));
-        let highlighter = highlight.then(Highlighter::shared);
+        let highlighter = Highlighter::shared();
         let plain = (
             Color::Named(NamedColor::Foreground),
             Color::Named(NamedColor::Background),
@@ -1020,9 +1084,7 @@ impl Terminal {
                 // One character of the row's text per cell, so a role found
                 // at a position in the text belongs to the cell at that
                 // position.
-                let roles = highlighter
-                    .filter(|_| !unfinished.contains(&line))
-                    .map(|highlighter| highlighter.roles(&text));
+                let roles = (!unfinished.contains(&line)).then(|| highlighter.roles(&text));
                 let mut runs: Vec<RenderRun> = Vec::new();
                 for (index, cell) in pending.into_iter().enumerate() {
                     let flags = cell.flags;
@@ -1440,7 +1502,7 @@ mod tests {
     /// The line number on each row of the screen.
     fn numbers(terminal: &Terminal) -> Vec<Option<usize>> {
         terminal
-            .render(&TerminalPalette::DARK, false)
+            .render(&TerminalPalette::DARK)
             .rows
             .iter()
             .map(|row| row.number)
@@ -1449,7 +1511,7 @@ mod tests {
 
     fn rows(terminal: &Terminal) -> Vec<(Option<String>, String)> {
         terminal
-            .render(&TerminalPalette::DARK, true)
+            .render(&TerminalPalette::DARK)
             .rows
             .into_iter()
             .map(|row| (row.stamp, row.text))
@@ -1467,10 +1529,10 @@ mod tests {
     #[test]
     fn every_line_shows_the_time_it_began() {
         let mut terminal = terminal(40, 5);
-        terminal.receive(b"temp=25\r\n", "10:00:00.000");
-        terminal.receive(b"hum", "10:00:01.000");
-        terminal.receive(b"=61\r\n", "10:00:02.000");
-        terminal.receive(b"\r\n", "10:00:03.000");
+        terminal.feed(b"temp=25\r\n", "10:00:00.000");
+        terminal.feed(b"hum", "10:00:01.000");
+        terminal.feed(b"=61\r\n", "10:00:02.000");
+        terminal.feed(b"\r\n", "10:00:03.000");
         assert_eq!(
             rows(&terminal),
             vec![
@@ -1482,8 +1544,70 @@ mod tests {
             ]
         );
         // The empty line the cursor sits on has no time until something lands on it.
-        terminal.receive(b"OK", "10:00:04.000");
+        terminal.feed(b"OK", "10:00:04.000");
         assert_eq!(rows(&terminal)[3], stamped("10:00:04.000", "OK"));
+    }
+
+    /// A shell answers Enter with the newline first and its prompt a
+    /// moment later, in a read of its own. The first read is kept back
+    /// and goes in with the second, so the cursor goes straight to the
+    /// prompt rather than to the head of the line and then on.
+    #[test]
+    fn a_read_that_ends_at_the_head_of_a_line_waits_for_the_next() {
+        let mut terminal = terminal(30, 3);
+        terminal.receive(b"root@ubuntu:/# ", "1");
+        assert!(!terminal.holds());
+        assert_eq!(terminal.cursor_position(), Some((0, 15)));
+        terminal.receive(b"\r\n\x1b[?2004l\r", "2");
+        assert!(terminal.holds());
+        assert_eq!(terminal.cursor_position(), Some((0, 15)));
+        terminal.receive(b"\x1b[?2004hroot@ubuntu:/# ", "3");
+        assert!(!terminal.holds());
+        assert_eq!(terminal.cursor_position(), Some((1, 15)));
+        assert_eq!(
+            rows(&terminal),
+            vec![
+                stamped("1", "root@ubuntu:/#"),
+                stamped("2", "root@ubuntu:/#"),
+                plain("")
+            ]
+        );
+    }
+
+    /// A read with nothing behind it — a device logging a line, a
+    /// progress bar's return — goes in when the hold runs out, stamped
+    /// with the time it arrived.
+    #[test]
+    fn a_read_on_its_own_goes_in_when_the_hold_runs_out() {
+        let mut terminal = terminal(20, 3);
+        terminal.receive(b"temp=25\r\n", "1");
+        assert!(terminal.holds());
+        assert_eq!(rows(&terminal)[0], plain(""));
+        terminal.flush();
+        assert!(!terminal.holds());
+        assert_eq!(rows(&terminal)[0], stamped("1", "temp=25"));
+        terminal.flush();
+        terminal.receive(b"50%\r", "2");
+        assert_eq!(terminal.cursor_position(), Some((1, 0)));
+        terminal.flush();
+        terminal.receive(b"100%", "3");
+        assert_eq!(
+            rows(&terminal),
+            vec![stamped("1", "temp=25"), stamped("2", "100%"), plain("")]
+        );
+    }
+
+    /// A note printed while a read is kept back comes after it, on a
+    /// line of its own.
+    #[test]
+    fn a_note_comes_after_the_read_kept_back() {
+        let mut terminal = terminal(20, 4);
+        terminal.receive(b"line one\r\n", "1");
+        terminal.note("Port closed.", "2");
+        assert_eq!(
+            rows(&terminal)[..2],
+            [stamped("1", "line one"), stamped("2", "Port closed.")]
+        );
     }
 
     /// Lines are numbered from one, a wrapped line once, and the line the
@@ -1491,13 +1615,13 @@ mod tests {
     #[test]
     fn lines_are_numbered_from_one() {
         let mut terminal = terminal(5, 5);
-        terminal.receive(b"one\r\ntwo\r\nabcdefgh\r\n", "1");
+        terminal.feed(b"one\r\ntwo\r\nabcdefgh\r\n", "1");
         assert_eq!(
             numbers(&terminal),
             vec![Some(1), Some(2), Some(3), None, None],
             "the wrapped third line takes one number, the empty fourth none yet"
         );
-        terminal.receive(b"x", "2");
+        terminal.feed(b"x", "2");
         assert_eq!(numbers(&terminal)[4], Some(4));
     }
 
@@ -1507,7 +1631,7 @@ mod tests {
     fn numbers_keep_counting_past_the_scrollback() {
         let mut terminal = Terminal::with_size(GridSize { columns: 8, lines: 2 }, 3);
         for index in 1..=250 {
-            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+            terminal.feed(format!("l{index}\r\n").as_bytes(), "1");
         }
         assert_eq!(numbers(&terminal), vec![Some(250), None]);
         assert!(terminal.first_number > 1, "the stamps of lost lines went");
@@ -1521,19 +1645,19 @@ mod tests {
     #[test]
     fn a_clear_starts_the_numbering_over() {
         let mut terminal = terminal(8, 3);
-        terminal.receive(b"one\r\ntwo\r\nthree\r\n", "1");
-        terminal.receive(b"\x1b[3J", "2");
-        terminal.receive(b"four", "3");
+        terminal.feed(b"one\r\ntwo\r\nthree\r\n", "1");
+        terminal.feed(b"\x1b[3J", "2");
+        terminal.feed(b"four", "3");
         assert_eq!(numbers(&terminal), vec![Some(2), Some(3), Some(4)]);
-        terminal.receive(b"\x1b[2J", "4");
-        terminal.receive(b"\r\nfive", "5");
+        terminal.feed(b"\x1b[2J", "4");
+        terminal.feed(b"\r\nfive", "5");
         assert_eq!(
             numbers(&terminal),
             vec![None, Some(1), Some(2)],
             "the cleared row above is no line; the line kept is the first again"
         );
         terminal.clear();
-        terminal.receive(b"six", "6");
+        terminal.feed(b"six", "6");
         assert_eq!(numbers(&terminal)[0], Some(1));
     }
 
@@ -1542,14 +1666,14 @@ mod tests {
     fn the_scrollback_can_be_resized() {
         let mut terminal = Terminal::with_size(GridSize { columns: 8, lines: 2 }, 100);
         for index in 1..=50 {
-            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+            terminal.feed(format!("l{index}\r\n").as_bytes(), "1");
         }
         terminal.set_scrollback(10);
         assert_eq!(terminal.scrollback(), 10);
         assert_eq!(terminal.term.grid().history_size(), 10);
         terminal.set_scrollback(1_000);
         for index in 51..=500 {
-            terminal.receive(format!("l{index}\r\n").as_bytes(), "1");
+            terminal.feed(format!("l{index}\r\n").as_bytes(), "1");
         }
         assert_eq!(terminal.term.grid().history_size(), 460);
         assert_eq!(numbers(&terminal), vec![Some(500), None]);
@@ -1560,7 +1684,7 @@ mod tests {
     #[test]
     fn find_locates_matches_across_a_wrap() {
         let mut terminal = terminal(5, 4);
-        terminal.receive(b"abcdefgh\r\nDEF\r\n", "1");
+        terminal.feed(b"abcdefgh\r\nDEF\r\n", "1");
         let mut matcher = OutputFilter::default();
         matcher.set_pattern("def");
         let found = terminal.find(&matcher, |_| true);
@@ -1593,7 +1717,7 @@ mod tests {
     #[test]
     fn find_counts_wide_characters_and_reaches_the_scrollback() {
         let mut terminal = terminal(10, 2);
-        terminal.receive("温度=25\r\nnext\r\nlast\r\n".as_bytes(), "1");
+        terminal.feed("温度=25\r\nnext\r\nlast\r\n".as_bytes(), "1");
         let mut matcher = OutputFilter::default();
         matcher.set_pattern("度=2");
         assert_eq!(
@@ -1606,7 +1730,7 @@ mod tests {
         );
         terminal.scroll_to_line(-2);
         assert!(!terminal.is_at_bottom());
-        assert_eq!(terminal.render(&TerminalPalette::DARK, false).rows[0].text, "温度=25");
+        assert_eq!(terminal.render(&TerminalPalette::DARK).rows[0].text, "温度=25");
     }
 
     /// A match answers to the same name after the rows under it have
@@ -1615,12 +1739,12 @@ mod tests {
     #[test]
     fn a_match_keeps_its_name_as_the_rows_move() {
         let mut terminal = Terminal::with_size(GridSize { columns: 40, lines: 3 }, 100);
-        terminal.receive(b"lost 1\r\nfine\r\nlost 2\r\n", "1");
+        terminal.feed(b"lost 1\r\nfine\r\nlost 2\r\n", "1");
         let mut matcher = OutputFilter::default();
         matcher.set_pattern("lost");
         let before: Vec<_> = terminal.find(&matcher, |_| true).iter().map(FindMatch::key).collect();
         assert_eq!(before, vec![(1, 0), (3, 0)]);
-        terminal.receive(b"lost 3\r\nmore\r\n", "2");
+        terminal.feed(b"lost 3\r\nmore\r\n", "2");
         terminal.resize(8, 6);
         let after: Vec<_> = terminal.find(&matcher, |_| true).iter().map(FindMatch::key).collect();
         assert_eq!(after, vec![(1, 0), (3, 0), (4, 0)]);
@@ -1629,8 +1753,8 @@ mod tests {
     #[test]
     fn a_wrapped_line_carries_its_time_once() {
         let mut terminal = terminal(10, 4);
-        terminal.receive(b"abcdefghijklmno\r\n", "1");
-        terminal.receive(b"next\r\n", "2");
+        terminal.feed(b"abcdefghijklmno\r\n", "1");
+        terminal.feed(b"next\r\n", "2");
         assert_eq!(
             rows(&terminal),
             vec![
@@ -1645,7 +1769,7 @@ mod tests {
     #[test]
     fn a_note_takes_a_line_of_its_own() {
         let mut terminal = terminal(40, 4);
-        terminal.receive(b"login: ", "1");
+        terminal.feed(b"login: ", "1");
         terminal.note("Disconnected from /dev/tty", "2");
         assert_eq!(
             rows(&terminal)[..3],
@@ -1661,7 +1785,7 @@ mod tests {
     fn the_scrollback_keeps_its_times() {
         let mut terminal = terminal(20, 3);
         for index in 1..=6 {
-            terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
+            terminal.feed(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
         assert_eq!(rows(&terminal)[0], stamped("5", "line 5"));
         assert!(terminal.is_at_bottom());
@@ -1681,8 +1805,8 @@ mod tests {
     #[test]
     fn a_clear_from_the_device_wipes_the_log() {
         let mut terminal = terminal(20, 4);
-        terminal.receive(b"one\r\ntwo\r\n", "1");
-        terminal.receive(b"\x1b[H\x1b[2J$ ", "2");
+        terminal.feed(b"one\r\ntwo\r\n", "1");
+        terminal.feed(b"\x1b[H\x1b[2J$ ", "2");
         assert_eq!(
             rows(&terminal),
             vec![stamped("2", "$"), plain(""), plain(""), plain("")]
@@ -1693,7 +1817,7 @@ mod tests {
         terminal.scroll(3);
         assert!(terminal.is_at_bottom());
         assert_eq!(rows(&terminal)[0], stamped("2", "$"));
-        terminal.receive(b"ls\r\nREADME\r\n", "3");
+        terminal.feed(b"ls\r\nREADME\r\n", "3");
         assert_eq!(
             rows(&terminal),
             vec![stamped("2", "$ ls"), stamped("3", "README"), plain(""), plain("")]
@@ -1707,17 +1831,17 @@ mod tests {
     fn a_clear_empties_the_scrollback() {
         let mut terminal = terminal(20, 3);
         for index in 1..=6 {
-            terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
+            terminal.feed(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
         terminal.scroll(2);
         assert!(!terminal.is_at_bottom());
-        terminal.receive(b"\x1b[H\x1b[2J", "7");
+        terminal.feed(b"\x1b[H\x1b[2J", "7");
         assert!(terminal.is_at_bottom());
         assert_eq!(rows(&terminal), vec![stamped("7", ""), plain(""), plain("")]);
         terminal.scroll(1);
         assert_eq!(rows(&terminal), vec![stamped("7", ""), plain(""), plain("")]);
         for index in 8..=11 {
-            terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
+            terminal.feed(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
         assert_eq!(rows(&terminal)[0], stamped("10", "line 10"));
         terminal.scroll(10);
@@ -1733,9 +1857,9 @@ mod tests {
     fn a_resized_view_keeps_the_bottom_of_the_log() {
         let mut terminal = terminal(20, 3);
         for index in 1..=6 {
-            terminal.receive(format!("line {index}\r\n").as_bytes(), &index.to_string());
+            terminal.feed(format!("line {index}\r\n").as_bytes(), &index.to_string());
         }
-        terminal.receive(b"$ ", "7");
+        terminal.feed(b"$ ", "7");
         terminal.resize(20, 5);
         assert_eq!(
             rows(&terminal),
@@ -1759,20 +1883,20 @@ mod tests {
     #[test]
     fn an_erase_from_the_top_is_a_clear() {
         let mut terminal = terminal(20, 3);
-        terminal.receive(b"one\r\ntwo\r\n", "1");
-        terminal.receive(b"\x1b[H\x1b[J$ ", "2");
+        terminal.feed(b"one\r\ntwo\r\n", "1");
+        terminal.feed(b"\x1b[H\x1b[J$ ", "2");
         assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain(""), plain("")]);
-        terminal.receive(b"abc\x1b[2D\x1b[J", "3");
+        terminal.feed(b"abc\x1b[2D\x1b[J", "3");
         assert_eq!(rows(&terminal)[0], stamped("2", "$ a"));
-        terminal.receive(b"\r\nnext", "4");
+        terminal.feed(b"\r\nnext", "4");
         assert_eq!(
             rows(&terminal),
             vec![stamped("2", "$ a"), stamped("4", "next"), plain("")]
         );
         // Below the cursor, from the top of a screen that has scrolled, is
         // the whole screen again.
-        terminal.receive(b"\r\nmore\r\n", "5");
-        terminal.receive(b"\x1b[H\x1b[0J# ", "6");
+        terminal.feed(b"\r\nmore\r\n", "5");
+        terminal.feed(b"\x1b[H\x1b[0J# ", "6");
         assert_eq!(rows(&terminal), vec![stamped("6", "#"), plain(""), plain("")]);
         terminal.scroll(5);
         assert!(terminal.is_at_bottom());
@@ -1781,16 +1905,16 @@ mod tests {
     #[test]
     fn an_erase_cut_short_by_a_read_is_still_seen() {
         let mut terminal = terminal(20, 3);
-        terminal.receive(b"one\r\ntwo\r\n\x1b[H\x1b", "1");
-        terminal.receive(b"[", "2");
+        terminal.feed(b"one\r\ntwo\r\n\x1b[H\x1b", "1");
+        terminal.feed(b"[", "2");
         assert_eq!(rows(&terminal)[0], stamped("1", "one"));
-        terminal.receive(b"J$ ", "3");
+        terminal.feed(b"J$ ", "3");
         assert_eq!(rows(&terminal), vec![stamped("1", "$"), plain(""), plain("")]);
         // What is held back is only ever an erase in the making.
-        terminal.receive(b"\x1b[1", "4");
-        terminal.receive(b"mbold\x1b[0", "4");
-        terminal.receive(b"m\r\n", "4");
-        let content = terminal.render(&TerminalPalette::DARK, false);
+        terminal.feed(b"\x1b[1", "4");
+        terminal.feed(b"mbold\x1b[0", "4");
+        terminal.feed(b"m\r\n", "4");
+        let content = terminal.render(&TerminalPalette::DARK);
         assert_eq!(content.rows[0].text, "$ bold");
         assert!(content.rows[0].runs.iter().any(|run| run.text == "bold" && run.style.bold));
     }
@@ -1800,11 +1924,11 @@ mod tests {
     #[test]
     fn the_device_can_empty_the_scrollback_alone() {
         let mut terminal = terminal(20, 2);
-        terminal.receive(b"one\r\ntwo\r\n", "1");
-        terminal.receive(b"three", "2");
+        terminal.feed(b"one\r\ntwo\r\n", "1");
+        terminal.feed(b"three", "2");
         terminal.scroll(1);
         assert_eq!(rows(&terminal), vec![stamped("1", "one"), stamped("1", "two")]);
-        terminal.receive(b"\x1b[3J", "3");
+        terminal.feed(b"\x1b[3J", "3");
         assert!(terminal.is_at_bottom());
         assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "three")]);
         terminal.scroll(1);
@@ -1816,9 +1940,9 @@ mod tests {
     #[test]
     fn a_full_clear_leaves_nothing() {
         let mut terminal = terminal(20, 2);
-        terminal.receive(b"one\r\ntwo\r\nthree\r\n", "1");
-        terminal.receive(b"\x1b[H\x1b[2J", "2");
-        terminal.receive(b"\x1b[3J$ ", "2");
+        terminal.feed(b"one\r\ntwo\r\nthree\r\n", "1");
+        terminal.feed(b"\x1b[H\x1b[2J", "2");
+        terminal.feed(b"\x1b[3J$ ", "2");
         assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain("")]);
         terminal.scroll(1);
         assert_eq!(rows(&terminal), vec![stamped("2", "$"), plain("")]);
@@ -1829,11 +1953,11 @@ mod tests {
     #[test]
     fn the_alternate_screen_clears_itself_and_not_the_log() {
         let mut terminal = terminal(20, 2);
-        terminal.receive(b"one\r\ntwo\r\n", "1");
-        terminal.receive(b"\x1b[?1049h\x1b[H\x1b[2Jmenu", "2");
+        terminal.feed(b"one\r\ntwo\r\n", "1");
+        terminal.feed(b"\x1b[?1049h\x1b[H\x1b[2Jmenu", "2");
         assert_eq!(rows(&terminal)[0].1, "menu");
-        terminal.receive(b"\x1b[2J\x1b[3J", "3");
-        terminal.receive(b"\x1b[?1049l", "4");
+        terminal.feed(b"\x1b[2J\x1b[3J", "3");
+        terminal.feed(b"\x1b[?1049l", "4");
         assert_eq!(rows(&terminal), vec![stamped("1", "two"), stamped("2", "")]);
         terminal.scroll(1);
         assert_eq!(rows(&terminal), vec![stamped("1", "one"), stamped("1", "two")]);
@@ -1842,14 +1966,14 @@ mod tests {
     #[test]
     fn a_short_log_starts_at_the_top() {
         let mut terminal = terminal(20, 4);
-        terminal.receive(b"one\r\n", "1");
+        terminal.feed(b"one\r\n", "1");
         assert_eq!(
             rows(&terminal),
             vec![stamped("1", "one"), plain(""), plain(""), plain("")]
         );
         assert_eq!(terminal.cursor_position(), Some((1, 0)));
         // A clear with nothing behind it leaves the prompt at the top too.
-        terminal.receive(b"\x1b[H\x1b[2J$ ", "2");
+        terminal.feed(b"\x1b[H\x1b[2J$ ", "2");
         assert_eq!(
             rows(&terminal),
             vec![stamped("2", "$"), plain(""), plain(""), plain("")]
@@ -1875,10 +1999,10 @@ mod tests {
     #[test]
     fn the_device_draws_the_way_a_terminal_shows_it() {
         let mut terminal = terminal(30, 3);
-        terminal.receive(b"\x1b[1;32mroot@board\x1b[0m:~# lss\x08 -la\r\n", "1");
-        terminal.receive(b"10%\r50%\r100%\r\n", "2");
-        terminal.receive("温度 25°C".as_bytes(), "3");
-        let content = terminal.render(&TerminalPalette::DARK, false);
+        terminal.feed(b"\x1b[1;32mroot@board\x1b[0m:~# lss\x08 -la\r\n", "1");
+        terminal.feed(b"10%\r50%\r100%\r\n", "2");
+        terminal.feed("温度 25°C".as_bytes(), "3");
+        let content = terminal.render(&TerminalPalette::DARK);
         assert_eq!(content.rows[0].text, "root@board:~# ls -la");
         assert_eq!(content.rows[1].text, "100%");
         assert_eq!(content.rows[2].text, "温度 25°C");
@@ -1908,10 +2032,10 @@ mod tests {
     #[test]
     fn plain_text_is_coloured_by_what_it_says() {
         let mut terminal = terminal(60, 3);
-        terminal.receive(b"E (1234) wifi: lost 192.168.1.20 after 350ms\r\n", "1");
-        terminal.receive(b"GET /index.html\r\n", "2");
+        terminal.feed(b"E (1234) wifi: lost 192.168.1.20 after 350ms\r\n", "1");
+        terminal.feed(b"GET /index.html\r\n", "2");
         let palette = TerminalPalette::DARK;
-        let content = terminal.render(&palette, true);
+        let content = terminal.render(&palette);
         let colour = |role: Role| role.style(palette.theme).color;
         // A pill: the page's ink on a ground of the role's own.
         let method = run(&content, 1, "GET");
@@ -1947,7 +2071,7 @@ mod tests {
             "E (1234) wifi: lost 192.168.1.20 after 350ms"
         );
         // The light theme picks the same roles in its own colours.
-        let light = terminal.render(&TerminalPalette::LIGHT, true);
+        let light = terminal.render(&TerminalPalette::LIGHT);
         assert_eq!(
             run(&light, 0, "E").style.foreground,
             Role::Error.style(TerminalPalette::LIGHT.theme).color
@@ -1958,9 +2082,9 @@ mod tests {
     #[test]
     fn a_devices_own_colours_are_kept() {
         let mut terminal = terminal(40, 2);
-        terminal.receive(b"\x1b[32mERROR\x1b[0m ERROR \x1b[7mERROR\x1b[0m\r\n", "1");
+        terminal.feed(b"\x1b[32mERROR\x1b[0m ERROR \x1b[7mERROR\x1b[0m\r\n", "1");
         let palette = TerminalPalette::DARK;
-        let content = terminal.render(&palette, true);
+        let content = terminal.render(&palette);
         // Blank stretches are not shaped, so the three words are the runs.
         let runs = &content.rows[0].runs;
         assert_eq!(runs.len(), 3);
@@ -1981,47 +2105,36 @@ mod tests {
     fn the_line_being_written_waits_for_its_colour() {
         let mut terminal = terminal(10, 4);
         let palette = TerminalPalette::DARK;
-        terminal.receive(b"ERROR one\r\n", "1");
+        terminal.feed(b"ERROR one\r\n", "1");
         // Seventeen characters wrap onto a second row; the cursor is on it.
-        terminal.receive(b"ERROR 1234 ERROR", "2");
-        let content = terminal.render(&palette, true);
+        terminal.feed(b"ERROR 1234 ERROR", "2");
+        let content = terminal.render(&palette);
         assert_eq!(run(&content, 0, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
         for row in 1..3 {
             assert_eq!(content.rows[row].runs.len(), 1, "row {row} is one plain run");
             assert_eq!(content.rows[row].runs[0].style.foreground, palette.foreground);
         }
         // Ending the line finishes it, and the colour arrives.
-        terminal.receive(b"\r\n", "3");
-        let content = terminal.render(&palette, true);
+        terminal.feed(b"\r\n", "3");
+        let content = terminal.render(&palette);
         assert_eq!(run(&content, 1, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
         assert_eq!(run(&content, 2, "ERROR").style.foreground, Role::Error.style(palette.theme).color);
     }
 
     #[test]
-    fn colouring_can_be_switched_off() {
-        let mut terminal = terminal(40, 2);
-        terminal.receive(b"ERROR at 10:00:00\r\n", "1");
-        let palette = TerminalPalette::DARK;
-        let content = terminal.render(&palette, false);
-        assert_eq!(content.rows[0].runs.len(), 1);
-        assert_eq!(content.rows[0].runs[0].style.foreground, palette.foreground);
-        assert!(terminal.render(&palette, true).rows[0].runs.len() > 1);
-    }
-
-    #[test]
     fn a_split_character_is_whole_on_arrival() {
         let mut terminal = terminal(20, 2);
-        terminal.receive(b"T=\xe6\xb8", "1");
-        terminal.receive(b"\xa9\r\n", "2");
+        terminal.feed(b"T=\xe6\xb8", "1");
+        terminal.feed(b"\xa9\r\n", "2");
         assert_eq!(rows(&terminal)[0], stamped("1", "T=温"));
     }
 
     #[test]
     fn clearing_starts_over() {
         let mut terminal = terminal(20, 2);
-        terminal.receive(b"old\r\n", "1");
+        terminal.feed(b"old\r\n", "1");
         terminal.clear();
-        terminal.receive(b"new", "2");
+        terminal.feed(b"new", "2");
         assert_eq!(rows(&terminal), vec![stamped("2", "new"), plain("")]);
     }
 
@@ -2030,11 +2143,11 @@ mod tests {
     fn a_program_can_ask_for_a_steady_cursor() {
         let mut terminal = terminal(20, 2);
         assert!(terminal.cursor_blinks());
-        terminal.receive(b"\x1b[2 q", "1");
+        terminal.feed(b"\x1b[2 q", "1");
         assert!(!terminal.cursor_blinks());
-        terminal.receive(b"\x1b[1 q", "2");
+        terminal.feed(b"\x1b[1 q", "2");
         assert!(terminal.cursor_blinks());
-        terminal.receive(b"\x1b[0 q", "3");
+        terminal.feed(b"\x1b[0 q", "3");
         assert!(terminal.cursor_blinks());
     }
 
@@ -2051,14 +2164,14 @@ mod tests {
     #[test]
     fn a_selection_reads_back_as_text() {
         let mut terminal = terminal(6, 4);
-        terminal.receive(b"hello world\r\nnext\r\n", "1");
+        terminal.feed(b"hello world\r\nnext\r\n", "1");
         assert!(!terminal.has_selection());
         terminal.begin_selection(cell(0, 1, false), SelectionKind::Cells);
         assert!(!terminal.has_selection(), "a press alone selects nothing");
         terminal.extend_selection(cell(1, 2, true));
         assert!(terminal.has_selection());
         assert_eq!(terminal.selection_text().as_deref(), Some("ello wor"));
-        let content = terminal.render(&TerminalPalette::DARK, false);
+        let content = terminal.render(&TerminalPalette::DARK);
         let selected: Vec<_> = content.rows.iter().map(|row| row.selected.clone()).collect();
         assert_eq!(selected, vec![Some(1..6), Some(0..3), None, None]);
         assert!(terminal.clear_selection());
@@ -2071,7 +2184,7 @@ mod tests {
     #[test]
     fn words_lines_and_the_whole_log_can_be_selected() {
         let mut terminal = terminal(6, 4);
-        terminal.receive(b"hello world\r\nnext\r\n", "1");
+        terminal.feed(b"hello world\r\nnext\r\n", "1");
         terminal.begin_selection(cell(1, 1, false), SelectionKind::Words);
         assert_eq!(terminal.selection_text().as_deref(), Some("world"));
         terminal.begin_selection(cell(2, 3, false), SelectionKind::Lines);
@@ -2092,10 +2205,10 @@ mod tests {
     #[test]
     fn a_selection_rides_with_its_text() {
         let mut terminal = terminal(10, 2);
-        terminal.receive(b"first\r\n", "1");
+        terminal.feed(b"first\r\n", "1");
         terminal.begin_selection(cell(0, 0, false), SelectionKind::Words);
         assert_eq!(terminal.selection_text().as_deref(), Some("first"));
-        terminal.receive(b"second\r\nthird\r\n", "2");
+        terminal.feed(b"second\r\nthird\r\n", "2");
         assert_eq!(terminal.selection_text().as_deref(), Some("first"));
         terminal.resize(10, 3);
         assert_eq!(terminal.selection_text().as_deref(), Some("first"));

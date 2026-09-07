@@ -537,7 +537,7 @@ mod tests {
 
     fn log() -> Terminal {
         let mut terminal = Terminal::new(100);
-        terminal.receive(b"ok\r\nERROR one\r\nok\r\nERROR two\r\n", "1");
+        terminal.feed(b"ok\r\nERROR one\r\nok\r\nERROR two\r\n", "1");
         terminal
     }
 
@@ -578,7 +578,7 @@ mod tests {
         find.refresh(&terminal, None, true);
         find.step(true);
         assert_eq!(find.current_index(), Some(0));
-        terminal.receive(b"ERROR three\r\n", "2");
+        terminal.feed(b"ERROR three\r\n", "2");
         terminal.resize(12, 3);
         find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 3);
@@ -615,7 +615,7 @@ mod tests {
         find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 2);
         assert!(!find.refresh(&terminal, None, false), "nothing changed");
-        terminal.receive(b"ok\r\n", "3");
+        terminal.feed(b"ok\r\n", "3");
         assert!(
             find.refresh(&terminal, None, false),
             "changed within the interval: owed"

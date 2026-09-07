@@ -61,6 +61,16 @@ use updater::{
 const REPOSITORY_URL: &str = "https://github.com/miskin-lee/serialX";
 /// Half a period of the cursor's blink: this long on, this long off.
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+/// How long a read that leaves the cursor at the head of a line is kept
+/// back for what follows. A shell answers Enter with the newline at once
+/// and its prompt a moment later, in a read of its own — bash on a board
+/// behind a USB-UART bridge was measured at 10 ms between the two — and
+/// shown as they come, the cursor lands at the head of the line and then
+/// jumps to the prompt, at every keystroke. Kept back, the two go in
+/// together. A read nothing follows — a line logged, a progress bar's
+/// return — goes in on its own when the hold runs out, which is too soon
+/// to be seen; the hold is long enough for a slower board's shell.
+const LINE_HOLD: Duration = Duration::from_millis(80);
 
 enum UpdateStatus {
     Checking,
@@ -260,6 +270,10 @@ impl SerialWorkspace {
     /// threads report something, then hands it over at once — together with
     /// whatever else has arrived meanwhile, so a burst is one update and
     /// one frame rather than many. It ends when the tab is gone.
+    ///
+    /// While the terminal is keeping back a read the sleep is bounded by
+    /// [`LINE_HOLD`]: if nothing follows within it, an empty batch goes
+    /// over, and the read goes in on its own.
     fn listen_to_port(
         id: usize,
         events: Option<smol::channel::Receiver<SerialEvent>>,
@@ -269,16 +283,32 @@ impl SerialWorkspace {
             return;
         };
         cx.spawn(async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                let mut batch = vec![event];
-                while let Ok(event) = events.try_recv() {
-                    batch.push(event);
-                }
-                if this
-                    .update(cx, |this, cx| this.handle_serial_events(id, batch, cx))
-                    .is_err()
-                {
-                    break;
+            let mut holding = false;
+            loop {
+                let next = if holding {
+                    let more = async { events.recv().await.map(Some) };
+                    let hold = async {
+                        Timer::after(LINE_HOLD).await;
+                        Ok(None)
+                    };
+                    smol::future::or(more, hold).await
+                } else {
+                    events.recv().await.map(Some)
+                };
+                let batch = match next {
+                    Ok(Some(event)) => {
+                        let mut batch = vec![event];
+                        while let Ok(event) = events.try_recv() {
+                            batch.push(event);
+                        }
+                        batch
+                    }
+                    Ok(None) => Vec::new(),
+                    Err(_) => break,
+                };
+                match this.update(cx, |this, cx| this.handle_serial_events(id, batch, cx)) {
+                    Ok(still_holding) => holding = still_holding,
+                    Err(_) => break,
                 }
             }
         })
@@ -739,15 +769,22 @@ impl SerialWorkspace {
         cx.notify();
     }
 
+    /// Feeds a tab what its port reported. An empty batch is the hold on
+    /// a read running out (see [`LINE_HOLD`]): the read goes in by itself.
+    /// Says whether the terminal is now keeping one back, so the listener
+    /// knows to bound its next sleep.
     fn handle_serial_events(
         &mut self,
         tab_id: usize,
         events: Vec<SerialEvent>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let Some(tab) = self.tab_mut(tab_id) else {
-            return;
+            return false;
         };
+        if events.is_empty() {
+            tab.flush();
+        }
         for event in events {
             match event {
                 SerialEvent::Connected => {
@@ -770,6 +807,7 @@ impl SerialWorkspace {
             tab.scroll_to_bottom();
         }
         cx.notify();
+        tab.terminal.holds()
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -812,27 +850,6 @@ impl SerialWorkspace {
             && tab.line_ending() != ending
         {
             tab.set_line_ending(ending);
-            cx.notify();
-        }
-    }
-
-    fn toggle_timestamps(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.timestamps = !tab.timestamps;
-            cx.notify();
-        }
-    }
-
-    fn toggle_line_numbers(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.line_numbers = !tab.line_numbers;
-            cx.notify();
-        }
-    }
-
-    fn toggle_highlight(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.highlight = !tab.highlight;
             cx.notify();
         }
     }

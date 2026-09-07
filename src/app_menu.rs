@@ -23,9 +23,6 @@ actions!(
         TogglePause,
         ClearTerminal,
         ToggleHex,
-        ToggleTimestamps,
-        ToggleLineNumbers,
-        ToggleHighlight,
         ToggleAutoScroll,
         ToggleSidePanel,
         PreviousTab,
@@ -69,8 +66,6 @@ keystroke!(PAUSE_KEYSTROKE, "cmd-shift-p", "ctrl-shift-p");
 // bar in every browser, so the pair is left alone here.
 keystroke!(CLEAR_KEYSTROKE, "cmd-k", "ctrl-k");
 keystroke!(HEX_KEYSTROKE, "cmd-shift-h", "ctrl-shift-h");
-keystroke!(TIMESTAMPS_KEYSTROKE, "cmd-shift-t", "ctrl-shift-t");
-keystroke!(LINE_NUMBERS_KEYSTROKE, "cmd-shift-n", "ctrl-shift-n");
 keystroke!(AUTO_SCROLL_KEYSTROKE, "cmd-shift-a", "ctrl-shift-a");
 keystroke!(THEME_KEYSTROKE, "cmd-shift-l", "ctrl-shift-l");
 keystroke!(SIDE_PANEL_KEYSTROKE, "cmd-b", "ctrl-b");
@@ -143,9 +138,6 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Filter Output…", FocusOutputFilter),
             MenuItem::separator(),
             MenuItem::action("Send as HEX", ToggleHex),
-            MenuItem::action("Toggle Timestamps", ToggleTimestamps),
-            MenuItem::action("Toggle Line Numbers", ToggleLineNumbers),
-            MenuItem::action("Toggle Semantic Colours", ToggleHighlight),
             MenuItem::action("Toggle Auto-scroll", ToggleAutoScroll),
             MenuItem::separator(),
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
@@ -220,8 +212,6 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(PAUSE_KEYSTROKE, TogglePause, None),
         KeyBinding::new(CLEAR_KEYSTROKE, ClearTerminal, None),
         KeyBinding::new(HEX_KEYSTROKE, ToggleHex, None),
-        KeyBinding::new(TIMESTAMPS_KEYSTROKE, ToggleTimestamps, None),
-        KeyBinding::new(LINE_NUMBERS_KEYSTROKE, ToggleLineNumbers, None),
         KeyBinding::new(AUTO_SCROLL_KEYSTROKE, ToggleAutoScroll, None),
         KeyBinding::new(THEME_KEYSTROKE, ToggleTheme, None),
         KeyBinding::new(SIDE_PANEL_KEYSTROKE, ToggleSidePanel, None),
@@ -297,16 +287,6 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     });
 
     let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleTimestamps, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_timestamps(cx));
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleLineNumbers, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_line_numbers(cx));
-    });
-
-    let view = workspace.downgrade();
     cx.on_action(move |_: &FindInOutput, cx| {
         defer_window_action(cx, view.clone(), |view, window, cx| {
             view.open_find(window, cx);
@@ -340,11 +320,6 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
         defer_window_action(cx, view.clone(), |view, window, cx| {
             view.open_settings_dialog(window, cx);
         });
-    });
-
-    let view = workspace.downgrade();
-    cx.on_action(move |_: &ToggleHighlight, cx| {
-        let _ = view.update(cx, |view, cx| view.toggle_highlight(cx));
     });
 
     let view = workspace.downgrade();
@@ -484,6 +459,21 @@ mod tests {
         assert!(labels(help).iter().any(|label| label == "Check for Updates…"));
         let application = menus.first().expect("an application menu");
         assert!(!labels(application).iter().any(|label| label == "Check for Updates…"));
+    }
+
+    /// The line numbers, the timestamps and the colours are always on:
+    /// the menu offers nothing to switch off.
+    #[test]
+    fn view_menu_offers_no_switch_for_what_is_always_on() {
+        let menus = application_menus();
+        let view = menus
+            .iter()
+            .find(|menu| menu.name == "View")
+            .expect("a View menu");
+        let labels = labels(view);
+        for gone in ["Timestamps", "Line Numbers", "Colours"] {
+            assert!(!labels.iter().any(|label| label.contains(gone)), "{gone}");
+        }
     }
 
     /// Rescan and pause live on the toolbar and their shortcuts, not the menu.

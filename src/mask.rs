@@ -282,7 +282,7 @@ impl SerialTabState {
     /// one.
     pub(crate) fn view_content(&self, palette: &TerminalPalette) -> RenderContent {
         if !self.masking() {
-            return self.terminal.render(palette, self.highlight);
+            return self.terminal.render(palette);
         }
         let specs: Vec<(i32, Option<i64>)> = self
             .mask
@@ -291,7 +291,7 @@ impl SerialTabState {
             .map(|row| (row.line, (row.part == 0).then_some(row.number)))
             .collect();
         RenderContent {
-            rows: self.terminal.render_rows(&specs, palette, self.highlight),
+            rows: self.terminal.render_rows(&specs, palette),
             cursor: None,
         }
     }
@@ -375,7 +375,7 @@ mod tests {
     fn the_mask_keeps_the_lines_that_match() {
         let mut terminal = Terminal::new(100);
         terminal.resize(8, 4);
-        terminal.receive(b"ok\r\nERROR one\r\nok\r\nERR\r\n", "1");
+        terminal.feed(b"ok\r\nERROR one\r\nok\r\nERR\r\n", "1");
         let filter = masked();
         let mut mask = MaskState::default();
         mask.refresh(&terminal, &filter);
@@ -403,7 +403,7 @@ mod tests {
         let mut terminal = Terminal::new(100);
         terminal.resize(20, 2);
         for index in 0..6 {
-            terminal.receive(format!("err {index}\r\n").as_bytes(), "1");
+            terminal.feed(format!("err {index}\r\n").as_bytes(), "1");
         }
         let mut filter = masked();
         let mut mask = MaskState::default();
@@ -414,7 +414,7 @@ mod tests {
         mask.scroll(3, 2);
         assert!(!mask.is_at_bottom());
         assert_eq!(lines(&mask, 2), vec![-4, -3]);
-        terminal.receive(b"err 6\r\nok\r\nerr 7\r\n", "2");
+        terminal.feed(b"err 6\r\nok\r\nerr 7\r\n", "2");
         mask.refresh(&terminal, &filter);
         assert_eq!(lines(&mask, 2), vec![-7, -6], "the same rows, moved up");
         assert_eq!(mask.cache.len(), 8, "the settled lines, answered once");

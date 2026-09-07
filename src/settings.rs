@@ -1,25 +1,26 @@
 //! Settings: what is the workbench's to set rather than a session's.
 //!
-//! Two so far — how many lines a terminal keeps above its screen, and the
-//! size its log is set in — so the dialog is two fields, opened from the
-//! application menu with ⌘, as every macOS application opens its own. What
-//! is set is written to the workspace file beside the presets, and takes
-//! effect at once in every open session.
+//! Two so far — how many lines a terminal keeps above its screen, typed as a
+//! number, and the size its log is set in, picked from the list of sizes the
+//! setting offers — opened from the application menu with ⌘, as every macOS
+//! application opens its own. What is set is written to the workspace file
+//! beside the presets, and takes effect at once in every open session.
 
 use gpui_kit::component::{
-    Sizable, WindowExt,
-    input::{Input, InputState},
+    Icon, IconName, Sizable, WindowExt,
+    button::{Button, ButtonVariants},
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
+    v_flex,
 };
 use gpui_kit::*;
 
 use crate::SerialWorkspace;
 use crate::controls::{dialog_footer, eyebrow};
 use crate::icons::{Glyph, icon_chip};
-use crate::presets::{
-    MAX_SCROLLBACK_LINES, MAX_TERMINAL_FONT_SIZE, MIN_SCROLLBACK_LINES, MIN_TERMINAL_FONT_SIZE,
-    Settings,
-};
-use crate::theme::{CAPTION, LABEL, TITLE, Typography, WorkbenchPalette};
+use crate::presets::{MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES};
+use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
 
 /// Width of the dialog: a number, and a sentence about it.
 const DIALOG_WIDTH: f32 = 420.;
@@ -27,6 +28,9 @@ const DIALOG_WIDTH: f32 = 420.;
 const FIELD_HEIGHT: f32 = 30.;
 /// The gap between the two settings.
 const SECTION_GAP: f32 = 14.;
+/// Width of the size field: a couple of digits, a `pt` and a caret. The list
+/// it opens is at least as wide as the field it hangs from.
+const SIZE_FIELD_WIDTH: f32 = 108.;
 
 /// Reads a count of lines as typed: digits, with the thousands separators
 /// anyone might put in, within the bounds the setting takes.
@@ -48,29 +52,8 @@ pub(crate) fn parse_scrollback_lines(text: &str) -> Result<usize, &'static str> 
     Ok(lines)
 }
 
-/// Reads a type size as typed: a number of points, whole or with a half,
-/// within the bounds the setting takes. Anything finer is rounded to the
-/// nearest half point, which is as fine as the size is worth setting.
-pub(crate) fn parse_font_size(text: &str) -> Result<f32, &'static str> {
-    let digits = text.trim().trim_end_matches("pt").trim();
-    if digits.is_empty() {
-        return Err("Enter a size in points");
-    }
-    let size: f32 = digits.parse().map_err(|_| "Numbers only")?;
-    if !size.is_finite() {
-        return Err("Numbers only");
-    }
-    let size = (size * 2.).round() / 2.;
-    if size < MIN_TERMINAL_FONT_SIZE {
-        return Err("At least 8 points");
-    }
-    if size > MAX_TERMINAL_FONT_SIZE {
-        return Err("At most 32 points");
-    }
-    Ok(size)
-}
-
-/// A type size as the field shows it: the half point only when there is one.
+/// A type size as the field and its list show it: the half point only when
+/// there is one.
 pub(crate) fn format_font_size(size: f32) -> String {
     if (size - size.round()).abs() < f32::EPSILON {
         format!("{}", size.round() as i32)
@@ -92,48 +75,204 @@ pub(crate) fn format_lines(lines: usize) -> String {
     out
 }
 
-/// One setting: its label, the field its number is typed in with the unit
-/// after it, and a line under the field — what the number means and the
-/// bounds it keeps within while it will do, the reason it will not when it
-/// will not, in the colour that says which.
-fn setting_field(
+/// The settings as they are being set: the scrollback typed into a field, the
+/// type size picked from a list. Nothing here reaches the workspace until the
+/// dialog is confirmed.
+struct SettingsEditor {
+    theme: InterfaceTheme,
+    lines_input: Entity<InputState>,
+    _lines_subscription: Subscription,
+    font_size: f32,
+}
+
+impl SettingsEditor {
+    fn new(
+        theme: InterfaceTheme,
+        current: Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let lines_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(format_lines(Settings::default().scrollback_lines))
+                .default_value(format_lines(current.scrollback_lines))
+        });
+        // The line under the field answers what has been typed, so the
+        // dialog is drawn again at every keystroke.
+        let lines_subscription = cx.subscribe_in(
+            &lines_input,
+            window,
+            |_, _, event: &InputEvent, _, cx: &mut Context<Self>| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
+
+        Self {
+            theme,
+            lines_input,
+            _lines_subscription: lines_subscription,
+            font_size: current.terminal_font_size,
+        }
+    }
+
+    /// The scrollback as typed, or why it will not do.
+    fn scrollback_lines(&self, cx: &App) -> Result<usize, &'static str> {
+        parse_scrollback_lines(self.lines_input.read(cx).value().as_ref())
+    }
+
+    /// Puts the cursor in the scrollback field with its number selected, so
+    /// a new one can be typed over it.
+    fn focus_lines(&self, select: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.lines_input.update(cx, |field, cx| {
+            field.focus(window, cx);
+            if select {
+                field.select_all(window, cx);
+            }
+        });
+    }
+
+    fn select_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        self.font_size = size;
+        cx.notify();
+    }
+
+    /// The size field: the size it is set to and a caret, drawn as the other
+    /// field is drawn, opening the list of sizes with the current one ticked.
+    fn render_size_field(
+        &mut self,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let current = self.font_size;
+        let editor = cx.weak_entity();
+
+        Button::new("settings-font-size")
+            .ghost()
+            .with_size(px(FIELD_HEIGHT))
+            .w(px(SIZE_FIELD_WIDTH))
+            .h(px(FIELD_HEIGHT))
+            .pl_2p5()
+            .pr_2()
+            .bg(rgb(palette.input))
+            .border_1()
+            .border_color(rgb(palette.input_border))
+            .rounded(px(8.))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_baseline()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .ui_mono_token(LABEL)
+                                    .text_color(rgb(palette.strong_foreground))
+                                    .child(format_font_size(current)),
+                            )
+                            .child(
+                                div()
+                                    .text_token(CAPTION)
+                                    .text_color(rgb(palette.faint))
+                                    .child("pt"),
+                            ),
+                    )
+                    .child(
+                        Icon::new(IconName::ChevronDown)
+                            .size(px(12.))
+                            .text_color(rgb(palette.muted)),
+                    ),
+            )
+            .tooltip("The size the terminal's log is set in")
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                menu = menu.min_w(px(SIZE_FIELD_WIDTH));
+                for size in TERMINAL_FONT_SIZES {
+                    let editor = editor.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format_font_size(size))
+                            .checked((current - size).abs() < f32::EPSILON)
+                            .on_click(move |_, _, cx| {
+                                let _ = editor
+                                    .update(cx, |editor, cx| editor.select_font_size(size, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    }
+}
+
+impl Render for SettingsEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.theme.palette();
+        // The field says as it is typed whether the number will do.
+        let verdict = self.scrollback_lines(cx);
+        let lines = Input::new(&self.lines_input)
+            .small()
+            .h(px(FIELD_HEIGHT))
+            .ui_mono_token(LABEL)
+            .bg(rgb(palette.input))
+            .border_color(rgb(if verdict.is_ok() {
+                palette.input_border
+            } else {
+                palette.danger
+            }))
+            .rounded(px(8.))
+            .px_2p5()
+            .focus_bordered(verdict.is_ok())
+            .suffix(
+                div()
+                    .text_token(CAPTION)
+                    .text_color(rgb(palette.faint))
+                    .child("lines"),
+            );
+        let size = self.render_size_field(palette, cx);
+
+        v_flex()
+            .gap(px(SECTION_GAP))
+            .child(setting_section(
+                palette,
+                "Scrollback",
+                lines,
+                match &verdict {
+                    Ok(_) => Ok("Lines kept above the screen, in every session. 100 to 1,000,000; the change takes effect at once."),
+                    Err(reason) => Err(*reason),
+                },
+            ))
+            .child(setting_section(
+                palette,
+                "Terminal text",
+                size,
+                Ok("The size the log is set in, in every session. The line numbers, the timestamps and the line height follow it."),
+            ))
+    }
+}
+
+/// One setting: its label, the control it is set with, and a line under that
+/// — what the setting means while what is set will do, the reason it will
+/// not otherwise, in the colour that says which.
+fn setting_section(
     palette: WorkbenchPalette,
     label: &str,
-    input: &Entity<InputState>,
-    unit: &'static str,
+    control: impl IntoElement,
     hint: Result<&str, &str>,
 ) -> impl IntoElement {
-    let good = hint.is_ok();
     let (hint, hint_color) = match hint {
         Ok(blurb) => (blurb.to_owned(), palette.muted),
         Err(reason) => (reason.to_owned(), palette.danger),
     };
-    div()
-        .flex()
-        .flex_col()
+    v_flex()
         .gap_2()
         .child(eyebrow(palette, label))
-        .child(
-            Input::new(input)
-                .small()
-                .h(px(FIELD_HEIGHT))
-                .ui_mono_token(LABEL)
-                .bg(rgb(palette.input))
-                .border_color(rgb(if good {
-                    palette.input_border
-                } else {
-                    palette.danger
-                }))
-                .rounded(px(8.))
-                .px_2p5()
-                .focus_bordered(good)
-                .suffix(
-                    div()
-                        .text_token(CAPTION)
-                        .text_color(rgb(palette.faint))
-                        .child(unit),
-                ),
-        )
+        .child(control)
         .child(
             div()
                 .text_token(CAPTION)
@@ -145,29 +284,16 @@ fn setting_field(
 impl SerialWorkspace {
     /// Opens the dialog on the settings as they are.
     pub(crate) fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let palette = self.interface_theme.palette();
+        let theme = self.interface_theme;
+        let palette = theme.palette();
         let current = self.presets.settings;
-        let defaults = Settings::default();
-        let lines_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(format_lines(defaults.scrollback_lines))
-                .default_value(format_lines(current.scrollback_lines))
-        });
-        let size_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(format_font_size(defaults.terminal_font_size))
-                .default_value(format_font_size(current.terminal_font_size))
-        });
-        let field = lines_input.clone();
+        let editor = cx.new(|cx| SettingsEditor::new(theme, current, window, cx));
+        let field = editor.clone();
         let workspace = cx.weak_entity();
 
-        window.open_alert_dialog(cx, move |alert, _, cx| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
             let workspace = workspace.clone();
-            let lines_input = lines_input.clone();
-            let size_input = size_input.clone();
-            // Each field says as it is typed whether its number will do.
-            let lines = parse_scrollback_lines(lines_input.read(cx).value().as_ref());
-            let size = parse_font_size(size_input.read(cx).value().as_ref());
+            let editor = editor.clone();
             alert
                 .width(px(DIALOG_WIDTH))
                 .p_5()
@@ -180,48 +306,17 @@ impl SerialWorkspace {
                 )
                 .description("Kept with the workspace, for every session.")
                 .close_button(true)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(SECTION_GAP))
-                        .child(setting_field(
-                            palette,
-                            "Scrollback",
-                            &lines_input,
-                            "lines",
-                            match &lines {
-                                Ok(_) => Ok("Lines kept above the screen, in every session. 100 to 1,000,000; the change takes effect at once."),
-                                Err(reason) => Err(*reason),
-                            },
-                        ))
-                        .child(setting_field(
-                            palette,
-                            "Terminal text",
-                            &size_input,
-                            "pt",
-                            match &size {
-                                Ok(_) => Ok("The size the log is set in, in every session. 8 to 32 points; the line numbers and timestamps follow it."),
-                                Err(reason) => Err(*reason),
-                            },
-                        )),
-                )
+                .child(editor.clone())
                 .footer(dialog_footer(palette, "Save", Glyph::Bookmark, None))
                 .on_ok(move |_, window, cx| {
                     // A number that will not do keeps the dialog open with
-                    // that field in focus, and the reason under it.
-                    let Ok(scrollback_lines) =
-                        parse_scrollback_lines(lines_input.read(cx).value().as_ref())
-                    else {
-                        lines_input.update(cx, |input, cx| input.focus(window, cx));
+                    // the field in focus, and the reason under it. The size
+                    // comes from a list, so there is nothing to check.
+                    let Ok(scrollback_lines) = editor.read(cx).scrollback_lines(cx) else {
+                        editor.update(cx, |editor, cx| editor.focus_lines(false, window, cx));
                         return false;
                     };
-                    let Ok(terminal_font_size) =
-                        parse_font_size(size_input.read(cx).value().as_ref())
-                    else {
-                        size_input.update(cx, |input, cx| input.focus(window, cx));
-                        return false;
-                    };
+                    let terminal_font_size = editor.read(cx).font_size;
                     let _ = workspace.update(cx, |workspace, cx| {
                         workspace.apply_settings(
                             Settings {
@@ -235,14 +330,11 @@ impl SerialWorkspace {
                 })
         });
 
-        // The dialog takes focus as it opens; the first field takes it back
-        // once the dialog is there, with the number selected so a new one
-        // can be typed over it.
+        // The dialog takes focus as it opens; the field takes it back once
+        // the dialog is there, with the number selected so a new one can
+        // be typed over it.
         cx.defer_in(window, move |_, window, cx| {
-            field.update(cx, |field, cx| {
-                field.focus(window, cx);
-                field.select_all(window, cx);
-            });
+            field.update(cx, |editor, cx| editor.focus_lines(true, window, cx));
         });
     }
 
@@ -259,7 +351,11 @@ impl SerialWorkspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_font_size, format_lines, parse_font_size, parse_scrollback_lines};
+    use super::{format_font_size, format_lines, parse_scrollback_lines};
+    use crate::presets::{
+        DEFAULT_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE,
+        TERMINAL_FONT_SIZES,
+    };
 
     #[test]
     fn a_count_of_lines_is_read_as_typed_and_kept_in_bounds() {
@@ -275,17 +371,15 @@ mod tests {
         );
     }
 
+    /// The list the field opens: sizes in order, none outside the bounds, and
+    /// the size a fresh workspace starts at among them, so the field always
+    /// opens with one of its rows ticked.
     #[test]
-    fn a_type_size_is_read_as_typed_and_kept_in_bounds() {
-        assert_eq!(parse_font_size("14"), Ok(14.));
-        assert_eq!(parse_font_size(" 12.5 "), Ok(12.5));
-        assert_eq!(parse_font_size("13pt"), Ok(13.));
-        // Finer than a half point is as good as a half point.
-        assert_eq!(parse_font_size("13.4"), Ok(13.5));
-        assert_eq!(parse_font_size(""), Err("Enter a size in points"));
-        assert_eq!(parse_font_size("big"), Err("Numbers only"));
-        assert_eq!(parse_font_size("7"), Err("At least 8 points"));
-        assert_eq!(parse_font_size("33"), Err("At most 32 points"));
+    fn the_sizes_offered_climb_within_the_bounds_and_hold_the_default() {
+        assert!(TERMINAL_FONT_SIZES.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(TERMINAL_FONT_SIZES.first(), Some(&MIN_TERMINAL_FONT_SIZE));
+        assert_eq!(TERMINAL_FONT_SIZES.last(), Some(&MAX_TERMINAL_FONT_SIZE));
+        assert!(TERMINAL_FONT_SIZES.contains(&DEFAULT_TERMINAL_FONT_SIZE));
     }
 
     #[test]

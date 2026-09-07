@@ -88,9 +88,15 @@ pub(crate) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 /// The size the terminal's log is set in out of the box, in points: the
 /// size it was set in before the size could be set at all.
 pub(crate) const DEFAULT_TERMINAL_FONT_SIZE: f32 = 12.5;
-/// The least and the most the setting takes. Below eight points the log is
-/// there to squint at rather than to read; above thirty-two a window holds
-/// so few columns that a device's own line wraps.
+/// The sizes the setting offers, as its list shows them: an editor's ladder
+/// of type sizes, close together around the default and further apart at the
+/// ends, where a point either way makes little odds.
+pub(crate) const TERMINAL_FONT_SIZES: [f32; 14] = [
+    8., 9., 10., 11., 12., 12.5, 13., 14., 15., 16., 18., 20., 24., 32.,
+];
+/// The least and the most the setting takes — the ends of that list. Below
+/// eight points the log is there to squint at rather than to read; above
+/// thirty-two a window holds so few columns that a device's own line wraps.
 pub(crate) const MIN_TERMINAL_FONT_SIZE: f32 = 8.;
 pub(crate) const MAX_TERMINAL_FONT_SIZE: f32 = 32.;
 

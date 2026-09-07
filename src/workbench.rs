@@ -23,7 +23,7 @@ use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
 use crate::terminal::{CaretShape, RenderContent};
-use crate::presets::DEFAULT_TERMINAL_FONT_SIZE;
+use crate::presets::{DEFAULT_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE};
 use crate::theme::{
     BODY, CAPTION, LABEL, MONO_SMALL, TerminalPalette, Typography, WORDMARK, WorkbenchPalette,
     fonts, tint,
@@ -565,6 +565,14 @@ pub(crate) struct TerminalType {
 
 impl TerminalType {
     fn new(font_size: f32) -> Self {
+        // The dialog only offers sizes that will do, but the workspace file
+        // can be written by hand: a size from outside the bounds is brought
+        // back to them rather than left to wreck the layout.
+        let font_size = if font_size.is_finite() {
+            font_size.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE)
+        } else {
+            DEFAULT_TERMINAL_FONT_SIZE
+        };
         let scale = font_size / DEFAULT_TERMINAL_FONT_SIZE;
         Self {
             font_size,

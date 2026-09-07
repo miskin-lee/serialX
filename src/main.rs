@@ -49,7 +49,7 @@ use sidebar::{
 };
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
-use terminal::key_bytes;
+use terminal::{GridCell, SelectionKind, key_bytes};
 use title_bar::{FILTER_PLACEHOLDER, TITLE_BAR_HEIGHT, traffic_light_position};
 use workbench::TerminalMetrics;
 use updater::{
@@ -112,8 +112,12 @@ pub struct SerialWorkspace {
     /// is sent until the composition is committed.
     composing: Option<String>,
     /// The terminal's cell size as last laid out, for placing the input
-    /// method's candidate window under the cursor.
+    /// method's candidate window under the cursor and for telling which
+    /// cell a press landed on.
     terminal_metrics: TerminalMetrics,
+    /// Whether a selection is being dragged out over the terminal: from
+    /// the press that began it to the release that ends it.
+    selecting: bool,
     /// Wheel travel short of a whole line, carried to the next event.
     scroll_remainder: f32,
     /// The cursor's blink: whether it is in its visible half, whether a
@@ -170,6 +174,7 @@ impl SerialWorkspace {
             terminal_focus: cx.focus_handle(),
             composing: None,
             terminal_metrics: TerminalMetrics::default(),
+            selecting: false,
             scroll_remainder: 0.,
             cursor_shown: true,
             blinking: false,
@@ -481,14 +486,16 @@ impl SerialWorkspace {
 
     /// Text typed into the terminal goes to the port as it is typed, the
     /// way a serial console works: what shows on screen is what the device
-    /// echoes back.
+    /// echoes back. A read-only tab takes nothing. Typing lets go of the
+    /// selection, as it does in a terminal.
     fn type_into_terminal(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        if !tab.connected || text.is_empty() {
+        if !tab.connected || !tab.interactive || text.is_empty() {
             return;
         }
+        tab.terminal.clear_selection();
         tab.write(text.as_bytes().to_vec());
         if tab.auto_scroll {
             tab.terminal.scroll_to_bottom();
@@ -553,17 +560,36 @@ impl SerialWorkspace {
     /// go out as the bytes a terminal sends for them. Plain text does not
     /// come this way but through the input handler, so an input method can
     /// compose it first; keys the terminal has no meaning for, and every
-    /// command shortcut, pass on to the menus.
+    /// command shortcut, pass on to the menus. A read-only tab sends
+    /// nothing.
+    ///
+    /// Where Ctrl+C is the platform's copy, it copies while there is a
+    /// selection to copy and is the interrupt it is in every terminal
+    /// otherwise, as VS Code's terminal has it; on macOS ⌘C copies and
+    /// Ctrl+C is always the interrupt.
     fn terminal_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let modifiers = event.keystroke.modifiers;
+        if cfg!(not(target_os = "macos"))
+            && modifiers.control
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.platform
+            && event.keystroke.key == "c"
+            && self.copy_terminal_selection(cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        if !tab.connected {
+        if !tab.connected || !tab.interactive {
             return;
         }
         let Some(bytes) = key_bytes(&event.keystroke, tab.terminal.mode()) else {
             return;
         };
+        tab.terminal.clear_selection();
         tab.write(bytes);
         if tab.auto_scroll {
             tab.terminal.scroll_to_bottom();
@@ -571,6 +597,110 @@ impl SerialWorkspace {
         self.wake_cursor(window, cx);
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// A press on the terminal starts a selection at the cell under it —
+    /// the cell, its word or its line, by how many times the button was
+    /// clicked — or, with shift held, moves the end of the one there is.
+    /// The drag that follows is watched from the terminal's paint, so it
+    /// goes on when the pointer leaves the log.
+    fn terminal_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let metrics = self.terminal_metrics;
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let cell = Self::cell_at(metrics, tab.terminal.display_offset(), event.position);
+        if event.modifiers.shift {
+            tab.terminal.extend_selection(cell);
+        } else {
+            tab.terminal
+                .begin_selection(cell, SelectionKind::for_clicks(event.click_count));
+        }
+        self.selecting = true;
+        cx.notify();
+    }
+
+    /// The pointer moving with the button down: the selection's end
+    /// follows it. Past the top or bottom of the log the view scrolls a
+    /// line that way, so a drag can reach into the scrollback.
+    fn terminal_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        let metrics = self.terminal_metrics;
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        let y = f32::from(position.y) - metrics.origin_y;
+        let past_edge = if y < 0. {
+            tab.terminal.scroll(1);
+            true
+        } else if y > metrics.lines as f32 * metrics.line_height {
+            tab.terminal.scroll(-1);
+            true
+        } else {
+            false
+        };
+        if past_edge {
+            tab.auto_scroll = tab.terminal.is_at_bottom();
+        }
+        let cell = Self::cell_at(metrics, tab.terminal.display_offset(), position);
+        tab.terminal.extend_selection(cell);
+        cx.notify();
+    }
+
+    /// The button released: the drag is over. A press that moved over
+    /// nothing leaves nothing selected.
+    fn terminal_release(&mut self, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+            && !tab.terminal.has_selection()
+        {
+            tab.terminal.clear_selection();
+        }
+        cx.notify();
+    }
+
+    /// The cell under a point of the window, on the grid as it is
+    /// scrolled: past the edges of the log, the nearest cell.
+    fn cell_at(metrics: TerminalMetrics, display_offset: usize, position: Point<Pixels>) -> GridCell {
+        let columns = metrics.columns.max(1);
+        let lines = metrics.lines.max(1);
+        let x = (f32::from(position.x) - metrics.origin_x - metrics.text_left)
+            / metrics.cell_width.max(1.);
+        let y = (f32::from(position.y) - metrics.origin_y) / metrics.line_height.max(1.);
+        let row = y.floor().clamp(0., (lines - 1) as f32) as usize;
+        let column = x.floor().clamp(0., (columns - 1) as f32) as usize;
+        GridCell {
+            line: row as i32 - display_offset as i32,
+            column,
+            right_half: x >= column as f32 + 0.5,
+        }
+    }
+
+    /// Selects the whole log of the tab in front, for ⌘A.
+    fn select_all_in_terminal(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.terminal.select_all();
+            cx.notify();
+        }
+    }
+
+    /// Puts the selected text on the clipboard, for ⌘C, and says whether
+    /// there was any: with nothing selected the clipboard keeps what it
+    /// had.
+    fn copy_terminal_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self
+            .active_tab()
+            .and_then(|tab| tab.terminal.selection_text())
+        else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
     }
 
     /// The wheel over the terminal moves through its scrollback. Scrolling
@@ -1059,7 +1189,8 @@ impl EntityInputHandler for SerialWorkspace {
     }
 
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
-        self.active_tab().is_some_and(|tab| tab.connected)
+        self.active_tab()
+            .is_some_and(|tab| tab.connected && tab.interactive)
     }
 }
 

@@ -18,7 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
-use crate::app_menu::NewSerialTab;
+use crate::app_menu::{NewSerialTab, TERMINAL_CONTEXT};
 use crate::icons::Glyph;
 use crate::filter::OutputFilter;
 use crate::find::FindView;
@@ -67,13 +67,20 @@ const TERMINAL_TOP_INSET: f32 = 8.;
 
 /// How the terminal's cells map to pixels, measured each frame from the
 /// mono font. Kept on the workspace so the input method's candidate window
-/// can be put under the cursor.
+/// can be put under the cursor, and so a press on the log can be told
+/// which cell it landed on.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct TerminalMetrics {
     pub(crate) cell_width: f32,
     pub(crate) line_height: f32,
     /// Where the cells start, from the terminal's left edge.
     pub(crate) text_left: f32,
+    /// The terminal's top-left corner, in the window.
+    pub(crate) origin_x: f32,
+    pub(crate) origin_y: f32,
+    /// The grid's size, as last fitted to the terminal.
+    pub(crate) columns: usize,
+    pub(crate) lines: usize,
 }
 
 impl SerialWorkspace {
@@ -164,9 +171,10 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let name = tab.title().to_string();
         let detail: SharedString = format!(
-            "{} · {}",
+            "{} · {}{}",
             tab.selected_port().name,
-            tab.configuration.summary()
+            tab.configuration.summary(),
+            if tab.interactive { "" } else { " · read-only" }
         )
         .into();
         let status = if tab.connected {
@@ -246,8 +254,10 @@ impl SerialWorkspace {
     }
 
     /// The terminal. It is a place to type as well as to read: a click gives
-    /// it focus, and from then on keys go to the port of this tab; the wheel
-    /// moves through the scrollback.
+    /// it focus, and from then on keys go to the port of this tab — unless
+    /// the tab was made read-only, when the log is only to read and the
+    /// composer does the sending; the wheel moves through the scrollback,
+    /// and a drag selects, to be copied with ⌘C.
     pub(crate) fn render_active_tab(
         &mut self,
         tab: SerialTabSnapshot,
@@ -256,7 +266,7 @@ impl SerialWorkspace {
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
         let focused = self.terminal_focus.is_focused(window) && window.is_window_active();
-        if focused {
+        if focused && tab.interactive {
             self.start_blinking(window, cx);
         }
         let terminal = self.render_terminal(&tab, focused, cx);
@@ -277,10 +287,17 @@ impl SerialWorkspace {
                     .min_h_0()
                     .w_full()
                     .track_focus(&self.terminal_focus)
+                    .key_context(TERMINAL_CONTEXT)
                     .cursor(CursorStyle::IBeam)
                     .on_key_down(cx.listener(|this, event, window, cx| {
                         this.terminal_key(event, window, cx)
                     }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.terminal_mouse_down(event, cx)
+                        }),
+                    )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                         let line_height = px(TERMINAL_LINE_HEIGHT);
                         let delta = event.delta.pixel_delta(line_height).y / line_height;
@@ -300,6 +317,11 @@ impl SerialWorkspace {
     /// The gutter is measured here: a column of line numbers as wide as
     /// the highest number in the log, then the timestamps, each with air
     /// after it, and either or both can be switched off.
+    ///
+    /// While a selection is being dragged out, the pointer is followed
+    /// from here at the window rather than at the log, so the drag goes on
+    /// past the terminal's edges and the release that ends it can land
+    /// anywhere.
     fn render_terminal(
         &mut self,
         tab: &SerialTabSnapshot,
@@ -321,6 +343,8 @@ impl SerialWorkspace {
         let focus = self.terminal_focus.clone();
         let composing = self.composing.clone();
         let cursor_shown = self.cursor_shown;
+        let selecting = self.selecting;
+        let interactive = tab.interactive;
         let fit = cx.entity();
         let paint = cx.entity();
 
@@ -329,21 +353,52 @@ impl SerialWorkspace {
                 let layout = TerminalLayout::measure(window, gutters);
                 let columns = (bounds.size.width - layout.gutter - px(ROW_INSET)) / layout.cell_width;
                 let lines = bounds.size.height / px(TERMINAL_LINE_HEIGHT);
+                let columns = columns.floor().max(0.) as usize;
+                let lines = lines.floor().max(0.) as usize;
                 fit.update(cx, |this, _| {
                     this.terminal_metrics = TerminalMetrics {
                         cell_width: f32::from(layout.cell_width),
                         line_height: TERMINAL_LINE_HEIGHT,
                         text_left: f32::from(layout.gutter),
+                        origin_x: f32::from(bounds.origin.x),
+                        origin_y: f32::from(bounds.origin.y),
+                        columns,
+                        lines,
                     };
                     if let Some(tab) = this.tab_mut(tab_id) {
-                        tab.terminal
-                            .resize(columns.floor().max(0.) as usize, lines.floor().max(0.) as usize);
+                        tab.terminal.resize(columns, lines);
                     }
                 });
                 layout
             },
             move |bounds, layout, window, cx| {
                 window.handle_input(&focus, ElementInputHandler::new(bounds, paint.clone()), cx);
+                if selecting {
+                    // In the capture phase, so nothing the pointer passes
+                    // over can swallow the drag or the release.
+                    let drag = paint.clone();
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                        if phase != DispatchPhase::Capture {
+                            return;
+                        }
+                        drag.update(cx, |this, cx| {
+                            // A release that went unseen — one that fell
+                            // between frames — shows as a move with the
+                            // button up, and ends the drag the same.
+                            if event.pressed_button == Some(MouseButton::Left) {
+                                this.terminal_drag(event.position, cx);
+                            } else {
+                                this.terminal_release(cx);
+                            }
+                        });
+                    });
+                    let release = paint.clone();
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                            release.update(cx, |this, cx| this.terminal_release(cx));
+                        }
+                    });
+                }
                 let Some(content) = paint
                     .read(cx)
                     .tab(tab_id)
@@ -356,6 +411,7 @@ impl SerialWorkspace {
                     layout,
                     &content,
                     focused,
+                    interactive,
                     cursor_shown,
                     composing.as_deref(),
                     &filter,
@@ -536,18 +592,21 @@ impl TerminalLayout {
     }
 }
 
-/// Paints the screen: a filled cursor first so its glyph stays readable on
-/// it, then row by row the filter's tint, the line number, the timestamp,
-/// each run's background and text, the find's washes over what it found,
-/// and last the cursor when it is an outline. With focus the cursor
-/// blinks — it is left out in the off half — and without focus it stands
-/// as a steady outline.
+/// Paints the screen: under everything the filter's tint on the rows it
+/// matches and the selection's plate on the cells it covers, then a
+/// filled cursor so its glyph stays readable on it, then row by row the
+/// line number, the timestamp, each run's background and text and the
+/// find's washes over what it found, and last the cursor when it is an
+/// outline. With focus the cursor blinks — it is left out in the off
+/// half — and without focus it stands as a steady outline. A read-only
+/// tab has no cursor at all: there is nowhere to type.
 #[allow(clippy::too_many_arguments)]
 fn paint_terminal(
     bounds: Bounds<Pixels>,
     layout: TerminalLayout,
     content: &RenderContent,
     focused: bool,
+    interactive: bool,
     cursor_shown: bool,
     composing: Option<&str>,
     filter: &OutputFilter,
@@ -566,15 +625,40 @@ fn paint_terminal(
     let cursor_color = rgb(terminal_palette.cursor);
     let finding = find.open && find.matcher.is_active();
 
-    let cursor_cell = content.cursor.as_ref().map(|cursor| {
-        Bounds::new(
-            point(
-                text_left + cell_width * cursor.column as f32,
-                bounds.origin.y + line_height * cursor.line as f32,
-            ),
-            size(cell_width * if cursor.wide { 2. } else { 1. }, line_height),
-        )
-    });
+    for (index, row) in content.rows.iter().enumerate() {
+        let y = bounds.origin.y + line_height * index as f32;
+        if filter.is_active() && filter.matches(&row.text) {
+            window.paint_quad(fill(
+                Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, line_height)),
+                tint(palette.accent, 0.12),
+            ));
+        }
+        // The plate is the theme's selection colour, the one the inputs
+        // select in, laid under the text so the letters keep their ink.
+        if let Some(cells) = &row.selected {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(text_left + cell_width * cells.start as f32, y),
+                    size(cell_width * cells.len() as f32, line_height),
+                ),
+                rgb(palette.selection),
+            ));
+        }
+    }
+
+    let cursor_cell = content
+        .cursor
+        .as_ref()
+        .filter(|_| interactive)
+        .map(|cursor| {
+            Bounds::new(
+                point(
+                    text_left + cell_width * cursor.column as f32,
+                    bounds.origin.y + line_height * cursor.line as f32,
+                ),
+                size(cell_width * if cursor.wide { 2. } else { 1. }, line_height),
+            )
+        });
     if let (Some(cursor), Some(cell)) = (&content.cursor, cursor_cell)
         && focused
         && cursor_shown
@@ -603,12 +687,6 @@ fn paint_terminal(
 
     for (index, row) in content.rows.iter().enumerate() {
         let y = bounds.origin.y + line_height * index as f32;
-        if filter.is_active() && filter.matches(&row.text) {
-            window.paint_quad(fill(
-                Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, line_height)),
-                tint(palette.accent, 0.12),
-            ));
-        }
         // The number sits against the right edge of its column, as an
         // editor's do, so the units line up.
         if let (true, Some(number)) = (layout.gutters.numbers, row.number) {

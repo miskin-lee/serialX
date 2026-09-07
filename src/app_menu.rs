@@ -35,6 +35,8 @@ actions!(
         FindNext,
         FindPrevious,
         CloseFind,
+        SelectAllInTerminal,
+        CopyTerminalSelection,
         OpenSettings,
         UseLightTheme,
         UseDarkTheme,
@@ -83,8 +85,19 @@ keystroke!(FIND_NEXT_KEYSTROKE, "cmd-g", "f3");
 keystroke!(FIND_PREVIOUS_KEYSTROKE, "cmd-shift-g", "shift-f3");
 keystroke!(SETTINGS_KEYSTROKE, "cmd-,", "ctrl-,");
 keystroke!(QUIT_KEYSTROKE, "cmd-q", "ctrl-q");
+// Select all and copy in the log, while it is in focus. On macOS they are
+// ⌘A and ⌘C, as everywhere. Elsewhere Ctrl+A and Ctrl+C belong to the
+// device — the start of the line, and the interrupt — so the log takes
+// what the platform's terminals spare: Ctrl+Insert copies (and so does
+// Ctrl+C while something is selected; see the key handler), and Ctrl+Alt+A
+// selects all, Ctrl+Shift+A being the auto-scroll switch already.
+keystroke!(SELECT_ALL_KEYSTROKE, "cmd-a", "ctrl-alt-a");
+keystroke!(COPY_SELECTION_KEYSTROKE, "cmd-c", "ctrl-insert");
 /// Where `Escape` closes the find bar: only while the bar is in focus.
 pub(crate) const FIND_BAR_CONTEXT: &str = "FindBar";
+/// Where select all and copy act on the log: only while it is in focus,
+/// so a text box elsewhere keeps its own.
+pub(crate) const TERMINAL_CONTEXT: &str = "Terminal";
 
 fn application_menus() -> Vec<Menu> {
     let mut help = vec![
@@ -218,6 +231,8 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(FIND_NEXT_KEYSTROKE, FindNext, None),
         KeyBinding::new(FIND_PREVIOUS_KEYSTROKE, FindPrevious, None),
         KeyBinding::new("escape", CloseFind, Some(FIND_BAR_CONTEXT)),
+        KeyBinding::new(SELECT_ALL_KEYSTROKE, SelectAllInTerminal, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new(COPY_SELECTION_KEYSTROKE, CopyTerminalSelection, Some(TERMINAL_CONTEXT)),
         KeyBinding::new(SETTINGS_KEYSTROKE, OpenSettings, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
     ]);
@@ -306,6 +321,18 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &FindPrevious, cx| {
         let _ = view.update(cx, |view, cx| view.find_step(Some(false), cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &SelectAllInTerminal, cx| {
+        let _ = view.update(cx, |view, cx| view.select_all_in_terminal(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &CopyTerminalSelection, cx| {
+        let _ = view.update(cx, |view, cx| {
+            view.copy_terminal_selection(cx);
+        });
     });
 
     let view = workspace.downgrade();

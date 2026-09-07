@@ -256,6 +256,10 @@ pub(crate) struct SerialTabState {
     /// The saved group the session was filed under when it was made or
     /// opened, so saving it again keeps it there.
     pub(crate) group: Option<u64>,
+    /// Whether the terminal is a place to type: keys go to the port, at a
+    /// cursor. Off, the log is only to read, the composer does the
+    /// sending, and there is no cursor.
+    pub(crate) interactive: bool,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
@@ -308,6 +312,7 @@ impl SerialTabState {
             color: TagColor::default(),
             alias: None,
             group: None,
+            interactive: true,
             connected: false,
             connecting: false,
             paused: false,
@@ -416,6 +421,7 @@ impl Drop for SerialTabState {
 #[derive(Clone)]
 pub(crate) struct SerialTabSnapshot {
     pub(crate) id: usize,
+    pub(crate) interactive: bool,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) hex_mode: bool,
@@ -434,6 +440,7 @@ impl From<&SerialTabState> for SerialTabSnapshot {
     fn from(tab: &SerialTabState) -> Self {
         Self {
             id: tab.id,
+            interactive: tab.interactive,
             connected: tab.connected,
             connecting: tab.connecting,
             hex_mode: tab.hex_mode,

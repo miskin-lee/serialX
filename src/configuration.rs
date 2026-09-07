@@ -13,10 +13,17 @@
 //! for telling this session's tab from the others; a new session is offered
 //! the first colour no open tab wears. Beside the name, the group the
 //! session files under in the side panel: a field that opens the list of
-//! the groups there are, with an offer to make one. A summary line at the
-//! foot restates the choice in the `115200 8N1` shorthand the rest of the
-//! workbench prints, behind a tag glyph in the chosen colour, with the group
-//! named at its end.
+//! the groups there are, with an offer to make one. Over them, at the end
+//! of the section's eyebrow, an `Interactive` switch, on unless turned off:
+//! whether the terminal is a place to type, or a log only to read, with no
+//! cursor, that the composer sends to. A summary line at the foot restates
+//! the choice in the `115200 8N1` shorthand the rest of the workbench
+//! prints, behind a tag glyph in the chosen colour, with the group named
+//! at its end and a `Read-only` tag after it when the switch is off.
+//!
+//! A new session is confirmed with `Save & Connect` — `Enter` — which keeps
+//! it in the side panel and opens it in a tab; `Connect`, beside it, only
+//! opens the tab.
 //!
 //! The dialog is modal, and says so: a press outside it — on the workbench
 //! or the side panel — closes nothing, and the dialog flashes instead, the
@@ -33,6 +40,7 @@ use std::{
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -266,9 +274,11 @@ struct SerialConfigurationEditor {
     /// configuration keeps the last rate that was, and the dialog will not
     /// confirm until the text is one again.
     baud_error: Option<BaudRateError>,
-    /// Set by `Save & Connect` just before it confirms, and taken by the
-    /// confirm, so the one handler knows which button it was.
-    save_on_confirm: bool,
+    /// Whether the tab will be a place to type, or a log only to read.
+    interactive: bool,
+    /// Set by `Connect` just before it confirms, and taken by the confirm,
+    /// so the one handler knows it was not `Save & Connect`.
+    connect_only: bool,
 }
 
 impl SerialConfigurationEditor {
@@ -354,7 +364,8 @@ impl SerialConfigurationEditor {
             baud_input,
             _baud_subscription: baud_subscription,
             baud_error: None,
-            save_on_confirm: false,
+            interactive: saved.is_none_or(|saved| saved.interactive),
+            connect_only: false,
         }
     }
 
@@ -492,6 +503,11 @@ impl SerialConfigurationEditor {
 
     fn select_group(&mut self, group: Option<u64>, cx: &mut Context<Self>) {
         self.group = group;
+        cx.notify();
+    }
+
+    fn set_interactive(&mut self, interactive: bool, cx: &mut Context<Self>) {
+        self.interactive = interactive;
         cx.notify();
     }
 
@@ -1076,12 +1092,25 @@ impl SerialConfigurationEditor {
 
     /// The tab, in two rows under one eyebrow: its name beside its group, a
     /// column each, and under them its colour — the bright dozen over the
-    /// deep dozen, so a column holds two colours that read as kin.
+    /// deep dozen, so a column holds two colours that read as kin. At the
+    /// end of the eyebrow, the `Interactive` switch: on, and the terminal
+    /// is typed into; off, and it is only read.
     fn render_tab_section(
         &mut self,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let interactive = Checkbox::new("config-interactive")
+            .small()
+            .checked(self.interactive)
+            .label("Interactive")
+            .tooltip(
+                "Type into the terminal: keys go straight to the port, at a cursor. Off, the log is read-only, with no cursor, and the composer does the sending.",
+            )
+            .on_click(cx.listener(|editor, checked: &bool, _, cx| {
+                editor.set_interactive(*checked, cx);
+            }))
+            .into_any_element();
         let name = field_frame(Input::new(&self.alias_input).small())
             .text_token(LABEL)
             .font_weight(FontWeight::NORMAL)
@@ -1110,7 +1139,7 @@ impl SerialConfigurationEditor {
         Self::section(
             palette,
             "Tab",
-            None,
+            Some(interactive),
             v_flex()
                 .gap_2p5()
                 .child(
@@ -1135,7 +1164,8 @@ impl SerialConfigurationEditor {
     /// under it the same thing in words — with the device first when a name
     /// has taken its place above. All behind a tag glyph in the chosen
     /// colour, the one place the tag is named as a tag, and with the group
-    /// as a pill at the end when there is one.
+    /// as a pill at the end when there is one — and a `Read-only` pill
+    /// after it when the tab will not be typed into.
     fn render_summary(&self, palette: WorkbenchPalette, cx: &App) -> AnyElement {
         let port = self.selected_port();
         let hue = palette.tag(self.color);
@@ -1193,6 +1223,9 @@ impl SerialConfigurationEditor {
             )
             .when_some(group, |strip, group| {
                 strip.child(tag(palette, palette.category_session, MICRO, group))
+            })
+            .when(!self.interactive, |strip| {
+                strip.child(tag(palette, palette.warning, MICRO, "Read-only"))
             })
             .into_any_element()
     }
@@ -1295,9 +1328,9 @@ impl SerialWorkspace {
         let (title, blurb, confirm, confirm_glyph) = match target {
             ConfigurationTarget::NewTab => (
                 "New session",
-                "Pick the device and the parameters it expects. Connect opens them in a tab of their own; Save & Connect also keeps the session in the side panel.",
-                "Connect",
-                Glyph::Bolt,
+                "Pick the device and the parameters it expects. Save & Connect keeps the session in the side panel and opens it in a tab of its own; Connect only opens the tab.",
+                "Save & Connect",
+                Glyph::Bookmark,
             ),
             ConfigurationTarget::SavedSession(_) => (
                 "Edit saved session",
@@ -1323,16 +1356,16 @@ impl SerialWorkspace {
             });
             let header_frame = frame.clone();
             let footer_frame = frame.clone();
-            // A new session can be kept as it is opened; an edit is a save
-            // already, so it has the one button.
+            // A new session can be opened without being kept; an edit is a
+            // save already, so it has the one button.
             let secondary = match target {
                 ConfigurationTarget::NewTab => {
                     let editor = editor_for_footer.clone();
                     Some(SecondaryConfirm {
-                        label: "Save & Connect",
-                        glyph: Glyph::Bookmark,
+                        label: "Connect",
+                        glyph: Glyph::Bolt,
                         before: Box::new(move |_, cx| {
-                            editor.update(cx, |editor, _| editor.save_on_confirm = true);
+                            editor.update(cx, |editor, _| editor.connect_only = true);
                         }),
                     })
                 }
@@ -1368,8 +1401,8 @@ impl SerialWorkspace {
                 .on_ok(move |_, window, cx| {
                     // Taken first, so a confirm that fails below does not
                     // leave the choice lying around for the next one.
-                    let save_too =
-                        editor.update(cx, |editor, _| std::mem::take(&mut editor.save_on_confirm));
+                    let connect_only =
+                        editor.update(cx, |editor, _| std::mem::take(&mut editor.connect_only));
                     // A field that does not hold a rate keeps the dialog
                     // open, with the field in focus, rather than opening the
                     // port at the last rate that was one.
@@ -1386,17 +1419,19 @@ impl SerialWorkspace {
                     let color = editor.color;
                     let alias = editor.alias(cx);
                     let group = editor.group;
+                    let interactive = editor.interactive;
                     let target = editor.target;
 
                     let _ = workspace.update(cx, |workspace, cx| match target {
                         ConfigurationTarget::NewTab => {
-                            if save_too {
+                            if !connect_only {
                                 workspace.save_session_preset(
                                     port_name.clone(),
                                     configuration,
                                     color,
                                     alias.clone(),
                                     group,
+                                    interactive,
                                 );
                             }
                             let id = workspace.create_configured_tab(
@@ -1405,6 +1440,7 @@ impl SerialWorkspace {
                                 color,
                                 alias,
                                 group,
+                                interactive,
                                 window,
                                 cx,
                             );
@@ -1418,6 +1454,7 @@ impl SerialWorkspace {
                                 color,
                                 alias,
                                 group,
+                                interactive,
                             );
                             if let Some(group) =
                                 workspace.presets.resolve_group(Library::Sessions, group)
@@ -1440,6 +1477,7 @@ impl SerialWorkspace {
         color: TagColor,
         alias: Option<String>,
         group: Option<u64>,
+        interactive: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1451,6 +1489,7 @@ impl SerialWorkspace {
         tab.color = color;
         tab.alias = alias;
         tab.group = self.presets.resolve_group(Library::Sessions, group);
+        tab.interactive = interactive;
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {

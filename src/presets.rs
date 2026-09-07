@@ -32,6 +32,15 @@ pub(crate) struct StoredSession {
     /// top of the list. Absent in files written before there were groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group: Option<u64>,
+    /// Whether the tab is a place to type. Absent in files written before
+    /// a session could be read-only, when every one was typed into.
+    #[serde(default = "interactive_by_default")]
+    pub(crate) interactive: bool,
+}
+
+/// What a session's `interactive` is when the file does not say: on.
+fn interactive_by_default() -> bool {
+    true
 }
 
 /// A folder in one of the lists. It is only a name: which sessions or
@@ -159,6 +168,7 @@ impl PresetStore {
         self.commands.len() != before
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_session(
         &mut self,
         label: String,
@@ -167,6 +177,7 @@ impl PresetStore {
         color: TagColor,
         alias: Option<String>,
         group: Option<u64>,
+        interactive: bool,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.label == label) {
@@ -175,6 +186,7 @@ impl PresetStore {
             saved.color = color;
             saved.alias = alias;
             saved.group = group;
+            saved.interactive = interactive;
         } else {
             let id = self.take_id();
             self.sessions.push(StoredSession {
@@ -185,6 +197,7 @@ impl PresetStore {
                 color,
                 alias,
                 group,
+                interactive,
             });
         }
         self.persist();
@@ -195,6 +208,7 @@ impl PresetStore {
         self.persist();
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_session(
         &mut self,
         id: u64,
@@ -203,6 +217,7 @@ impl PresetStore {
         color: TagColor,
         alias: Option<String>,
         group: Option<u64>,
+        interactive: bool,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
@@ -212,6 +227,7 @@ impl PresetStore {
             saved.color = color;
             saved.alias = alias;
             saved.group = group;
+            saved.interactive = interactive;
             self.persist();
         }
     }
@@ -528,6 +544,8 @@ mod tests {
         assert_eq!(store.sessions[0].alias, None);
         assert_eq!(store.sessions[0].group, None);
         assert!(store.groups.is_empty());
+        // A session from before there was a switch was typed into.
+        assert!(store.sessions[0].interactive);
 
         let mut store = store;
         store.update_session(
@@ -537,10 +555,14 @@ mod tests {
             TagColor::Teal,
             Some("Motor board".into()),
             None,
+            false,
         );
         let json = serde_json::to_string(&store).unwrap();
         assert!(json.contains(r#""color":"teal""#));
         assert!(json.contains(r#""alias":"Motor board""#));
+        assert!(json.contains(r#""interactive":false"#));
+        let restored: PresetStore = serde_json::from_str(&json).unwrap();
+        assert!(!restored.sessions[0].interactive);
 
         // A session without a name does not write an empty field.
         store.update_session(
@@ -550,6 +572,7 @@ mod tests {
             TagColor::Teal,
             None,
             None,
+            true,
         );
         assert!(!serde_json::to_string(&store).unwrap().contains("alias"));
     }
@@ -569,6 +592,7 @@ mod tests {
             TagColor::Red,
             None,
             Some(group),
+            true,
         );
         store.add_session(
             "/dev/tty.b · 115200 8N1".into(),
@@ -577,6 +601,7 @@ mod tests {
             TagColor::Teal,
             None,
             None,
+            true,
         );
 
         let json = serde_json::to_string(&store).unwrap();
@@ -627,6 +652,7 @@ mod tests {
             TagColor::Red,
             None,
             Some(group),
+            true,
         );
         store.remove_group(group);
         assert!(store.groups.is_empty());
@@ -642,6 +668,7 @@ mod tests {
             TagColor::Red,
             None,
             Some(999),
+            true,
         );
         assert_eq!(store.sessions[1].group, None);
         assert_eq!(store.resolve_group(Library::Sessions, Some(999)), None);

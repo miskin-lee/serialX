@@ -393,6 +393,9 @@ impl SerialWorkspace {
         h_flex()
             .id("find-bar")
             .key_context("FindBar")
+            // Over the log, not of it: a press on the bar is not a press
+            // on the terminal under it, while the wheel still scrolls it.
+            .block_mouse_except_scroll()
             .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_find(window, cx)))
             .on_action(cx.listener(|this, _: &FindNext, _, cx| this.find_step(Some(true), cx)))
             .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.find_step(Some(false), cx)))

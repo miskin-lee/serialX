@@ -48,14 +48,26 @@
 //! It reads logical lines — a wrapped line joined back together, so a word
 //! split by the wrap is still found — and answers in cells, so a match can
 //! be painted over the rows it sits on and scrolled into view.
+//!
+//! The selection is alacritty's as well ([`Terminal::begin_selection`] and
+//! its kin). It is anchored to cells of the grid, so it rides up with the
+//! log as lines arrive and lets go when the columns change under it; it
+//! reads back the way a terminal copies — a line the terminal wrapped
+//! comes out whole, without the break the wrap put in it — and the screen
+//! is drawn with the cells it covers marked, row by row.
 
-use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, ops::Range, rc::Rc};
 
 use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
-    index::{Column, Line, Point},
-    term::{Config, Term, TermMode, cell::Flags, color::Colors},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
+    term::{
+        Config, Term, TermMode,
+        cell::{Flags, LineLength},
+        color::Colors,
+    },
     vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor, Rgb},
 };
 use gpui_kit::Keystroke;
@@ -93,6 +105,37 @@ impl Dimensions for GridSize {
     fn columns(&self) -> usize {
         self.columns
     }
+}
+
+/// How much a press picks up: the cell under it and whatever is dragged
+/// over, the word there, or the whole line — one, two and three clicks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionKind {
+    Cells,
+    Words,
+    Lines,
+}
+
+impl SelectionKind {
+    /// What a press of `clicks` picks up.
+    pub(crate) fn for_clicks(clicks: usize) -> Self {
+        match clicks {
+            0 | 1 => Self::Cells,
+            2 => Self::Words,
+            _ => Self::Lines,
+        }
+    }
+}
+
+/// A cell of the grid as the pointer names it: the row — zero the top of
+/// the screen, negative into the scrollback — the column, and which half
+/// of the cell the pointer is on, since a selection begun in the right
+/// half begins after the character there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridCell {
+    pub(crate) line: i32,
+    pub(crate) column: usize,
+    pub(crate) right_half: bool,
 }
 
 /// What the terminal itself wants written to the port: the answer to a
@@ -390,6 +433,93 @@ impl Terminal {
         }
     }
 
+    /// How far back the view is scrolled, in lines: the grid line drawn
+    /// on the first row of the screen is minus this.
+    pub(crate) fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    /// A cell clamped onto the grid, as the point alacritty anchors a
+    /// selection to and the side of it the pointer was on.
+    fn anchor(&self, cell: GridCell) -> (Point, Side) {
+        let history = self.term.grid().history_size() as i32;
+        let line = cell.line.clamp(-history, self.size.lines as i32 - 1);
+        let column = cell.column.min(self.size.columns - 1);
+        let side = if cell.right_half {
+            Side::Right
+        } else {
+            Side::Left
+        };
+        (Point::new(Line(line), Column(column)), side)
+    }
+
+    /// Starts a selection at a cell — the cell, the word it is in or its
+    /// whole line — to be grown from there by [`extend_selection`]. What
+    /// was selected before is let go.
+    ///
+    /// [`extend_selection`]: Self::extend_selection
+    pub(crate) fn begin_selection(&mut self, cell: GridCell, kind: SelectionKind) {
+        let (point, side) = self.anchor(cell);
+        let ty = match kind {
+            SelectionKind::Cells => SelectionType::Simple,
+            SelectionKind::Words => SelectionType::Semantic,
+            SelectionKind::Lines => SelectionType::Lines,
+        };
+        self.term.selection = Some(Selection::new(ty, point, side));
+    }
+
+    /// Moves the far end of the selection to a cell. With nothing to grow,
+    /// a selection of cells starts there.
+    pub(crate) fn extend_selection(&mut self, cell: GridCell) {
+        let (point, side) = self.anchor(cell);
+        match &mut self.term.selection {
+            Some(selection) => selection.update(point, side),
+            None => {
+                self.term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+            }
+        }
+    }
+
+    /// Selects the whole log, from the top of the scrollback to the last
+    /// line on screen that holds anything: the blank rows under the log
+    /// are not part of it, and would only copy as blank lines.
+    pub(crate) fn select_all(&mut self) {
+        let grid = self.term.grid();
+        let last = (0..self.size.lines as i32)
+            .rev()
+            .map(Line)
+            .find(|&line| grid[line].line_length().0 > 0)
+            .unwrap_or(Line(0));
+        let start = Point::new(self.term.topmost_line(), Column(0));
+        let end = Point::new(last, self.term.last_column());
+        let mut selection = Selection::new(SelectionType::Lines, start, Side::Left);
+        selection.update(end, Side::Right);
+        self.term.selection = Some(selection);
+    }
+
+    /// Lets go of the selection; says whether there was one to let go of.
+    pub(crate) fn clear_selection(&mut self) -> bool {
+        self.term.selection.take().is_some()
+    }
+
+    /// Whether any text is selected. A press that was dragged over nothing
+    /// selects nothing, and a selection the scrollback has let go of is
+    /// gone with it.
+    pub(crate) fn has_selection(&self) -> bool {
+        self.term.selection.as_ref().is_some_and(|selection| {
+            !selection.is_empty() && selection.to_range(&self.term).is_some()
+        })
+    }
+
+    /// The selected text, as a terminal copies it: rows the terminal
+    /// wrapped joined back into their line, and the blank end of every
+    /// line dropped.
+    pub(crate) fn selection_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
     /// How wide the line numbers run: the digits of the highest number in
     /// the log, and never fewer than a short log is sized for.
     pub(crate) fn number_digits(&self) -> usize {
@@ -570,6 +700,7 @@ impl Terminal {
         let grid = self.term.grid();
         let content = self.term.renderable_content();
         let offset = content.display_offset as i32;
+        let selection = content.selection;
         let lines = self.size.lines;
         let history = grid.history_size() as i32;
 
@@ -617,6 +748,7 @@ impl Terminal {
                     runs: Vec::new(),
                     text: String::new(),
                     columns: Vec::new(),
+                    selected: None,
                 }
             })
             .collect();
@@ -757,6 +889,41 @@ impl Terminal {
             });
         }
 
+        // The selection, as the cells of each row it covers: a row it runs
+        // through from edge to edge, its first and last rows from and to
+        // the cell it was dragged over, and a wide character's second cell
+        // along with its first.
+        if let Some(range) = selection {
+            let columns = self.size.columns;
+            for (index, row) in rows.iter_mut().enumerate() {
+                let line = index as i32 - offset;
+                if line < range.start.line.0 || line > range.end.line.0 {
+                    continue;
+                }
+                let start = if range.is_block || line == range.start.line.0 {
+                    range.start.column.0
+                } else {
+                    0
+                };
+                let mut end = if range.is_block || line == range.end.line.0 {
+                    range.end.column.0 + 1
+                } else {
+                    columns
+                };
+                if end < columns
+                    && grid[Line(line)][Column(end - 1)]
+                        .flags
+                        .contains(Flags::WIDE_CHAR)
+                {
+                    end += 1;
+                }
+                let end = end.min(columns);
+                if start < end {
+                    row.selected = Some(start..end);
+                }
+            }
+        }
+
         let cursor = (content.cursor.shape != CursorShape::Hidden)
             .then(|| {
                 let line = content.cursor.point.line.0 + offset;
@@ -830,6 +997,8 @@ pub(crate) struct RenderRow {
     /// The cell each character of the text sits in: a wide character
     /// takes two cells, so the two drift apart after one.
     pub(crate) columns: Vec<usize>,
+    /// The cells the selection covers on this row, when it reaches it.
+    pub(crate) selected: Option<Range<usize>>,
 }
 
 /// One occurrence of what the find bar looks for: a run of cells, or two
@@ -1073,8 +1242,8 @@ pub(crate) fn key_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::{
-        CaretShape, DEFAULT_SCROLLBACK_LINES, FindMatch, FindSpan, GridSize, MIN_NUMBER_DIGITS,
-        RenderContent, RenderRun, Terminal, key_bytes,
+        CaretShape, DEFAULT_SCROLLBACK_LINES, FindMatch, FindSpan, GridCell, GridSize,
+        MIN_NUMBER_DIGITS, RenderContent, RenderRun, SelectionKind, Terminal, key_bytes,
     };
     use crate::{filter::OutputFilter, highlight::Role, theme::TerminalPalette};
     use alacritty_terminal::{grid::Dimensions, term::TermMode};
@@ -1683,6 +1852,75 @@ mod tests {
         assert!(terminal.cursor_blinks());
         terminal.receive(b"\x1b[0 q", "3");
         assert!(terminal.cursor_blinks());
+    }
+
+    fn cell(line: i32, column: usize, right_half: bool) -> GridCell {
+        GridCell {
+            line,
+            column,
+            right_half,
+        }
+    }
+
+    /// A drag picks up the text under it — a wrapped line whole, without
+    /// the wrap's break — and the screen says which cells it covers.
+    #[test]
+    fn a_selection_reads_back_as_text() {
+        let mut terminal = terminal(6, 4);
+        terminal.receive(b"hello world\r\nnext\r\n", "1");
+        assert!(!terminal.has_selection());
+        terminal.begin_selection(cell(0, 1, false), SelectionKind::Cells);
+        assert!(!terminal.has_selection(), "a press alone selects nothing");
+        terminal.extend_selection(cell(1, 2, true));
+        assert!(terminal.has_selection());
+        assert_eq!(terminal.selection_text().as_deref(), Some("ello wor"));
+        let content = terminal.render(&TerminalPalette::DARK, false);
+        let selected: Vec<_> = content.rows.iter().map(|row| row.selected.clone()).collect();
+        assert_eq!(selected, vec![Some(1..6), Some(0..3), None, None]);
+        assert!(terminal.clear_selection());
+        assert!(!terminal.has_selection());
+        assert!(!terminal.clear_selection());
+    }
+
+    /// Two clicks take the word, three the line, and select all the log;
+    /// a selection past the grid's edges is clamped onto it.
+    #[test]
+    fn words_lines_and_the_whole_log_can_be_selected() {
+        let mut terminal = terminal(6, 4);
+        terminal.receive(b"hello world\r\nnext\r\n", "1");
+        terminal.begin_selection(cell(1, 1, false), SelectionKind::Words);
+        assert_eq!(terminal.selection_text().as_deref(), Some("world"));
+        terminal.begin_selection(cell(2, 3, false), SelectionKind::Lines);
+        assert_eq!(terminal.selection_text().as_deref(), Some("next\n"));
+        terminal.select_all();
+        assert_eq!(terminal.selection_text().as_deref(), Some("hello world\nnext\n"));
+        terminal.begin_selection(cell(-10, 0, false), SelectionKind::Cells);
+        terminal.extend_selection(cell(10, 99, true));
+        assert_eq!(
+            terminal.selection_text().map(|text| text.trim_end().to_string()).as_deref(),
+            Some("hello world\nnext")
+        );
+    }
+
+    /// The selection stays on its text as lines push it up the screen and
+    /// into the scrollback, and goes when the log is cleared or its
+    /// columns change.
+    #[test]
+    fn a_selection_rides_with_its_text() {
+        let mut terminal = terminal(10, 2);
+        terminal.receive(b"first\r\n", "1");
+        terminal.begin_selection(cell(0, 0, false), SelectionKind::Words);
+        assert_eq!(terminal.selection_text().as_deref(), Some("first"));
+        terminal.receive(b"second\r\nthird\r\n", "2");
+        assert_eq!(terminal.selection_text().as_deref(), Some("first"));
+        terminal.resize(10, 3);
+        assert_eq!(terminal.selection_text().as_deref(), Some("first"));
+        terminal.resize(12, 3);
+        assert!(!terminal.has_selection(), "a reflow lets it go");
+        terminal.begin_selection(cell(0, 0, false), SelectionKind::Lines);
+        assert!(terminal.has_selection());
+        terminal.clear();
+        assert!(!terminal.has_selection());
     }
 
     fn bytes(keys: &str, mode: TermMode) -> Option<Vec<u8>> {

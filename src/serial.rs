@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
 use crate::find::{FindState, FindView};
+use crate::mask::MaskState;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
 
@@ -281,6 +282,9 @@ pub(crate) struct SerialTabState {
     /// The title bar filter box and what it currently holds back.
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
+    /// The filter's mask: the lines it shows while it is holding lines
+    /// back, and where in them the view is.
+    pub(crate) mask: MaskState,
     /// The find bar over the terminal, and its box.
     pub(crate) find: FindState,
     pub(crate) find_input: Entity<InputState>,
@@ -330,6 +334,7 @@ impl SerialTabState {
             },
             filter_input,
             filter: OutputFilter::default(),
+            mask: MaskState::default(),
             find: FindState::default(),
             find_input,
             command_tx: None,
@@ -429,7 +434,8 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) timestamps: bool,
     pub(crate) line_numbers: bool,
     /// How many rows on screen the title bar filter matches, out of how
-    /// many there are, while a filter is set.
+    /// many there are, while a filter is set — or, while its mask is on,
+    /// how many lines of the log it shows, out of how many there are.
     pub(crate) filter_counts: Option<(usize, usize)>,
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
@@ -447,11 +453,15 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             line_ending: tab.line_ending(),
             timestamps: tab.timestamps,
             line_numbers: tab.line_numbers,
-            filter_counts: tab.filter.is_active().then(|| {
-                let texts = tab.terminal.visible_texts();
-                let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
-                (matching, texts.len())
-            }),
+            filter_counts: if tab.masking() {
+                Some(tab.mask.counts())
+            } else {
+                tab.filter.is_active().then(|| {
+                    let texts = tab.terminal.visible_texts();
+                    let matching = texts.iter().filter(|text| tab.filter.matches(text)).count();
+                    (matching, texts.len())
+                })
+            },
             filter_input: tab.filter_input.clone(),
             filter: tab.filter.clone(),
             find: FindView {

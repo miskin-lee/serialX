@@ -14,7 +14,11 @@
 //! amber ringed in the accent, and stepping scrolls the terminal so the
 //! occurrence stands in the middle of the screen. The box starts literal —
 //! `.` and `+` are usually the characters looked for — and the `.*` switch
-//! turns regular expressions on; `Aa` makes it mind case.
+//! turns regular expressions on; `Aa` makes it mind case. Opened over a
+//! selection, the box takes the selected text, as an editor's find takes
+//! the word under the cursor, and the occurrence selected is the one in
+//! hand. While the filter's mask is on, the find looks only through the
+//! lines the mask shows.
 //!
 //! Where the pattern occurs is asked of the grid ([`Terminal::find`]) and
 //! remembered against the grid's revision, so a frame with nothing new
@@ -38,6 +42,7 @@ use smol::Timer;
 
 use crate::app_menu::{CloseFind, FindNext, FindPrevious};
 use crate::filter::OutputFilter;
+use crate::mask::MaskState;
 use crate::terminal::{FindMatch, FindSpan, Terminal};
 use crate::theme::{CAPTION, MICRO, Typography};
 use crate::{SerialTabSnapshot, SerialWorkspace};
@@ -76,7 +81,7 @@ impl Default for FindState {
     fn default() -> Self {
         Self {
             open: false,
-            matcher: OutputFilter::literal(),
+            matcher: OutputFilter::default(),
             matches: Vec::new(),
             current: None,
             scanned: None,
@@ -110,9 +115,15 @@ impl FindState {
         self.landing = None;
     }
 
-    /// Brings the matches up to the grid, unless a scan ran within the
-    /// interval and `force` is off. Says whether a scan is still owed.
-    pub(crate) fn refresh(&mut self, terminal: &Terminal, force: bool) -> bool {
+    /// Brings the matches up to the grid — the lines `mask` shows, or
+    /// every line — unless a scan ran within the interval and `force` is
+    /// off. Says whether a scan is still owed.
+    pub(crate) fn refresh(
+        &mut self,
+        terminal: &Terminal,
+        mask: Option<&MaskState>,
+        force: bool,
+    ) -> bool {
         if !self.open || self.scanned == Some(terminal.revision()) {
             return false;
         }
@@ -123,17 +134,19 @@ impl FindState {
         {
             return true;
         }
-        self.rescan(terminal);
+        self.rescan(terminal, mask);
         false
     }
 
-    fn rescan(&mut self, terminal: &Terminal) {
+    fn rescan(&mut self, terminal: &Terminal, mask: Option<&MaskState>) {
         let held = self
             .current
             .and_then(|index| self.matches.get(index))
             .map(FindMatch::key);
         let fresh = self.scanned.is_none();
-        self.matches = terminal.find(&self.matcher);
+        self.matches = terminal.find(&self.matcher, |number| {
+            mask.is_none_or(|mask| mask.is_shown(number))
+        });
         self.scanned = Some(terminal.revision());
         self.last_scan = Some(Instant::now());
         // The occurrence in hand stays in hand while it is still there —
@@ -161,6 +174,21 @@ impl FindState {
     /// Where a fresh scan wants the terminal scrolled to, once.
     pub(crate) fn take_landing(&mut self) -> Option<FindSpan> {
         self.landing.take()
+    }
+
+    /// Takes in hand the occurrence starting at a cell of the grid, if one
+    /// does, and gives up the place a fresh scan chose: the find was
+    /// seeded from a selection, and the selection is where to stay.
+    pub(crate) fn land_on(&mut self, line: i32, column: usize) -> bool {
+        let found = self.matches.iter().position(|found| {
+            let start = found.start();
+            start.line == line && start.column == column
+        });
+        if let Some(index) = found {
+            self.current = Some(index);
+            self.landing = None;
+        }
+        found.is_some()
     }
 
     /// Moves to the next occurrence, or the previous, around the ends, and
@@ -207,16 +235,53 @@ pub(crate) struct FindView {
     pub(crate) input: Entity<InputState>,
 }
 
+/// What a selection seeds the find box with: the text, less the line
+/// break a whole-line selection ends in. Nothing for a selection over
+/// more than one line — there is no one thing to look for in it — or an
+/// empty one.
+fn seed_from_selection(text: &str) -> Option<String> {
+    let text = text.trim_end_matches(['\r', '\n']);
+    (!text.is_empty() && !text.contains('\n')).then(|| text.to_owned())
+}
+
 impl SerialWorkspace {
     /// Opens the bar over the tab in front and puts the cursor in its box,
-    /// with what the box already holds selected, so typing starts afresh
-    /// and `Enter` steps on from where it was.
+    /// with what the box holds selected, so typing starts afresh and
+    /// `Enter` steps on from where it was. Over a selection in the log,
+    /// the box takes the selected text — escaped, if the box is reading
+    /// regular expressions — and the occurrence selected is the one in
+    /// hand, so the view stays where it is.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
         tab.find.open = true;
         let input = tab.find_input.clone();
+        let seed = tab
+            .selection_text()
+            .as_deref()
+            .and_then(seed_from_selection)
+            .map(|seed| {
+                if tab.find.matcher.use_regex() {
+                    regex::escape(&seed)
+                } else {
+                    seed
+                }
+            });
+        if let Some(seed) = seed {
+            if tab.find.matcher.set_pattern(&seed) {
+                tab.find.forget();
+            }
+            tab.refresh_mask();
+            tab.find
+                .refresh(&tab.terminal, tab.filter.masking().then_some(&tab.mask), true);
+            if let Some((line, column)) = tab.terminal.selection_start() {
+                tab.find.land_on(line, column);
+            }
+            // Setting the box says nothing to its subscriber, so the
+            // pattern was set by hand above.
+            input.update(cx, |input, cx| input.set_value(seed, window, cx));
+        }
         input.update(cx, |input, cx| {
             input.focus(window, cx);
             input.select_all(window, cx);
@@ -273,14 +338,16 @@ impl SerialWorkspace {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        tab.find.refresh(&tab.terminal, true);
+        tab.refresh_mask();
+        tab.find
+            .refresh(&tab.terminal, tab.filter.masking().then_some(&tab.mask), true);
         let landing = match forward {
             Some(forward) => tab.find.step(forward),
             None => tab.find.take_landing(),
         };
         if let Some(span) = landing {
-            tab.terminal.scroll_to_line(span.line);
-            tab.auto_scroll = tab.terminal.is_at_bottom();
+            tab.reveal_line(span.line);
+            tab.auto_scroll = tab.view_at_bottom();
         }
         cx.notify();
     }
@@ -292,10 +359,13 @@ impl SerialWorkspace {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        let owed = tab.find.refresh(&tab.terminal, false);
+        tab.refresh_mask();
+        let owed = tab
+            .find
+            .refresh(&tab.terminal, tab.filter.masking().then_some(&tab.mask), false);
         if let Some(span) = tab.find.take_landing() {
-            tab.terminal.scroll_to_line(span.line);
-            tab.auto_scroll = tab.terminal.is_at_bottom();
+            tab.reveal_line(span.line);
+            tab.auto_scroll = tab.view_at_bottom();
         }
         if owed && !self.find_refresh_pending {
             self.find_refresh_pending = true;
@@ -460,7 +530,9 @@ impl SerialWorkspace {
 
 #[cfg(test)]
 mod tests {
-    use super::FindState;
+    use super::{FindState, seed_from_selection};
+    use crate::filter::OutputFilter;
+    use crate::mask::MaskState;
     use crate::terminal::Terminal;
 
     fn log() -> Terminal {
@@ -481,7 +553,7 @@ mod tests {
         assert_eq!(find.status(), None, "nothing to say without a pattern");
         find.matcher.set_pattern("error");
         assert!(
-            !find.refresh(&terminal, false),
+            !find.refresh(&terminal, None, false),
             "a first scan is never owed"
         );
         assert_eq!(find.total(), 2);
@@ -503,12 +575,12 @@ mod tests {
             ..FindState::default()
         };
         find.matcher.set_pattern("error");
-        find.refresh(&terminal, true);
+        find.refresh(&terminal, None, true);
         find.step(true);
         assert_eq!(find.current_index(), Some(0));
         terminal.receive(b"ERROR three\r\n", "2");
         terminal.resize(12, 3);
-        find.refresh(&terminal, true);
+        find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 3);
         assert_eq!(find.current_index(), Some(0), "still on the first");
         assert_eq!(
@@ -519,11 +591,11 @@ mod tests {
         find.matcher.toggle_match_case();
         find.forget();
         assert_eq!(find.status(), Some(("No results".to_owned(), false)));
-        find.refresh(&terminal, true);
+        find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 0, "the log is upper case");
         find.matcher.set_pattern("ERROR");
         find.forget();
-        find.refresh(&terminal, true);
+        find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 3);
         find.matcher.set_pattern("error(");
         find.matcher.toggle_regex();
@@ -537,18 +609,56 @@ mod tests {
         let mut terminal = log();
         let mut find = FindState::default();
         find.matcher.set_pattern("ok");
-        assert!(!find.refresh(&terminal, true));
+        assert!(!find.refresh(&terminal, None, true));
         assert_eq!(find.total(), 0);
         find.open = true;
-        find.refresh(&terminal, true);
+        find.refresh(&terminal, None, true);
         assert_eq!(find.total(), 2);
-        assert!(!find.refresh(&terminal, false), "nothing changed");
+        assert!(!find.refresh(&terminal, None, false), "nothing changed");
         terminal.receive(b"ok\r\n", "3");
         assert!(
-            find.refresh(&terminal, false),
+            find.refresh(&terminal, None, false),
             "changed within the interval: owed"
         );
-        assert!(!find.refresh(&terminal, true));
+        assert!(!find.refresh(&terminal, None, true));
         assert_eq!(find.total(), 3);
+    }
+
+    /// A selection seeds the box with its one line, whole-line selections
+    /// without their break; a selection over several lines seeds nothing.
+    #[test]
+    fn a_selection_seeds_a_find_when_it_is_one_line() {
+        assert_eq!(seed_from_selection("ERROR one").as_deref(), Some("ERROR one"));
+        assert_eq!(seed_from_selection("ERROR one\n").as_deref(), Some("ERROR one"));
+        assert_eq!(seed_from_selection("  AT+OK \r\n").as_deref(), Some("  AT+OK "));
+        assert_eq!(seed_from_selection("one\ntwo"), None);
+        assert_eq!(seed_from_selection("\n"), None);
+        assert_eq!(seed_from_selection(""), None);
+    }
+
+    /// The occurrence at a cell can be taken in hand in place of the
+    /// newest, and a masked find sees only the lines the mask shows.
+    #[test]
+    fn a_find_lands_on_a_selection_and_looks_through_the_mask() {
+        let terminal = log();
+        let mut find = FindState {
+            open: true,
+            ..FindState::default()
+        };
+        find.matcher.set_pattern("error");
+        find.refresh(&terminal, None, true);
+        assert!(find.land_on(1, 0), "`ERROR one` on row 1");
+        assert_eq!(find.current_index(), Some(0));
+        assert_eq!(find.take_landing(), None, "the view stays put");
+        assert!(!find.land_on(0, 0), "nothing starts on `ok`");
+
+        let mut filter = OutputFilter::default();
+        filter.toggle_mode();
+        filter.set_pattern("two");
+        let mut mask = MaskState::default();
+        mask.refresh(&terminal, &filter);
+        find.forget();
+        find.refresh(&terminal, Some(&mask), true);
+        assert_eq!(find.total(), 1, "only `ERROR two` is shown");
     }
 }

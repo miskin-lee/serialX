@@ -4,47 +4,61 @@
 //! and the matcher compiled from them. Compilation happens when any of the
 //! three changes rather than on every frame, and a literal pattern is escaped
 //! and sent through the same `Regex`, so both modes share one Unicode-aware,
-//! case-folding matcher. The find bar over the terminal (see [`crate::find`])
-//! is the same pattern and switches asked a different question — *where*
-//! rather than *whether* — so it holds one of these too, starting literal.
+//! case-folding matcher. Both switches start off: what is typed is looked
+//! for as typed, in either case. The find bar over the terminal (see
+//! [`crate::find`]) is the same pattern and switches asked a different
+//! question — *where* rather than *whether* — so it holds one of these too.
+//!
+//! What the filter does with a line that matches is a third switch, the
+//! [`FilterMode`]: highlight, where every line stays and the ones that
+//! match are washed in the accent, or mask, where the lines that match are
+//! the only ones shown (see [`crate::mask`]).
 
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
+
+/// What the filter does with the lines that match: tints them where they
+/// stand, or shows them and them alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum FilterMode {
+    /// Every line stays; the ones that match are washed in the accent.
+    #[default]
+    Highlight,
+    /// Only the lines that match are drawn; the rest are held back.
+    Mask,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct OutputFilter {
     pattern: String,
     use_regex: bool,
     match_case: bool,
+    mode: FilterMode,
     /// `None` while the pattern is empty. Otherwise the matcher, or why the
     /// pattern would not compile.
     matcher: Option<Result<Regex, String>>,
+    /// Goes up whenever the matcher is rebuilt, so what was matched with
+    /// the last one can tell it is stale.
+    generation: u64,
 }
 
 impl Default for OutputFilter {
-    /// Regular expressions on and case folded: the box is there to narrow a
-    /// stream, and `ERR|WARN` is the first thing anyone types into it.
+    /// Literal and case folded: `AT+OK` is looked for as `AT+OK`, in
+    /// either case, and the `.*` switch is there for `ERR|WARN`.
     fn default() -> Self {
         Self {
             pattern: String::new(),
-            use_regex: true,
+            use_regex: false,
             match_case: false,
+            mode: FilterMode::default(),
             matcher: None,
+            generation: 0,
         }
     }
 }
 
 impl OutputFilter {
-    /// A matcher with regular expressions off: what a find box starts as,
-    /// where `.` and `+` are usually the characters looked for.
-    pub(crate) fn literal() -> Self {
-        Self {
-            use_regex: false,
-            ..Self::default()
-        }
-    }
-
     pub(crate) fn pattern(&self) -> &str {
         &self.pattern
     }
@@ -55,6 +69,15 @@ impl OutputFilter {
 
     pub(crate) fn match_case(&self) -> bool {
         self.match_case
+    }
+
+    pub(crate) fn mode(&self) -> FilterMode {
+        self.mode
+    }
+
+    /// Which matcher this is: another number, another set of answers.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Replaces the pattern; `true` when it differed from the current one.
@@ -77,9 +100,25 @@ impl OutputFilter {
         self.recompile();
     }
 
-    /// Whether lines are being held back: a non-empty pattern that compiled.
+    /// Switches between tinting the lines that match and showing only
+    /// them. The matcher is untouched: the same lines match either way.
+    pub(crate) fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            FilterMode::Highlight => FilterMode::Mask,
+            FilterMode::Mask => FilterMode::Highlight,
+        };
+    }
+
+    /// Whether lines are being matched: a non-empty pattern that compiled.
     pub(crate) fn is_active(&self) -> bool {
         matches!(self.matcher, Some(Ok(_)))
+    }
+
+    /// Whether lines are being held back: the mask is on and there is a
+    /// pattern to hold them back with. With no pattern, or a broken one,
+    /// the mask shows everything, as the highlight tints nothing.
+    pub(crate) fn masking(&self) -> bool {
+        self.mode == FilterMode::Mask && self.is_active()
     }
 
     /// Why the pattern does not compile, in a phrase short enough for the box.
@@ -115,6 +154,7 @@ impl OutputFilter {
     }
 
     fn recompile(&mut self) {
+        self.generation += 1;
         if self.pattern.is_empty() {
             self.matcher = None;
             return;
@@ -152,7 +192,7 @@ fn summarize_regex_error(error: &regex::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::OutputFilter;
+    use super::{FilterMode, OutputFilter};
 
     #[test]
     fn an_empty_pattern_holds_nothing_back() {
@@ -163,17 +203,22 @@ mod tests {
     }
 
     #[test]
-    fn regular_expressions_are_on_by_default_and_case_folded() {
+    fn plain_text_is_looked_for_as_typed_in_either_case() {
         let mut filter = OutputFilter::default();
+        assert!(!filter.use_regex());
+        assert!(!filter.match_case());
         assert!(filter.set_pattern("err|warn"));
         assert!(filter.is_active());
-        assert!(filter.matches("[ERROR] sensor 3 timed out"));
-        assert!(filter.matches("Warn: low battery"));
-        assert!(!filter.matches("OK"));
+        assert!(!filter.matches("[ERROR] sensor 3 timed out"), "no alternation yet");
+        assert!(filter.matches("saw err|warn in the log"));
         assert!(
             !filter.set_pattern("err|warn"),
             "an unchanged pattern reports no change"
         );
+        filter.toggle_regex();
+        assert!(filter.matches("[ERROR] sensor 3 timed out"));
+        assert!(filter.matches("Warn: low battery"));
+        assert!(!filter.matches("OK"));
     }
 
     #[test]
@@ -189,15 +234,16 @@ mod tests {
     fn literal_mode_takes_metacharacters_at_face_value() {
         let mut filter = OutputFilter::default();
         filter.set_pattern("AT+OK");
-        assert!(filter.matches("ATTTOK"), "as a regex, + repeats the T");
-        filter.toggle_regex();
         assert!(!filter.matches("ATTTOK"));
         assert!(filter.matches("AT+OK"));
+        filter.toggle_regex();
+        assert!(filter.matches("ATTTOK"), "as a regex, + repeats the T");
     }
 
     #[test]
     fn a_broken_pattern_reports_itself_and_hides_nothing() {
         let mut filter = OutputFilter::default();
+        filter.toggle_regex();
         filter.set_pattern("ERR(");
         assert!(!filter.is_active());
         assert_eq!(filter.error(), Some("Unclosed group"));
@@ -208,11 +254,10 @@ mod tests {
         assert!(!filter.matches("ERROR"));
     }
 
-    /// A find starts literal, and says where each occurrence is.
+    /// A matcher says where each occurrence is, literally or as a regex.
     #[test]
-    fn a_literal_matcher_locates_every_occurrence() {
-        let mut find = OutputFilter::literal();
-        assert!(!find.use_regex());
+    fn a_matcher_locates_every_occurrence() {
+        let mut find = OutputFilter::default();
         find.set_pattern("a.");
         assert_eq!(find.find_ranges("a. ab a."), vec![0..2, 6..8]);
         find.toggle_regex();
@@ -221,6 +266,29 @@ mod tests {
         assert_eq!(find.find_ranges("abba"), vec![1..3], "empty matches are dropped");
         find.set_pattern("");
         assert!(find.find_ranges("anything").is_empty());
+    }
+
+    /// The mask holds lines back only with a pattern that compiles, and
+    /// switching it leaves the matcher — and so its generation — alone.
+    #[test]
+    fn the_mask_needs_a_pattern_to_hold_anything_back() {
+        let mut filter = OutputFilter::default();
+        assert_eq!(filter.mode(), FilterMode::Highlight);
+        filter.toggle_mode();
+        assert_eq!(filter.mode(), FilterMode::Mask);
+        assert!(!filter.masking(), "nothing to match with yet");
+        let generation = filter.generation();
+        filter.set_pattern("ERR");
+        assert!(filter.masking());
+        assert_ne!(filter.generation(), generation, "a new matcher");
+        let generation = filter.generation();
+        filter.toggle_mode();
+        assert!(!filter.masking());
+        assert_eq!(filter.generation(), generation, "the same matcher");
+        filter.toggle_mode();
+        filter.toggle_regex();
+        filter.set_pattern("ERR(");
+        assert!(!filter.masking(), "a broken pattern hides nothing");
     }
 
     #[test]

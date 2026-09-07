@@ -62,7 +62,7 @@ use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
     index::{Column, Line, Point, Side},
-    selection::{Selection, SelectionType},
+    selection::{Selection, SelectionRange, SelectionType},
     term::{
         Config, Term, TermMode,
         cell::{Flags, LineLength},
@@ -175,6 +175,9 @@ pub(crate) struct Terminal {
     /// Goes up whenever the grid changes — bytes in, a resize, a clear —
     /// so a search over it can tell whether its answer is still current.
     revision: u64,
+    /// Which log this is: goes up at every clear, since the numbering
+    /// starts over then and a number that named one line names another.
+    epoch: u64,
 }
 
 impl Default for Terminal {
@@ -208,6 +211,7 @@ impl Terminal {
             scrollback,
             first_number: 1,
             revision: 0,
+            epoch: 0,
         }
     }
 
@@ -245,6 +249,17 @@ impl Terminal {
     /// stale at any other.
     pub(crate) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Which log this is, counting clears: a line number kept from one
+    /// epoch names nothing in the next.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// How many rows the screen holds.
+    pub(crate) fn screen_lines(&self) -> usize {
+        self.size.lines
     }
 
     /// Lets go of the stamps of lines the scrollback no longer holds,
@@ -346,6 +361,7 @@ impl Terminal {
         // The log starts over, and so does the count: the line kept, if
         // any, is the first of what comes next.
         self.first_number = 1;
+        self.epoch += 1;
     }
 
     /// How many lines on screen, from the top row down to the cursor's,
@@ -412,8 +428,10 @@ impl Terminal {
     /// numbering over.
     pub(crate) fn clear(&mut self) {
         let revision = self.revision + 1;
+        let epoch = self.epoch + 1;
         *self = Self::with_size(self.size, self.scrollback);
         self.revision = revision;
+        self.epoch = epoch;
     }
 
     /// Moves the view through the scrollback: positive is back in time.
@@ -520,6 +538,53 @@ impl Terminal {
             .filter(|text| !text.is_empty())
     }
 
+    /// Where the selection begins: the row of the grid and the column of
+    /// its first cell — where a find seeded from it should land.
+    pub(crate) fn selection_start(&self) -> Option<(i32, usize)> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        Some((range.start.line.0, range.start.column.0))
+    }
+
+    /// The selected text of the lines `keep` says, by number, with the
+    /// rest left out: what a copy takes while the mask hides lines the
+    /// selection runs across. Each line reads as [`selection_text`] reads
+    /// it, its wrapped rows joined.
+    ///
+    /// [`selection_text`]: Self::selection_text
+    pub(crate) fn selection_text_within(&self, keep: impl Fn(i64) -> bool) -> Option<String> {
+        let selection = self.term.selection.as_ref()?;
+        let range = selection.to_range(&self.term)?;
+        let last_column = self.term.last_column();
+        let mut parts = Vec::new();
+        for line in self.logical_lines() {
+            if line.end <= range.start.line.0 || line.start > range.end.line.0 {
+                continue;
+            }
+            if !keep(line.number) {
+                continue;
+            }
+            let start = if range.start.line.0 >= line.start {
+                range.start
+            } else {
+                Point::new(Line(line.start), Column(0))
+            };
+            let end = if range.end.line.0 < line.end {
+                range.end
+            } else {
+                Point::new(Line(line.end - 1), last_column)
+            };
+            parts.push(self.term.bounds_to_string(start, end));
+        }
+        let mut text = parts.join("\n");
+        if text.is_empty() {
+            return None;
+        }
+        if matches!(selection.ty, SelectionType::Lines) {
+            text.push('\n');
+        }
+        Some(text)
+    }
+
     /// How wide the line numbers run: the digits of the highest number in
     /// the log, and never fewer than a short log is sized for.
     pub(crate) fn number_digits(&self) -> usize {
@@ -557,86 +622,136 @@ impl Terminal {
         self.first_number as i64 + self.stamps.len() as i64 - 1 - anchor
     }
 
-    /// Where a pattern occurs in the log, oldest first, as cells. Each
-    /// logical line is read whole — the rows the terminal wrapped it over
-    /// joined back — and a match that straddles the wrap comes back as one
-    /// match of two spans. A match is named by its line's number and how
-    /// far along the line it starts, which is the same match through a
-    /// scroll, a reflow or new lines pushing the rows up.
-    pub(crate) fn find(&self, matcher: &OutputFilter) -> Vec<FindMatch> {
+    /// The last row of the log: the cursor's, or the last row under it
+    /// that holds anything, whichever is lower. The cursor's own row is
+    /// left out while nothing has landed on it yet — it is where the next
+    /// line will go, not a line.
+    fn last_content_line(&self) -> i32 {
         let grid = self.term.grid();
-        let history = grid.history_size() as i32;
-        let last = self.size.lines as i32 - 1;
-        let is_spacer = |flags: Flags| {
-            flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-        };
-        let mut matches = Vec::new();
-        let mut text = String::new();
+        let cursor = grid.cursor.point.line.0;
+        let last_with_text = (0..self.size.lines as i32)
+            .rev()
+            .find(|&line| grid[Line(line)].line_length().0 > 0);
+        let last = last_with_text.map_or(cursor, |line| line.max(cursor));
+        if last == cursor && self.unstamped && grid[Line(cursor)].line_length().0 == 0 {
+            cursor - 1
+        } else {
+            last
+        }
+    }
+
+    /// The lines of the log as the device ended them, oldest first: each
+    /// with its number and the rows the terminal laid it over, from the
+    /// top of the scrollback to the last row that holds anything.
+    pub(crate) fn logical_lines(&self) -> impl Iterator<Item = LogicalLine> + '_ {
+        let grid = self.term.grid();
+        let last = self.last_content_line();
         let mut number = self.first_line_number();
-        let mut line = -history;
-        while line <= last {
-            // The logical line's text, and the row after its last.
-            text.clear();
-            let mut end = line;
+        let mut line = -(grid.history_size() as i32);
+        std::iter::from_fn(move || {
+            if line > last {
+                return None;
+            }
+            let start = line;
             loop {
-                let row = &grid[Line(end)];
-                text.extend(row[..].iter().filter(|cell| !is_spacer(cell.flags)).map(|cell| cell.c));
-                let wrapped = row
+                let wrapped = grid[Line(line)]
                     .last()
                     .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE));
-                end += 1;
-                if !wrapped || end > last {
+                line += 1;
+                if !wrapped || line > last {
                     break;
                 }
             }
-            text.truncate(text.trim_end().len());
+            let found = LogicalLine {
+                number,
+                start,
+                end: line,
+            };
+            number += 1;
+            Some(found)
+        })
+    }
+
+    /// What a line says: the characters of its rows in turn, a wide
+    /// character once, and the blank end dropped.
+    pub(crate) fn line_text(&self, line: &LogicalLine) -> String {
+        let grid = self.term.grid();
+        let mut text = String::new();
+        for at in line.rows() {
+            text.extend(
+                grid[Line(at)][..]
+                    .iter()
+                    .filter(|cell| !is_spacer(cell.flags))
+                    .map(|cell| cell.c),
+            );
+        }
+        text.truncate(text.trim_end().len());
+        text
+    }
+
+    /// Where a pattern occurs in the log, oldest first, as cells, in the
+    /// lines `keep` says by number — every line, or the ones the mask
+    /// shows. Each logical line is read whole — the rows the terminal
+    /// wrapped it over joined back — and a match that straddles the wrap
+    /// comes back as one match of two spans. A match is named by its
+    /// line's number and how far along the line it starts, which is the
+    /// same match through a scroll, a reflow or new lines pushing the
+    /// rows up.
+    pub(crate) fn find(&self, matcher: &OutputFilter, keep: impl Fn(i64) -> bool) -> Vec<FindMatch> {
+        let grid = self.term.grid();
+        let mut matches = Vec::new();
+        for line in self.logical_lines() {
+            if !keep(line.number) {
+                continue;
+            }
+            let text = self.line_text(&line);
             let ranges = matcher.find_ranges(&text);
-            if !ranges.is_empty() {
-                // One cell per character of the text, in order, for the
-                // few lines that hold a match.
-                let cells: Vec<FindSpan> = (line..end)
-                    .flat_map(|at| {
-                        grid[Line(at)][..]
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, cell)| !is_spacer(cell.flags))
-                            .map(move |(column, cell)| FindSpan {
-                                line: at,
-                                column,
-                                width: if cell.flags.contains(Flags::WIDE_CHAR) {
-                                    2
-                                } else {
-                                    1
-                                },
-                            })
-                    })
-                    .collect();
-                for range in ranges {
-                    let start = text[..range.start].chars().count();
-                    let end = start + text[range].chars().count();
-                    let mut spans: Vec<FindSpan> = Vec::new();
-                    for cell in &cells[start..end.min(cells.len())] {
-                        match spans.last_mut() {
-                            Some(span)
-                                if span.line == cell.line
-                                    && span.column + span.width == cell.column =>
-                            {
-                                span.width += cell.width;
-                            }
-                            _ => spans.push(*cell),
+            if ranges.is_empty() {
+                continue;
+            }
+            // One cell per character of the text, in order, for the few
+            // lines that hold a match.
+            let cells: Vec<FindSpan> = line
+                .rows()
+                .flat_map(|at| {
+                    grid[Line(at)][..]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, cell)| !is_spacer(cell.flags))
+                        .map(move |(column, cell)| FindSpan {
+                            line: at,
+                            column,
+                            width: if cell.flags.contains(Flags::WIDE_CHAR) {
+                                2
+                            } else {
+                                1
+                            },
+                        })
+                })
+                .collect();
+            for range in ranges {
+                let start = text[..range.start].chars().count();
+                let end = start + text[range].chars().count();
+                let mut spans: Vec<FindSpan> = Vec::new();
+                for cell in &cells[start..end.min(cells.len())] {
+                    match spans.last_mut() {
+                        Some(span)
+                            if span.line == cell.line
+                                && span.column + span.width == cell.column =>
+                        {
+                            span.width += cell.width;
                         }
-                    }
-                    if !spans.is_empty() {
-                        matches.push(FindMatch {
-                            line: number,
-                            offset: start,
-                            spans,
-                        });
+                        _ => spans.push(*cell),
                     }
                 }
+                if !spans.is_empty() {
+                    matches.push(FindMatch {
+                        line: line.number,
+                        offset: start,
+                        spans,
+                    });
+                }
             }
-            number += 1;
-            line = end;
         }
         matches
     }
@@ -691,6 +806,63 @@ impl Terminal {
         rows
     }
 
+    /// The rows of the line the cursor is on — the whole logical line,
+    /// wrapped rows included — which is still being written and is drawn
+    /// in plain ink; see [`render_rows`].
+    ///
+    /// [`render_rows`]: Self::render_rows
+    fn unfinished_lines(&self) -> Range<i32> {
+        let cursor_line = self.term.grid().cursor.point.line.0;
+        let lines = self.size.lines as i32;
+        let mut unfinished = cursor_line..cursor_line + 1;
+        while self.is_continuation(unfinished.start) {
+            unfinished.start -= 1;
+        }
+        while unfinished.end < lines && self.is_continuation(unfinished.end) {
+            unfinished.end += 1;
+        }
+        unfinished
+    }
+
+    /// The stamp of the line with a number, and the number itself, while
+    /// the log still holds the line.
+    fn stamp_for(&self, number: i64) -> Option<(String, usize)> {
+        let index = usize::try_from(number - self.first_number as i64).ok()?;
+        self.stamps
+            .get(index)
+            .map(|stamp| (stamp.clone(), self.first_number + index))
+    }
+
+    /// The cells of a row the selection covers: from edge to edge on a row
+    /// it runs through, from and to the cell it was dragged over on its
+    /// first and last rows, and a wide character's second cell along with
+    /// its first.
+    fn selected_cells(&self, range: &SelectionRange, line: i32) -> Option<Range<usize>> {
+        if line < range.start.line.0 || line > range.end.line.0 {
+            return None;
+        }
+        let columns = self.size.columns;
+        let start = if range.is_block || line == range.start.line.0 {
+            range.start.column.0
+        } else {
+            0
+        };
+        let mut end = if range.is_block || line == range.end.line.0 {
+            range.end.column.0 + 1
+        } else {
+            columns
+        };
+        if end < columns
+            && self.term.grid()[Line(line)][Column(end - 1)]
+                .flags
+                .contains(Flags::WIDE_CHAR)
+        {
+            end += 1;
+        }
+        let end = end.min(columns);
+        (start < end).then_some(start..end)
+    }
+
     /// The screen as it is to be drawn, colours resolved against the theme.
     /// With `highlight`, text the device left in the default colour takes
     /// the colour of what it says once its line is finished; the line the
@@ -700,11 +872,9 @@ impl Terminal {
         let grid = self.term.grid();
         let content = self.term.renderable_content();
         let offset = content.display_offset as i32;
-        let selection = content.selection;
         let lines = self.size.lines;
         let history = grid.history_size() as i32;
 
-        let is_continuation = |line: Line| self.is_continuation(line.0);
         // Rows that begin a line, numbered from the top of the scrollback:
         // one pass up to the cursor, noting the number as it passes the
         // first row on screen.
@@ -713,7 +883,7 @@ impl Terminal {
         let (mut hard_at_first, mut hard_at_cursor) = (0, 0);
         let mut count = 0usize;
         for at in -history..=cursor_line.max(first_visible) {
-            if !is_continuation(Line(at)) {
+            if !self.is_continuation(at) {
                 count += 1;
             }
             if at == first_visible {
@@ -724,205 +894,25 @@ impl Terminal {
             }
         }
         // The last stamped line is the cursor's, or the one above it while
-        // the cursor's line is still empty. A hard row's stamp is found by
-        // counting back from it, and its number is the stamp's place in
-        // the log.
+        // the cursor's line is still empty. A hard row's number is found by
+        // counting back from it; a row past the last stamp, or before the
+        // first, gets a number the log has no stamp for, and shows none.
         let anchor = hard_at_cursor as i64 - i64::from(self.unstamped);
-        let stamp_index = |hard: usize| -> Option<usize> {
-            let back = usize::try_from(anchor - hard as i64).ok()?;
-            self.stamps.len().checked_sub(back + 1)
+        let number_of = |hard: usize| -> i64 {
+            self.first_number as i64 + self.stamps.len() as i64 - 1 - (anchor - hard as i64)
         };
-
         let mut hard = hard_at_first;
-        let mut rows: Vec<RenderRow> = (0..lines)
+        let specs: Vec<(i32, Option<i64>)> = (0..lines)
             .map(|index| {
-                let line = Line(index as i32 - offset);
-                let continuation = is_continuation(line);
+                let line = index as i32 - offset;
+                let continuation = self.is_continuation(line);
                 if index > 0 && !continuation {
                     hard += 1;
                 }
-                let stamped = if continuation { None } else { stamp_index(hard) };
-                RenderRow {
-                    stamp: stamped.map(|index| self.stamps[index].clone()),
-                    number: stamped.map(|index| self.first_number + index),
-                    runs: Vec::new(),
-                    text: String::new(),
-                    columns: Vec::new(),
-                    selected: None,
-                }
+                (line, (!continuation).then(|| number_of(hard)))
             })
             .collect();
-
-        // Every cell first, unstyled: a row's text has to be whole before
-        // the parts of it worth a colour can be found.
-        struct Pending {
-            column: usize,
-            width: usize,
-            text: String,
-            flags: Flags,
-            fg: Color,
-            bg: Color,
-        }
-        let mut pending: Vec<Vec<Pending>> = (0..lines).map(|_| Vec::new()).collect();
-        for cell in content.display_iter {
-            let flags = cell.flags;
-            if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let index = (cell.point.line.0 + offset) as usize;
-            let (Some(row), Some(cells)) = (rows.get_mut(index), pending.get_mut(index)) else {
-                continue;
-            };
-            let mut text = String::new();
-            if flags.contains(Flags::HIDDEN) {
-                text.push(' ');
-            } else {
-                text.push(cell.c);
-                if let Some(marks) = cell.zerowidth() {
-                    text.extend(marks);
-                }
-            }
-            row.text.push(cell.c);
-            row.columns.push(cell.point.column.0);
-            cells.push(Pending {
-                column: cell.point.column.0,
-                width: if flags.contains(Flags::WIDE_CHAR) {
-                    2
-                } else {
-                    1
-                },
-                text,
-                flags,
-                fg: cell.fg,
-                bg: cell.bg,
-            });
-        }
-
-        let highlighter = highlight.then(Highlighter::shared);
-        let plain = (
-            Color::Named(NamedColor::Foreground),
-            Color::Named(NamedColor::Background),
-        );
-        // The line the cursor is on is still being written — by the device,
-        // or by whoever is typing at its prompt — and stays in plain ink
-        // until it is done: colours shifting under the caret as each
-        // character lands are a distraction, not a reading. The whole
-        // logical line, wrapped rows included, waits together.
-        let mut unfinished = cursor_line..cursor_line + 1;
-        while is_continuation(Line(unfinished.start)) {
-            unfinished.start -= 1;
-        }
-        while unfinished.end < lines as i32 && is_continuation(Line(unfinished.end)) {
-            unfinished.end += 1;
-        }
-        for (index, (row, cells)) in rows.iter_mut().zip(pending).enumerate() {
-            // One character of the row's text per cell, so a role found at
-            // a position in the text belongs to the cell at that position.
-            let roles = highlighter
-                .filter(|_| !unfinished.contains(&(index as i32 - offset)))
-                .map(|highlighter| highlighter.roles(&row.text));
-            for (index, cell) in cells.into_iter().enumerate() {
-                let flags = cell.flags;
-                let (mut fg, mut bg) = (cell.fg, cell.bg);
-                if flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                let background = resolve(bg, content.colors, palette);
-                let mut style = RunStyle {
-                    foreground: resolve(fg, content.colors, palette),
-                    background: (background != palette.background).then_some(background),
-                    bold: flags.contains(Flags::BOLD),
-                    italic: flags.contains(Flags::ITALIC),
-                    underline: flags.intersects(
-                        Flags::UNDERLINE
-                            | Flags::DOUBLE_UNDERLINE
-                            | Flags::UNDERCURL
-                            | Flags::DOTTED_UNDERLINE
-                            | Flags::DASHED_UNDERLINE,
-                    ),
-                    strikeout: flags.contains(Flags::STRIKEOUT),
-                };
-                // Only ink the device left plain takes a role's colour: what
-                // it coloured itself, it meant.
-                let role = roles
-                    .as_ref()
-                    .and_then(|roles| roles.get(index).copied().flatten());
-                if let Some(role) = role
-                    && (cell.fg, cell.bg) == plain
-                    && !flags.contains(Flags::INVERSE)
-                {
-                    let ink = role.style(palette.theme);
-                    style.foreground = ink.color;
-                    if let Some(ground) = ink.background {
-                        style.background = Some(ground);
-                    }
-                    style.bold |= ink.bold;
-                    style.italic |= ink.italic;
-                    style.underline |= ink.underline;
-                }
-                if flags.contains(Flags::DIM) {
-                    style.foreground = blend(style.foreground, palette.background, 0.5);
-                }
-                match row.runs.last_mut() {
-                    Some(run) if run.column + run.width == cell.column && run.style == style => {
-                        run.text.push_str(&cell.text);
-                        run.width += cell.width;
-                    }
-                    _ => row.runs.push(RenderRun {
-                        column: cell.column,
-                        width: cell.width,
-                        text: cell.text,
-                        style,
-                    }),
-                }
-            }
-        }
-        for row in &mut rows {
-            row.text.truncate(row.text.trim_end().len());
-            row.columns.truncate(row.text.chars().count());
-            // Blank stretches with nothing to show are not worth shaping.
-            row.runs.retain(|run| {
-                run.style.background.is_some()
-                    || run.style.underline
-                    || run.style.strikeout
-                    || !run.text.trim().is_empty()
-            });
-        }
-
-        // The selection, as the cells of each row it covers: a row it runs
-        // through from edge to edge, its first and last rows from and to
-        // the cell it was dragged over, and a wide character's second cell
-        // along with its first.
-        if let Some(range) = selection {
-            let columns = self.size.columns;
-            for (index, row) in rows.iter_mut().enumerate() {
-                let line = index as i32 - offset;
-                if line < range.start.line.0 || line > range.end.line.0 {
-                    continue;
-                }
-                let start = if range.is_block || line == range.start.line.0 {
-                    range.start.column.0
-                } else {
-                    0
-                };
-                let mut end = if range.is_block || line == range.end.line.0 {
-                    range.end.column.0 + 1
-                } else {
-                    columns
-                };
-                if end < columns
-                    && grid[Line(line)][Column(end - 1)]
-                        .flags
-                        .contains(Flags::WIDE_CHAR)
-                {
-                    end += 1;
-                }
-                let end = end.min(columns);
-                if start < end {
-                    row.selected = Some(start..end);
-                }
-            }
-        }
+        let rows = self.render_rows(&specs, palette, highlight);
 
         let cursor = (content.cursor.shape != CursorShape::Hidden)
             .then(|| {
@@ -943,11 +933,205 @@ impl Terminal {
             })
             .flatten();
 
-        RenderContent {
-            rows,
-            cursor,
-            offset,
+        RenderContent { rows, cursor }
+    }
+
+    /// Rows of the grid, named by row, as they are to be drawn: each with
+    /// its runs of styled text, its plain text, the cells the selection
+    /// covers, and — on a row that begins a line, given the line's number
+    /// — the line's stamp and number. The screen is its rows in order;
+    /// the mask draws the rows of the lines it keeps the same way.
+    pub(crate) fn render_rows(
+        &self,
+        specs: &[(i32, Option<i64>)],
+        palette: &TerminalPalette,
+        highlight: bool,
+    ) -> Vec<RenderRow> {
+        let grid = self.term.grid();
+        let colors = self.term.colors();
+        let selection = self
+            .term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term));
+        let highlighter = highlight.then(Highlighter::shared);
+        let plain = (
+            Color::Named(NamedColor::Foreground),
+            Color::Named(NamedColor::Background),
+        );
+        // The line the cursor is on is still being written — by the device,
+        // or by whoever is typing at its prompt — and stays in plain ink
+        // until it is done: colours shifting under the caret as each
+        // character lands are a distraction, not a reading. The whole
+        // logical line, wrapped rows included, waits together.
+        let unfinished = self.unfinished_lines();
+
+        struct Pending {
+            column: usize,
+            width: usize,
+            text: String,
+            flags: Flags,
+            fg: Color,
+            bg: Color,
         }
+
+        specs
+            .iter()
+            .map(|&(line, begins)| {
+                let (stamp, number) = match begins.and_then(|number| self.stamp_for(number)) {
+                    Some((stamp, number)) => (Some(stamp), Some(number)),
+                    None => (None, None),
+                };
+                // Every cell first, unstyled: a row's text has to be whole
+                // before the parts of it worth a colour can be found.
+                let mut text = String::new();
+                let mut columns = Vec::new();
+                let mut pending = Vec::new();
+                for (column, cell) in grid[Line(line)][..].iter().enumerate() {
+                    let flags = cell.flags;
+                    if is_spacer(flags) {
+                        continue;
+                    }
+                    let mut glyph = String::new();
+                    if flags.contains(Flags::HIDDEN) {
+                        glyph.push(' ');
+                    } else {
+                        glyph.push(cell.c);
+                        if let Some(marks) = cell.zerowidth() {
+                            glyph.extend(marks);
+                        }
+                    }
+                    text.push(cell.c);
+                    columns.push(column);
+                    pending.push(Pending {
+                        column,
+                        width: if flags.contains(Flags::WIDE_CHAR) {
+                            2
+                        } else {
+                            1
+                        },
+                        text: glyph,
+                        flags,
+                        fg: cell.fg,
+                        bg: cell.bg,
+                    });
+                }
+
+                // One character of the row's text per cell, so a role found
+                // at a position in the text belongs to the cell at that
+                // position.
+                let roles = highlighter
+                    .filter(|_| !unfinished.contains(&line))
+                    .map(|highlighter| highlighter.roles(&text));
+                let mut runs: Vec<RenderRun> = Vec::new();
+                for (index, cell) in pending.into_iter().enumerate() {
+                    let flags = cell.flags;
+                    let (mut fg, mut bg) = (cell.fg, cell.bg);
+                    if flags.contains(Flags::INVERSE) {
+                        std::mem::swap(&mut fg, &mut bg);
+                    }
+                    let background = resolve(bg, colors, palette);
+                    let mut style = RunStyle {
+                        foreground: resolve(fg, colors, palette),
+                        background: (background != palette.background).then_some(background),
+                        bold: flags.contains(Flags::BOLD),
+                        italic: flags.contains(Flags::ITALIC),
+                        underline: flags.intersects(
+                            Flags::UNDERLINE
+                                | Flags::DOUBLE_UNDERLINE
+                                | Flags::UNDERCURL
+                                | Flags::DOTTED_UNDERLINE
+                                | Flags::DASHED_UNDERLINE,
+                        ),
+                        strikeout: flags.contains(Flags::STRIKEOUT),
+                    };
+                    // Only ink the device left plain takes a role's colour:
+                    // what it coloured itself, it meant.
+                    let role = roles
+                        .as_ref()
+                        .and_then(|roles| roles.get(index).copied().flatten());
+                    if let Some(role) = role
+                        && (cell.fg, cell.bg) == plain
+                        && !flags.contains(Flags::INVERSE)
+                    {
+                        let ink = role.style(palette.theme);
+                        style.foreground = ink.color;
+                        if let Some(ground) = ink.background {
+                            style.background = Some(ground);
+                        }
+                        style.bold |= ink.bold;
+                        style.italic |= ink.italic;
+                        style.underline |= ink.underline;
+                    }
+                    if flags.contains(Flags::DIM) {
+                        style.foreground = blend(style.foreground, palette.background, 0.5);
+                    }
+                    match runs.last_mut() {
+                        Some(run) if run.column + run.width == cell.column && run.style == style => {
+                            run.text.push_str(&cell.text);
+                            run.width += cell.width;
+                        }
+                        _ => runs.push(RenderRun {
+                            column: cell.column,
+                            width: cell.width,
+                            text: cell.text,
+                            style,
+                        }),
+                    }
+                }
+                text.truncate(text.trim_end().len());
+                columns.truncate(text.chars().count());
+                // Blank stretches with nothing to show are not worth shaping.
+                runs.retain(|run| {
+                    run.style.background.is_some()
+                        || run.style.underline
+                        || run.style.strikeout
+                        || !run.text.trim().is_empty()
+                });
+                let selected = selection
+                    .as_ref()
+                    .and_then(|range| self.selected_cells(range, line));
+                RenderRow {
+                    line,
+                    stamp,
+                    number,
+                    runs,
+                    text,
+                    columns,
+                    selected,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether a cell is the second half of a wide character, or the blank a
+/// wide character left at a row's end when it would not fit: no character
+/// of its own either way.
+fn is_spacer(flags: Flags) -> bool {
+    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
+/// A line as the device ended it, over the rows the terminal laid it on:
+/// its number in the log, and its rows — the first, and one past the last
+/// — as alacritty numbers them, zero the top of the screen and negative
+/// into the scrollback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LogicalLine {
+    pub(crate) number: i64,
+    pub(crate) start: i32,
+    pub(crate) end: i32,
+}
+
+impl LogicalLine {
+    pub(crate) fn rows(&self) -> Range<i32> {
+        self.start..self.end
+    }
+
+    /// Whether the line is wholly in the scrollback, where nothing is
+    /// written again: what it says now is what it will say.
+    pub(crate) fn settled(&self) -> bool {
+        self.end <= 0
     }
 }
 
@@ -981,12 +1165,12 @@ fn erase(bytes: &[u8]) -> Erase {
 pub(crate) struct RenderContent {
     pub(crate) rows: Vec<RenderRow>,
     pub(crate) cursor: Option<RenderCursor>,
-    /// How far the view is scrolled back: the grid line drawn on the
-    /// first row is `-offset`.
-    pub(crate) offset: i32,
 }
 
 pub(crate) struct RenderRow {
+    /// The row of the grid this is: zero the top of the screen, negative
+    /// into the scrollback.
+    pub(crate) line: i32,
     /// When the line began, on the row that begins it.
     pub(crate) stamp: Option<String>,
     /// Which line of the log it is, on the row that begins it.
@@ -1377,9 +1561,9 @@ mod tests {
     fn find_locates_matches_across_a_wrap() {
         let mut terminal = terminal(5, 4);
         terminal.receive(b"abcdefgh\r\nDEF\r\n", "1");
-        let mut matcher = OutputFilter::literal();
+        let mut matcher = OutputFilter::default();
         matcher.set_pattern("def");
-        let found = terminal.find(&matcher);
+        let found = terminal.find(&matcher, |_| true);
         assert_eq!(
             found,
             vec![
@@ -1399,9 +1583,9 @@ mod tests {
             ]
         );
         matcher.toggle_match_case();
-        assert_eq!(terminal.find(&matcher).len(), 1);
+        assert_eq!(terminal.find(&matcher, |_| true).len(), 1);
         matcher.set_pattern("");
-        assert!(terminal.find(&matcher).is_empty());
+        assert!(terminal.find(&matcher, |_| true).is_empty());
     }
 
     /// A wide character is one match cell of two columns, and a line in
@@ -1410,10 +1594,10 @@ mod tests {
     fn find_counts_wide_characters_and_reaches_the_scrollback() {
         let mut terminal = terminal(10, 2);
         terminal.receive("温度=25\r\nnext\r\nlast\r\n".as_bytes(), "1");
-        let mut matcher = OutputFilter::literal();
+        let mut matcher = OutputFilter::default();
         matcher.set_pattern("度=2");
         assert_eq!(
-            terminal.find(&matcher),
+            terminal.find(&matcher, |_| true),
             vec![FindMatch {
                 line: 1,
                 offset: 1,
@@ -1432,13 +1616,13 @@ mod tests {
     fn a_match_keeps_its_name_as_the_rows_move() {
         let mut terminal = Terminal::with_size(GridSize { columns: 40, lines: 3 }, 100);
         terminal.receive(b"lost 1\r\nfine\r\nlost 2\r\n", "1");
-        let mut matcher = OutputFilter::literal();
+        let mut matcher = OutputFilter::default();
         matcher.set_pattern("lost");
-        let before: Vec<_> = terminal.find(&matcher).iter().map(FindMatch::key).collect();
+        let before: Vec<_> = terminal.find(&matcher, |_| true).iter().map(FindMatch::key).collect();
         assert_eq!(before, vec![(1, 0), (3, 0)]);
         terminal.receive(b"lost 3\r\nmore\r\n", "2");
         terminal.resize(8, 6);
-        let after: Vec<_> = terminal.find(&matcher).iter().map(FindMatch::key).collect();
+        let after: Vec<_> = terminal.find(&matcher, |_| true).iter().map(FindMatch::key).collect();
         assert_eq!(after, vec![(1, 0), (3, 0), (4, 0)]);
     }
 

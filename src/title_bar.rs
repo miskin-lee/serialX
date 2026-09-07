@@ -33,6 +33,7 @@ use gpui_kit::*;
 
 use crate::app_menu::{NextTab, PreviousTab, ToggleConnection, ToggleSidePanel};
 use crate::controls::tag;
+use crate::filter::FilterMode;
 use crate::icons::Glyph;
 use crate::theme::{LABEL, MICRO, MONO_SMALL, Typography, WorkbenchPalette, mix, tint};
 use crate::{SerialTabSnapshot, SerialWorkspace};
@@ -247,7 +248,8 @@ impl SerialWorkspace {
 
     /// The command-centre box, wired to the active tab's filter. Its right
     /// end reports how much of the log is showing, or why the pattern will
-    /// not compile, ahead of the two switches.
+    /// not compile, ahead of the three switches: match case, regular
+    /// expressions, and the mask that shows only the lines that match.
     fn render_filter_box(&mut self, tab: &SerialTabSnapshot, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
         let tab_id = tab.id;
@@ -337,17 +339,53 @@ impl SerialWorkspace {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.toggle_filter_regex(cx);
                         })),
+                    )
+                    .child(
+                        Self::filter_icon_switch(
+                            ("filter-mask", tab_id),
+                            IconName::EyeOff,
+                            filter.mode() == FilterMode::Mask,
+                            "Show only matching lines",
+                            palette,
+                            cx,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_filter_mode(cx);
+                        })),
                     ),
             )
             .into_any_element()
     }
 
-    /// One of the two switches inside the box, drawn like the toggles in VS
+    /// One of the switches inside the box, drawn like the toggles in VS
     /// Code's find widget: a bare glyph that takes the accent when it is on.
-    /// The side panel's search boxes borrow it for their `Aa`.
+    /// The side panel's search box borrows it for its `Aa`.
     pub(crate) fn filter_switch(
         id: impl Into<ElementId>,
         glyph: &'static str,
+        on: bool,
+        tooltip: &'static str,
+        palette: WorkbenchPalette,
+        cx: &App,
+    ) -> Button {
+        Self::switch(id, on, tooltip, palette, cx).label(glyph)
+    }
+
+    /// The same switch wearing an icon rather than letters: the mask's
+    /// crossed eye, for what it does to the lines that do not match.
+    pub(crate) fn filter_icon_switch(
+        id: impl Into<ElementId>,
+        icon: IconName,
+        on: bool,
+        tooltip: &'static str,
+        palette: WorkbenchPalette,
+        cx: &App,
+    ) -> Button {
+        Self::switch(id, on, tooltip, palette, cx).icon(icon)
+    }
+
+    fn switch(
+        id: impl Into<ElementId>,
         on: bool,
         tooltip: &'static str,
         palette: WorkbenchPalette,
@@ -358,7 +396,6 @@ impl SerialWorkspace {
             .compact()
             .rounded(px(6.))
             .tab_stop(false)
-            .label(glyph)
             .toggled(on)
             .tooltip(tooltip);
         if on {

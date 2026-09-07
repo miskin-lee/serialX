@@ -10,6 +10,7 @@ mod find;
 mod groups;
 mod highlight;
 mod icons;
+mod mask;
 mod presets;
 mod serial;
 mod settings;
@@ -41,7 +42,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use icons::WorkbenchAssets;
-use presets::{Library, PresetStore};
+use presets::PresetStore;
 use serial::*;
 use sidebar::{
     ListSearch, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH,
@@ -102,8 +103,7 @@ pub struct SerialWorkspace {
     /// to whichever tab is in front, so what was typed survives a switch.
     send_input: Entity<InputState>,
     _send_subscription: Subscription,
-    /// The search boxes over the two lists.
-    session_search: ListSearch,
+    /// The search box over the Quick send list.
     command_search: ListSearch,
     /// The terminal log as a place to type: while it holds focus, keys go to
     /// the port of the tab in front.
@@ -147,8 +147,7 @@ impl SerialWorkspace {
             },
         );
 
-        let session_search = ListSearch::new(Library::Sessions, window, cx);
-        let command_search = ListSearch::new(Library::Commands, window, cx);
+        let command_search = ListSearch::new(window, cx);
 
         let workspace = Self {
             tabs: Vec::new(),
@@ -169,7 +168,6 @@ impl SerialWorkspace {
             panel_layout,
             send_input,
             _send_subscription: send_subscription,
-            session_search,
             command_search,
             terminal_focus: cx.focus_handle(),
             composing: None,
@@ -346,6 +344,7 @@ impl SerialWorkspace {
         if let Some(index) = self.tab_index(tab_id)
             && self.tabs[index].filter.set_pattern(pattern)
         {
+            self.tabs[index].filter_changed();
             cx.notify();
         }
     }
@@ -353,6 +352,7 @@ impl SerialWorkspace {
     fn toggle_filter_regex(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.filter.toggle_regex();
+            tab.filter_changed();
             cx.notify();
         }
     }
@@ -360,6 +360,19 @@ impl SerialWorkspace {
     fn toggle_filter_match_case(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.filter.toggle_match_case();
+            tab.filter_changed();
+            cx.notify();
+        }
+    }
+
+    /// Switches the filter between tinting the lines that match and
+    /// showing only them. The mask opens at the newest line, and what the
+    /// find found is looked for again among the lines now shown.
+    fn toggle_filter_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.filter.toggle_mode();
+            tab.mask.scroll_to_bottom();
+            tab.find.forget();
             cx.notify();
         }
     }
@@ -477,7 +490,7 @@ impl SerialWorkspace {
         bytes.extend_from_slice(tab.line_ending().bytes());
         tab.write(bytes);
         if tab.auto_scroll {
-            tab.terminal.scroll_to_bottom();
+            tab.scroll_to_bottom();
         }
 
         input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -498,7 +511,7 @@ impl SerialWorkspace {
         tab.terminal.clear_selection();
         tab.write(text.as_bytes().to_vec());
         if tab.auto_scroll {
-            tab.terminal.scroll_to_bottom();
+            tab.scroll_to_bottom();
         }
         self.wake_cursor(window, cx);
         cx.notify();
@@ -592,7 +605,7 @@ impl SerialWorkspace {
         tab.terminal.clear_selection();
         tab.write(bytes);
         if tab.auto_scroll {
-            tab.terminal.scroll_to_bottom();
+            tab.scroll_to_bottom();
         }
         self.wake_cursor(window, cx);
         cx.stop_propagation();
@@ -609,7 +622,9 @@ impl SerialWorkspace {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        let cell = Self::cell_at(metrics, tab.terminal.display_offset(), event.position);
+        let Some(cell) = Self::cell_at(tab, metrics, event.position) else {
+            return;
+        };
         if event.modifiers.shift {
             tab.terminal.extend_selection(cell);
         } else {
@@ -633,19 +648,20 @@ impl SerialWorkspace {
         };
         let y = f32::from(position.y) - metrics.origin_y;
         let past_edge = if y < 0. {
-            tab.terminal.scroll(1);
+            tab.scroll_view(1);
             true
         } else if y > metrics.lines as f32 * metrics.line_height {
-            tab.terminal.scroll(-1);
+            tab.scroll_view(-1);
             true
         } else {
             false
         };
         if past_edge {
-            tab.auto_scroll = tab.terminal.is_at_bottom();
+            tab.auto_scroll = tab.view_at_bottom();
         }
-        let cell = Self::cell_at(metrics, tab.terminal.display_offset(), position);
-        tab.terminal.extend_selection(cell);
+        if let Some(cell) = Self::cell_at(tab, metrics, position) {
+            tab.terminal.extend_selection(cell);
+        }
         cx.notify();
     }
 
@@ -664,9 +680,14 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    /// The cell under a point of the window, on the grid as it is
-    /// scrolled: past the edges of the log, the nearest cell.
-    fn cell_at(metrics: TerminalMetrics, display_offset: usize, position: Point<Pixels>) -> GridCell {
+    /// The cell under a point of the window, on the grid as the tab's
+    /// view shows it: past the edges of the log, the nearest cell. Nothing
+    /// while the view has no rows to land on.
+    fn cell_at(
+        tab: &SerialTabState,
+        metrics: TerminalMetrics,
+        position: Point<Pixels>,
+    ) -> Option<GridCell> {
         let columns = metrics.columns.max(1);
         let lines = metrics.lines.max(1);
         let x = (f32::from(position.x) - metrics.origin_x - metrics.text_left)
@@ -674,11 +695,11 @@ impl SerialWorkspace {
         let y = (f32::from(position.y) - metrics.origin_y) / metrics.line_height.max(1.);
         let row = y.floor().clamp(0., (lines - 1) as f32) as usize;
         let column = x.floor().clamp(0., (columns - 1) as f32) as usize;
-        GridCell {
-            line: row as i32 - display_offset as i32,
+        Some(GridCell {
+            line: tab.grid_line_at(row)?,
             column,
             right_half: x >= column as f32 + 0.5,
-        }
+        })
     }
 
     /// Selects the whole log of the tab in front, for ⌘A.
@@ -693,10 +714,7 @@ impl SerialWorkspace {
     /// there was any: with nothing selected the clipboard keeps what it
     /// had.
     fn copy_terminal_selection(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(text) = self
-            .active_tab()
-            .and_then(|tab| tab.terminal.selection_text())
-        else {
+        let Some(text) = self.active_tab().and_then(SerialTabState::selection_text) else {
             return false;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -716,8 +734,8 @@ impl SerialWorkspace {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        tab.terminal.scroll(lines);
-        tab.auto_scroll = tab.terminal.is_at_bottom();
+        tab.scroll_view(lines);
+        tab.auto_scroll = tab.view_at_bottom();
         cx.notify();
     }
 
@@ -749,7 +767,7 @@ impl SerialWorkspace {
             }
         }
         if tab.auto_scroll {
-            tab.terminal.scroll_to_bottom();
+            tab.scroll_to_bottom();
         }
         cx.notify();
     }
@@ -823,7 +841,7 @@ impl SerialWorkspace {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
             tab.auto_scroll = !tab.auto_scroll;
             if tab.auto_scroll {
-                tab.terminal.scroll_to_bottom();
+                tab.scroll_to_bottom();
             }
             cx.notify();
         }
@@ -1209,7 +1227,11 @@ impl SerialWorkspace {
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
-        // The find is brought up to the log before the frame reads either.
+        // The mask and the find are brought up to the log before the frame
+        // reads any of them.
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.refresh_mask();
+        }
         self.refresh_find(cx);
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
         let tab_strip = self.render_tab_strip(active_snapshot.as_ref(), cx);

@@ -164,6 +164,27 @@ pub(crate) fn dialog_footer(
     glyph: Glyph,
     secondary: Option<SecondaryConfirm>,
 ) -> DialogFooter {
+    footer(palette, confirm, glyph, secondary, false)
+}
+
+/// The same foot for a dialog that asks before something is thrown away:
+/// the confirm is in the danger colour, so the button that forgets does
+/// not look like the one that saves.
+pub(crate) fn destructive_dialog_footer(
+    palette: WorkbenchPalette,
+    confirm: &'static str,
+    glyph: Glyph,
+) -> DialogFooter {
+    footer(palette, confirm, glyph, None, true)
+}
+
+fn footer(
+    palette: WorkbenchPalette,
+    confirm: &'static str,
+    glyph: Glyph,
+    secondary: Option<SecondaryConfirm>,
+    destructive: bool,
+) -> DialogFooter {
     DialogFooter::new()
         .justify_between()
         .items_center()
@@ -203,7 +224,8 @@ pub(crate) fn dialog_footer(
                 }))
                 .child(
                     Button::new("dialog-confirm")
-                        .primary()
+                        .when(destructive, |button| button.danger())
+                        .when(!destructive, |button| button.primary())
                         .icon(glyph)
                         .label(confirm)
                         .on_click(|_, window, cx| {

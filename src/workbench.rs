@@ -20,7 +20,7 @@ use gpui_kit::*;
 use crate::app_icon::application_icon_image;
 use crate::app_menu::{NewSerialTab, TERMINAL_CONTEXT};
 use crate::icons::Glyph;
-use crate::filter::OutputFilter;
+use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
 use crate::terminal::{CaretShape, RenderContent};
 use crate::theme::{
@@ -64,6 +64,8 @@ const TERMINAL_LINE_HEIGHT: f32 = 18.;
 const CARET_THICKNESS: f32 = 2.;
 /// Breathing room between the tab strip and the first line.
 const TERMINAL_TOP_INSET: f32 = 8.;
+/// What the log says while the filter's mask keeps every line back.
+const MASK_EMPTY_HINT: &str = "No line matches the filter";
 
 /// How the terminal's cells map to pixels, measured each frame from the
 /// mono font. Kept on the workspace so the input method's candidate window
@@ -399,11 +401,15 @@ impl SerialWorkspace {
                         }
                     });
                 }
-                let Some(content) = paint
-                    .read(cx)
-                    .tab(tab_id)
-                    .map(|tab| tab.terminal.render(&terminal_palette, tab.highlight))
-                else {
+                // The grid was just fitted to the bounds, so the mask is
+                // brought up to it here rather than left from the frame's
+                // start; nothing to do when nothing changed.
+                let Some(content) = paint.update(cx, |this, _| {
+                    this.tab_mut(tab_id).map(|tab| {
+                        tab.refresh_mask();
+                        tab.view_content(&terminal_palette)
+                    })
+                }) else {
                     return;
                 };
                 paint_terminal(
@@ -599,7 +605,9 @@ impl TerminalLayout {
 /// find's washes over what it found, and last the cursor when it is an
 /// outline. With focus the cursor blinks — it is left out in the off
 /// half — and without focus it stands as a steady outline. A read-only
-/// tab has no cursor at all: there is nowhere to type.
+/// tab has no cursor at all: there is nowhere to type. Under the mask the
+/// rows are the lines that match and nothing is tinted; with no line
+/// matching, the screen says so rather than standing empty.
 #[allow(clippy::too_many_arguments)]
 fn paint_terminal(
     bounds: Bounds<Pixels>,
@@ -624,10 +632,11 @@ fn paint_terminal(
     let gutter_font = terminal_font(false, false);
     let cursor_color = rgb(terminal_palette.cursor);
     let finding = find.open && find.matcher.is_active();
+    let tinting = filter.is_active() && filter.mode() == FilterMode::Highlight;
 
     for (index, row) in content.rows.iter().enumerate() {
         let y = bounds.origin.y + line_height * index as f32;
-        if filter.is_active() && filter.matches(&row.text) {
+        if tinting && filter.matches(&row.text) {
             window.paint_quad(fill(
                 Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, line_height)),
                 tint(palette.accent, 0.12),
@@ -741,7 +750,6 @@ fn paint_terminal(
         // on screen are matched as they are painted, so the wash never
         // lags the log the way the count may.
         if finding {
-            let grid_line = index as i32 - content.offset;
             for range in find.matcher.find_ranges(&row.text) {
                 let start = row.text[..range.start].chars().count();
                 let end = start + row.text[range].chars().count();
@@ -759,7 +767,7 @@ fn paint_terminal(
                 );
                 let current = find
                     .current
-                    .is_some_and(|span| span.line == grid_line && span.column == first);
+                    .is_some_and(|span| span.line == row.line && span.column == first);
                 if current {
                     window.paint_quad(
                         fill(cell, tint(palette.warning, FIND_WASH_CURRENT))
@@ -771,6 +779,28 @@ fn paint_terminal(
                 }
             }
         }
+    }
+
+    // A mask that keeps nothing says so where the first line would be, so
+    // an empty screen is not taken for a quiet device.
+    if filter.masking() && content.rows.is_empty() {
+        let run = TextRun {
+            len: MASK_EMPTY_HINT.len(),
+            font: terminal_font(false, true),
+            color: rgb(palette.faint).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let line = text_system.shape_line(SharedString::from(MASK_EMPTY_HINT), font_size, &[run], None);
+        let _ = line.paint(
+            point(text_left, bounds.origin.y),
+            line_height,
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        );
     }
 
     // Text an input method is still composing sits at the cursor, underlined,

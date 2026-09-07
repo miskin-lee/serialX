@@ -322,8 +322,8 @@ impl SerialWorkspace {
     /// platform's text input is wired to it while it holds focus, so an
     /// input method can compose before anything is sent.
     ///
-    /// The gutter is measured here: a column of line numbers as wide as
-    /// the highest number in the log, then the timestamps, each with air
+    /// The gutter is measured here: the timestamps first, then a column of
+    /// line numbers as wide as the highest number in the log, each with air
     /// after it.
     ///
     /// While a selection is being dragged out, the pointer is followed
@@ -584,8 +584,9 @@ struct TerminalLayout {
     text: TerminalType,
     /// A cell's width: the advance of `m` in the terminal's font.
     cell_width: Pixels,
-    /// The line-number column, as wide as the digits it has to hold.
-    number_width: Pixels,
+    /// The right edge of the line-number column, which the numbers are set
+    /// against, from the terminal's left edge.
+    number_right: Pixels,
     /// Where the timestamps start, from the terminal's left edge.
     stamp_left: Pixels,
     /// Where the cells start, from the terminal's left edge.
@@ -605,13 +606,16 @@ impl TerminalLayout {
         };
         let cell_width = advance(text.font_size, 'm', 7.5);
         let number_width = advance(text.gutter_size, '0', 6.6) * digits as f32;
-        let stamp_left = px(ROW_INSET) + number_width + px(ROW_GAP);
+        // The time a line arrived is what the eye goes to first, so it has
+        // the left edge; the numbers stand between it and the text.
+        let stamp_left = px(ROW_INSET);
+        let number_right = stamp_left + px(text.time_gutter + ROW_GAP) + number_width;
         Self {
             text,
             cell_width,
-            number_width,
+            number_right,
             stamp_left,
-            gutter: stamp_left + px(text.time_gutter + ROW_GAP),
+            gutter: number_right + px(ROW_GAP),
         }
     }
 }
@@ -619,7 +623,7 @@ impl TerminalLayout {
 /// Paints the screen: under everything the filter's tint on the rows it
 /// matches and the selection's plate on the cells it covers, then a
 /// filled cursor so its glyph stays readable on it, then row by row the
-/// line number, the timestamp, each run's background and text and the
+/// timestamp, the line number, each run's background and text and the
 /// find's washes over what it found, and last the cursor when it is an
 /// outline. With focus the cursor blinks — it is left out in the off
 /// half — and without focus it stands as a steady outline. A read-only
@@ -714,13 +718,6 @@ fn paint_terminal(
 
     for (index, row) in content.rows.iter().enumerate() {
         let y = bounds.origin.y + line_height * index as f32;
-        // The number sits against the right edge of its column, as an
-        // editor's do, so the units line up.
-        if let Some(number) = row.number {
-            let line = gutter_line(&number.to_string());
-            let x = bounds.origin.x + px(ROW_INSET) + layout.number_width - line.width;
-            let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
-        }
         if let Some(stamp) = &row.stamp {
             let line = gutter_line(stamp);
             let _ = line.paint(
@@ -731,6 +728,13 @@ fn paint_terminal(
                 window,
                 cx,
             );
+        }
+        // The number sits against the right edge of its column, as an
+        // editor's do, so the units line up.
+        if let Some(number) = row.number {
+            let line = gutter_line(&number.to_string());
+            let x = bounds.origin.x + layout.number_right - line.width;
+            let _ = line.paint(point(x, y), line_height, TextAlign::Left, None, window, cx);
         }
         for run in &row.runs {
             let x = text_left + cell_width * run.column as f32;

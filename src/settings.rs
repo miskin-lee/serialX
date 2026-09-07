@@ -19,7 +19,9 @@ use gpui_kit::*;
 use crate::SerialWorkspace;
 use crate::controls::{dialog_footer, eyebrow};
 use crate::icons::{Glyph, icon_chip};
-use crate::presets::{MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES};
+use crate::presets::{
+    MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES, usable_font_size,
+};
 use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
 
 /// Width of the dialog: a number, and a sentence about it.
@@ -52,14 +54,9 @@ pub(crate) fn parse_scrollback_lines(text: &str) -> Result<usize, &'static str> 
     Ok(lines)
 }
 
-/// A type size as the field and its list show it: the half point only when
-/// there is one.
+/// A type size as the field and its list show it: a whole number of points.
 pub(crate) fn format_font_size(size: f32) -> String {
-    if (size - size.round()).abs() < f32::EPSILON {
-        format!("{}", size.round() as i32)
-    } else {
-        format!("{size:.1}")
-    }
+    format!("{}", size.round() as i32)
 }
 
 /// A count with thousands separators, as the field shows it.
@@ -113,7 +110,9 @@ impl SettingsEditor {
             theme,
             lines_input,
             _lines_subscription: lines_subscription,
-            font_size: current.terminal_font_size,
+            // A file from before the sizes were whole opens on the size the
+            // log is actually laid out at, so the list has a row ticked.
+            font_size: usable_font_size(current.terminal_font_size),
         }
     }
 
@@ -354,7 +353,7 @@ mod tests {
     use super::{format_font_size, format_lines, parse_scrollback_lines};
     use crate::presets::{
         DEFAULT_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE,
-        TERMINAL_FONT_SIZES,
+        TERMINAL_FONT_SIZES, usable_font_size,
     };
 
     #[test]
@@ -382,10 +381,16 @@ mod tests {
         assert!(TERMINAL_FONT_SIZES.contains(&DEFAULT_TERMINAL_FONT_SIZE));
     }
 
+    /// A size out of an older workspace file is shown, and used, as the
+    /// whole point nearest it.
     #[test]
-    fn type_sizes_are_shown_without_a_needless_half() {
+    fn type_sizes_are_whole_points() {
         assert_eq!(format_font_size(14.), "14");
-        assert_eq!(format_font_size(12.5), "12.5");
+        assert_eq!(format_font_size(12.5), "13");
+        assert_eq!(usable_font_size(12.5), 13.);
+        assert_eq!(usable_font_size(0.), MIN_TERMINAL_FONT_SIZE);
+        assert_eq!(usable_font_size(400.), MAX_TERMINAL_FONT_SIZE);
+        assert_eq!(usable_font_size(f32::NAN), DEFAULT_TERMINAL_FONT_SIZE);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
 use crate::terminal::{CaretShape, RenderContent};
-use crate::presets::{DEFAULT_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE};
+use crate::presets::{DEFAULT_TERMINAL_FONT_SIZE, usable_font_size};
 use crate::theme::{
     BODY, CAPTION, LABEL, MONO_SMALL, TerminalPalette, Typography, WORDMARK, WorkbenchPalette,
     fonts, tint,
@@ -59,8 +59,8 @@ const ROW_GAP: f32 = 12.;
 const FIND_WASH: f32 = 0.28;
 const FIND_WASH_CURRENT: f32 = 0.55;
 /// How tall a line stands against the type it holds: the 18px lines the log
-/// was always set on, over the 12.5pt type that sat on them. Kept as the
-/// ratio so a size the setting names brings its own leading with it.
+/// was always set on, over the size it is set in out of the box. Kept as the
+/// ratio so a size picked from the list brings its own leading with it.
 const TERMINAL_LEADING: f32 = 18. / DEFAULT_TERMINAL_FONT_SIZE;
 /// The cursor when it is drawn as a bar or an underline.
 const CARET_THICKNESS: f32 = 2.;
@@ -565,14 +565,7 @@ pub(crate) struct TerminalType {
 
 impl TerminalType {
     fn new(font_size: f32) -> Self {
-        // The dialog only offers sizes that will do, but the workspace file
-        // can be written by hand: a size from outside the bounds is brought
-        // back to them rather than left to wreck the layout.
-        let font_size = if font_size.is_finite() {
-            font_size.clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE)
-        } else {
-            DEFAULT_TERMINAL_FONT_SIZE
-        };
+        let font_size = usable_font_size(font_size);
         let scale = font_size / DEFAULT_TERMINAL_FONT_SIZE;
         Self {
             font_size,

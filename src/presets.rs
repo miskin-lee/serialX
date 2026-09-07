@@ -86,19 +86,33 @@ pub(crate) const MIN_SCROLLBACK_LINES: usize = 100;
 pub(crate) const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 
 /// The size the terminal's log is set in out of the box, in points: the
-/// size it was set in before the size could be set at all.
-pub(crate) const DEFAULT_TERMINAL_FONT_SIZE: f32 = 12.5;
-/// The sizes the setting offers, as its list shows them: an editor's ladder
-/// of type sizes, close together around the default and further apart at the
+/// whole point nearest the 12.5 it was set in before the size could be set
+/// at all.
+pub(crate) const DEFAULT_TERMINAL_FONT_SIZE: f32 = 13.;
+/// The sizes the setting offers, as its list shows them: whole points, an
+/// editor's ladder — one at a time around the default, further apart at the
 /// ends, where a point either way makes little odds.
-pub(crate) const TERMINAL_FONT_SIZES: [f32; 14] = [
-    8., 9., 10., 11., 12., 12.5, 13., 14., 15., 16., 18., 20., 24., 32.,
+pub(crate) const TERMINAL_FONT_SIZES: [f32; 13] = [
+    8., 9., 10., 11., 12., 13., 14., 15., 16., 18., 20., 24., 32.,
 ];
 /// The least and the most the setting takes — the ends of that list. Below
 /// eight points the log is there to squint at rather than to read; above
 /// thirty-two a window holds so few columns that a device's own line wraps.
 pub(crate) const MIN_TERMINAL_FONT_SIZE: f32 = 8.;
 pub(crate) const MAX_TERMINAL_FONT_SIZE: f32 = 32.;
+
+/// The size a terminal is laid out at, from the size the settings hold: a
+/// whole number of points within the bounds. A workspace file written before
+/// the sizes were whole — 12.5 was the default then — or edited by hand comes
+/// back to the nearest size the list offers, rather than wrecking the layout.
+pub(crate) fn usable_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.round()
+            .clamp(MIN_TERMINAL_FONT_SIZE, MAX_TERMINAL_FONT_SIZE)
+    } else {
+        DEFAULT_TERMINAL_FONT_SIZE
+    }
+}
 
 /// What is the workbench's to set rather than a session's, kept in the
 /// same file as the presets.

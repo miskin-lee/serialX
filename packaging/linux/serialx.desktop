@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=serialX
-Comment=Modern serial port workspace
+Comment=A modern serial port workspace built with GPUI — a real terminal for your devices, with saved sessions and quick send.
 Exec=serialx
 Icon=serialx
 Terminal=false

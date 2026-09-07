@@ -5,120 +5,123 @@
   </picture>
 </p>
 
-一款基于 [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 与
-[GPUI Component](https://github.com/longbridge/gpui-component) 的现代串口调试工作台。
+<p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
 
-## 当前能力
+A modern serial port workspace built with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) and
+[GPUI Component](https://github.com/longbridge/gpui-component) — a real terminal for your devices, with saved
+sessions and quick send.
 
-- 自动发现本机串口设备，并支持完整串口参数配置、连接、断开和后台读取
-- 从 `Session` 菜单、标签栏的 `+` 按钮或 ⌘N 打开新建会话对话框，`Save & Connect`（也是 `Enter`）把会话存进右侧面板并打开标签连接，旁边的 `Connect` 只打开标签并连接；每个标签保留自己的连接和终端内容
-- 每个会话都有一种标签色：新建或编辑会话时在 24 种颜色中选一种（两排：一排明亮色相，一排更深更饱和的颜色），新会话默认拿到当前没有标签页在用的第一种颜色；标签页的底板和右侧已保存会话的图标都会带上这个颜色，连接状态仍由标签上的圆点表示
-- 会话可以起别名：对话框 `Tab` 一栏填一个名字，标签页和右侧已保存会话就显示它而不是端口路径，端口与参数改到悬停提示和卡片副标题里；不填则照旧显示端口路径
-- 右侧面板持久化串口会话：已保存的会话可以放进分组（用分区标题上的文件夹按钮新建分组，分组行可折叠、改名、删除，删除分组时里面的会话保留并回到顶层）；
-  会话卡片单击选中、双击打开（设备在线则直接连接，若该端口已有标签页则切到它），卡片右侧的铅笔和垃圾桶按钮分别修改与删除该会话。
-  下方是快捷发送命令：保存时可以填别名并选分组，命令也有自己的分组（同样可折叠、改名、删除），卡片单击发送、铅笔修改、垃圾桶删除；面板底部是发送栏
-- 右侧面板两级折叠：单击分区标题折叠单个分区，⌘B 或标题栏右端的开关把整个面板收成带数量角标的图标栏
-- 右侧面板底部的发送栏是一张聊天式的发送卡片：上方是输入框，卡片上沿的一行 `To` 标出它发往哪个会话及其连接状态；下沿一排开关，`UTF-8 / HEX` 分段开关选编码（HEX 把输入解析为十六进制字节，如 `41 54 0D 0A`，不是合法十六进制时卡片描红、按 Enter 不会发出并在日志里说明原因），`↵ CRLF` 下拉选行尾（`CRLF` = `\r\n`、`LF` = `\n`、`None` 不加），UTF-8 默认 `CRLF`，HEX 默认 `None`，两种编码各记各的行尾；Enter 或右侧的发送圆钮发到当前活跃的标签页
-- 接收区是一个真正的终端：仿真核心是 `alacritty_terminal`（Alacritty 与 Zed 终端共用的那一个），颜色、粗体、下划线、反显、256 色与真彩色、光标移动、退格、`\r` 重绘的进度条、宽字符都按终端语义显示，默认 50000 行回滚（`serialX` 菜单的 `Settings…`（`⌘,`）可改，100 到 1,000,000 行，改完对所有会话即时生效并保存在工作区文件里），滚轮翻看历史（向上翻会暂停“跟随输出”，翻回底部自动恢复）；
-  设备清屏就是清屏：设备发来的 `clear`（`ESC[2J`，或 vt100 从行首发的 `ESC[J`）会把屏幕、回滚和时间戳一并清空，和 `Session` 菜单的清屏效果一样；`ESC[3J` 只清回滚；全屏程序在备用屏上的清屏不影响日志
-- 终端可以直接键入：点一下获得焦点后，每个字符立刻发往串口，显示的是设备的回显；Enter、Backspace、Tab、Esc、方向键、Home/End、F1–F12、Ctrl+字母按终端惯例发送对应字节或转义序列，支持应用光标模式和修饰键编码；输入法组合中的文字带下划线显示在光标处，确认后才发送；
-  新建会话时 `Tab` 一栏的 `Interactive` 勾选框默认打开，去掉勾选打开的标签是只读的：终端里没有光标，键入不会发往串口，要发送就用面板底部的发送栏或 Quick send，标签的悬停提示和保存的会话都记着这一点
-- 终端里的文字可以用鼠标选中：拖动选一段，双击选一个词，三击选一整行，按住 Shift 点击延伸选区，拖到终端上下边缘之外会翻动回滚；`⌘A` 全选整段日志，`⌘C` 复制选中的文字，终端自动折行的续行会拼回一行；选区跟着文字走，新行推上去它也跟着上去，键入或清屏时清掉
-- 每一行左侧有行号和时间戳：行号像编辑器一样从 1 起编，回滚满了以后旧行丢弃但余下的行号不变（屏幕上第一行的号码会越过 1），清屏（菜单或设备发来的 `clear`）后重新从 1 起编，`⌘⇧N` 或 `View` 菜单可以关掉；时间戳记录该行第一个字节到达的本地时间（精确到毫秒），终端自动折行的续行不重复显示；标题栏过滤框改为高亮匹配的行并统计屏幕上的匹配数
-- 终端内查找（`⌘F`）：终端右上角浮出查找栏，逐字输入即在整个回滚里查找，屏幕上每处匹配涂琥珀色、当前一处加强调色描边并滚到屏幕中央，栏内显示“第几处 / 共几处”；`Enter` / `⌘G` 下一处，`⇧Enter` / `⌘⇧G` 上一处，`Aa` 区分大小写，`.*` 切到正则（默认按字面查找），`Esc` 关闭；查找与标题栏的过滤是两回事——过滤决定哪些行留在屏幕上，查找在整段日志里定位，所以过滤框不再占用 `⌘F`
-- 终端上方只有一条标签栏：会话标签（连接状态点、端口名、关闭）和新建按钮；连接 / 断开按钮在标题栏过滤框的右侧，过滤条件和连接状态都属于各自的标签页，随标签切换；暂停接收、清屏、时间戳、自动滚动和刷新端口都在菜单里，各有快捷键
-- 纯白与近黑两套工作台主题，默认以近黑主题启动，可在 `View` 菜单中切换
-- 启动时检查 GitHub Releases，支持校验并安装最新版本
-- VS Code 式标题栏（菜单栏）：中央是命令中心，左右箭头切换标签，过滤框按正则表达式或纯文本筛选终端输出，右侧是当前标签的连接 / 断开按钮，
-  可切换大小写敏感，右端实时显示“匹配行数 / 总行数”，写错的表达式会标红提示而不会隐藏任何输出；
-  右侧只留一个侧边面板开关；左侧只有平台自己的东西（macOS 的交通灯，Windows / Linux 的应用菜单）
-- 右侧面板的左边缘可以拖动，在 220 到 560 像素之间调整宽度，折叠成图标栏再展开时宽度保持不变
-- 新建会话对话框以“选择”而非“表单”呈现：设备是一张可滚动的单选列表，波特率是一个可直接键入的下拉框（列表里是标准速率，也接受任意自定义速率），
-  数据位、校验、停止位与流控是四组分段开关，`Tab` 一栏是整行的别名输入框与同样大小的所属分组下拉框并排（列表里也能当场新建一个），栏标题右端是 `Interactive` 勾选框，下面两排标签色板，
-  底部实时给出 `115200 8N1` 式摘要与逐项说明，选了分组会在摘要末尾标出来，去掉 `Interactive` 的勾选会标出 `Read-only`；对话框是模态的，点到它以外的地方不会关闭，而是闪一下提醒
-- 自定义 macOS 标题栏与紧凑、低干扰的编辑器式工作台布局
-- 参考 Material Icon Theme 的双色圆角图标集：设备、会话、命令、信号各有专属色相
-- 统一的排版比例，字体选择与 VS Code 对齐：不打包字库，按平台复用 VS Code 的字族栈，启动时取本机
-  第一款已安装的字族。终端沿用编辑器字族（macOS Menlo、Windows Consolas、Linux Droid Sans Mono），
-  界面里的等宽文本沿用 VS Code 的 `--monaco-monospace-font`（macOS SF Mono / Monaco），界面字体则是
-  各平台的系统 UI 字体或 Segoe UI
-- 按系统语言挂载 CJK 回退字族（PingFang SC、Microsoft YaHei、Source Han Sans 等），设备发来的
-  中日韩文本照常显示，读者自己的语言排在最前
+## What it does
 
-## 运行
+- Discovers the serial devices on the machine, with full port configuration, connect, disconnect, and reading in the background
+- The `Session` menu, the `+` in the tab strip or ⌘N open the New session dialog: `Save & Connect` (also `Enter`) keeps the session in the side panel and opens it in a connected tab, and `Connect` beside it only opens the tab and connects; every tab keeps its own connection and terminal contents
+- Every session has a tag colour: pick one of 24 when creating or editing a session (two rows: bright hues over deeper, more saturated ones), and a new session is offered the first colour no open tab is wearing; the tab's plate and the saved session's icon in the side panel carry the colour, while the dot on the tab still shows the connection state
+- Sessions can be named: fill in the `Tab` field of the dialog and the tab and the saved session show that name instead of the port path, with the port and its parameters moved to the tooltip and the card's subtitle; leave it empty and the port path shows as before
+- The side panel keeps sessions: saved sessions can be filed into groups (make one with the folder button on the section header; group rows collapse, rename and delete, and deleting a group keeps its sessions and moves them back to the top level).
+  A click selects a card, a double-click opens it (connecting at once when the device is attached, or switching to the tab already on that port), and the pencil and trash buttons on the card edit and delete it.
+  Below are the quick-send commands: give one a name and a group when saving, commands have groups of their own (collapsible, renamable and deletable too), a click sends, the pencil edits, the trash deletes; the composer sits at the foot of the panel
+- The side panel collapses in two steps: click a section header to fold that section, ⌘B or the switch at the right end of the title bar to fold the whole panel into an icon rail with count badges
+- The composer at the foot of the side panel is a chat-style card: the input on top, a `To` line along the card's upper edge naming the session it sends to and its connection state; along the lower edge a row of switches — the `UTF-8 / HEX` segmented switch picks the encoding (HEX parses the input as hex bytes such as `41 54 0D 0A`; input that is not valid hex outlines the card in red, Enter sends nothing and the log says why), the `↵ CRLF` dropdown picks the line ending (`CRLF` = `\r\n`, `LF` = `\n`, `None` adds nothing), UTF-8 defaults to `CRLF` and HEX to `None`, and each encoding remembers its own ending; Enter or the round send button sends to the active tab
+- The receive area is a real terminal: the emulation core is `alacritty_terminal` (the one Alacritty and Zed's terminal share), so colours, bold, underline, inverse video, 256 and true colour, cursor movement, backspace, progress bars redrawn with `\r` and wide characters all show as a terminal shows them, with 50,000 lines of scrollback by default (`Settings…` in the `serialX` menu, `⌘,`, from 100 to 1,000,000 lines, applied to every session at once and saved in the workspace file), and the wheel to page through history (scrolling up pauses following the output, scrolling back to the bottom resumes it);
+  a clear from the device is a clear: `clear` sent by the device (`ESC[2J`, or `ESC[J` from the home position on a vt100) wipes the screen, the scrollback and the timestamps, the same as Clear in the `Session` menu; `ESC[3J` only empties the scrollback; a full-screen program clearing the alternate screen leaves the log alone
+- The terminal can be typed into: click to focus it, and every character goes straight to the port, with the device's echo on screen; Enter, Backspace, Tab, Esc, the arrows, Home/End, F1–F12 and Ctrl+letter send the bytes or escape sequences a terminal sends, with application cursor mode and modifier encoding; text an input method is composing shows underlined at the cursor and is sent only once committed;
+  the `Interactive` checkbox in the dialog's `Tab` section is on by default, and unchecking it opens the tab read-only: no cursor in the terminal, nothing typed goes to the port, and sending is done from the composer at the foot of the panel or from Quick send — the tab's tooltip and the saved session both remember it
+- Text in the terminal can be selected with the mouse: drag to select a stretch, double-click a word, triple-click a whole line, Shift-click to extend, and drag past the top or bottom edge to scroll through the scrollback; `⌘A` selects the whole log and `⌘C` copies the selection, with lines the terminal wrapped joined back into one; the selection follows its text as new lines push it up, and clears when you type or clear the screen
+- Every line has a line number and a timestamp on the left: numbers count from 1 the way an editor's do, and when the scrollback fills, the oldest lines go but the rest keep their numbers (the first number on screen climbs past 1); a clear (from the menu or the device's `clear`) starts again at 1, and `⌘⇧N` or the `View` menu switches them off; the timestamp is the local time the line's first byte arrived, to the millisecond, and is not repeated on rows the terminal wrapped; the title bar filter highlights matching lines and counts the matches on screen
+- Find in the terminal (`⌘F`): a find bar floats over the terminal's top-right corner and searches the whole scrollback as you type; every match on screen is washed amber, the current one is ringed in the accent colour and scrolled to the middle of the screen, and the bar shows "n of m"; `Enter` / `⌘G` step forward, `⇧Enter` / `⌘⇧G` back, `Aa` matches case, `.*` switches to regular expressions (literal by default), `Esc` closes; find and the title bar's filter are two different things — the filter decides which lines stay on screen, find locates within the whole log — so the filter box no longer takes `⌘F`
+- One strip of tabs above the terminal: session tabs (connection dot, port name, close) and the new-tab button; the connect / disconnect button sits right of the filter box in the title bar, and the filter and the connection state belong to their tab and switch with it; pause, clear, timestamps, auto-scroll and rescan live in the menus, each with a shortcut
+- Two workbench themes, pure white and near-black, starting in the dark one and switched from the `View` menu
+- Checks GitHub Releases at start-up, and can verify and install the latest version
+- A VS Code-style title bar (menu bar): the command centre in the middle, arrows to switch tabs, a filter box that sifts the terminal output by regular expression or plain text, and the active tab's connect / disconnect button at its right;
+  the filter can match case, shows "matching lines / total lines" live at its right end, and marks a mis-typed expression in red rather than hiding any output;
+  the right end holds only the side-panel switch, and the left holds only the platform's own things (the traffic lights on macOS, the application menu on Windows / Linux)
+- The side panel's left edge drags to resize it between 220 and 560 pixels, and the width survives collapsing to the rail and back
+- The New session dialog is laid out as a choice rather than a form: the device is a scrollable single-choice list, the baud rate a dropdown you can type into (the standard rates in the list, any custom rate accepted),
+  data bits, parity, stop bits and flow control are four segmented switches, the `Tab` section is a full-width name field beside a group dropdown of the same size (with a way to make a group on the spot), the `Interactive` checkbox at the right end of the section's header, and two rows of tag swatches under them;
+  the foot restates the choice as a `115200 8N1`-style summary with the parameters spelled out, the group named at its end when one is chosen and `Read-only` when `Interactive` is off; the dialog is modal: a press outside it does not close it but makes it flash
+- A custom macOS title bar and a compact, low-noise, editor-like workbench layout
+- A two-tone rounded icon set after the Material Icon Theme: devices, sessions, commands and signals each have a hue of their own
+- One typographic scale, with the fonts chosen as VS Code chooses them: no bundled fonts — the platform's VS Code font stack is reused, and the first family
+  installed on the machine is taken at start-up. The terminal uses the editor family (Menlo on macOS, Consolas on Windows, Droid Sans Mono on Linux),
+  monospace text in the interface follows VS Code's `--monaco-monospace-font` (SF Mono / Monaco on macOS), and the interface font is
+  each platform's system UI font or Segoe UI
+- CJK fallback families (PingFang SC, Microsoft YaHei, Source Han Sans and so on) are mounted by the system language, so Chinese, Japanese
+  and Korean text from a device shows as it should, with the reader's own language first
+
+## Running
 
 ```bash
 cargo run
 ```
 
-首次构建需要下载 GPUI 相关依赖，耗时会稍长。建议使用最新稳定版 Rust；macOS
-还需要完整的 Xcode / Command Line Tools 环境。
+The first build downloads GPUI's dependencies and takes a while. The latest stable Rust is recommended;
+macOS also needs a full Xcode / Command Line Tools installation.
 
-## 下载
+## Downloads
 
-GitHub Releases 提供以下预编译包：
+GitHub Releases carry prebuilt packages:
 
-- macOS Apple Silicon：DMG
-- Windows x86_64：安装程序与便携 ZIP
-- Linux x86_64 / ARM64：DEB 与便携 tar.gz
+- macOS Apple Silicon: DMG
+- Windows x86_64: installer and portable ZIP
+- Linux x86_64 / ARM64: DEB and portable tar.gz
 
-当前发布包尚未进行 Apple 公证或 Windows 代码签名，首次启动时系统可能显示安全提示。
+The packages are not yet notarized by Apple or code-signed on Windows, so the system may show a security prompt on first launch.
 
-## 软件更新
+## Software updates
 
-serialX 启动后会在后台检查仓库中最新的正式 GitHub Release；发现新版本时会弹出
-更新提示。也可以随时通过 `Help > Check for Updates…` 手动检查，检查完成后会明确
-提示当前已是最新版或提供“下载并安装”操作。应用会下载当前系统对应的安装包，使用
-Release 附带的 SHA-256 摘要校验文件完整性，然后原地替换正在运行的这份 serialX，
-再询问是否立即重启；选择“稍后”时新版本会在下次启动时生效。版本、许可证和
-项目地址可在 `Help > About serialX` 中查看：
+serialX checks the repository's latest stable GitHub Release in the background after it starts, and shows an
+update prompt when there is a newer version. `Help > Check for Updates…` checks at any time, and then says
+plainly that this is the latest version or offers "Download and Install". The app downloads the package for
+the current system, verifies it against the SHA-256 digest attached to the Release, replaces the running copy
+of serialX in place, and asks whether to relaunch now; choose "Later" and the new version takes over at the
+next start. The version, licence and project address are under `Help > About serialX`:
 
-- macOS：挂载 DMG，把其中的 serialX.app 换到当前 bundle 所在位置（例如“应用程序”）
-- Windows：由安装程序安装的副本静默运行新安装程序，便携 ZIP 副本则解压覆盖；两者都在
-  serialX 退出后由后台脚本完成，随后自动重新启动
-- Linux：DEB 安装的副本通过 `pkexec dpkg -i` 升级（需要输入密码），便携 tar.gz 副本则
-  直接替换可执行文件
+- macOS: the DMG is mounted and its serialX.app swapped into place where the current bundle lives (`/Applications`, say)
+- Windows: a copy put there by the installer runs the new installer silently, and a portable ZIP copy is unpacked over itself;
+  both are finished by a background script after serialX exits, and serialX then restarts by itself
+- Linux: a DEB-installed copy upgrades with `pkexec dpkg -i` (a password is asked for), and a portable tar.gz copy
+  has its executable replaced directly
 
-原地替换失败时（例如没有写入权限，或 serialX 不是从应用包中运行），提示框会给出
-已校验的安装包位置，可以手动完成更新。
+When replacing in place fails (no write permission, or serialX is not running from an application bundle),
+the prompt names where the verified package is, so the update can be finished by hand.
 
-自动检查只读取公开 Release 信息，不需要 GitHub 登录或访问令牌；草稿版和预发布版
-不会被视为可用更新。
+The automatic check only reads public Release information and needs no GitHub login or token; drafts and
+pre-releases are not offered as updates.
 
-发布新版本前，使用版本升级脚本同步更新 `Cargo.toml` 与 `Cargo.lock`：
+Before publishing a release, bump the version in `Cargo.toml` and `Cargo.lock` together with the script:
 
 ```bash
 scripts/version-bump.sh 0.2.0
 ```
 
-脚本会校验版本号，创建 `chore: bump version to 0.2.0` 提交并推送当前分支；
-Release 工作流会从 `Cargo.toml` 读取该版本并创建对应的 `v0.2.0` 标签。
+The script checks the version number, makes the `chore: bump version to 0.2.0` commit and pushes the current branch;
+the Release workflow reads the version from `Cargo.toml` and creates the matching `v0.2.0` tag.
 
-## 快捷操作
+## Shortcuts
 
-- `Enter`：发送当前内容
-- `⌘N` / `Ctrl+N`：新建会话；`⌘S` / `Ctrl+S` 保存当前会话；`⌘W` / `Ctrl+W` 关闭当前会话
-- `⌘⇧C` / `Ctrl+Shift+C`：连接 / 断开；`⌘R` / `Ctrl+R` 重新扫描端口
-- `⌘⇧P` / `Ctrl+Shift+P`：暂停 / 恢复接收；`⌘K` / `Ctrl+K` 清空终端
-- `⌘A` / `Ctrl+Alt+A`：全选终端日志；`⌘C` / `Ctrl+Insert`：复制选中的文字（Windows / Linux 上有选区时 `Ctrl+C` 也复制，没有选区时照旧发送中断；`Ctrl+A` 和 `Ctrl+C` 本身留给设备）
-- `⌘⇧H` / `Ctrl+Shift+H`：发送栏在 UTF-8 / HEX 之间切换；`⌘⇧T` / `Ctrl+Shift+T` 时间戳；`⌘⇧N` / `Ctrl+Shift+N` 行号；`⌘⇧A` / `Ctrl+Shift+A` 自动滚动
-- `⌘F` / `Ctrl+F`：在终端里查找；`⌘G` / `F3` 下一处，`⌘⇧G` / `Shift+F3` 上一处，`Esc` 关闭查找栏；标题栏的输出过滤框从 `View` 菜单的 `Filter Output…` 进入，`Esc` 清空过滤
-- `⌘,` / `Ctrl+,`：设置（回滚行数）
-- `⌘⇧[` / `⌘⇧]`（`Ctrl+PageUp` / `Ctrl+PageDown`）：切换到左侧 / 右侧标签
-- `⌘B` / `Ctrl+B`：显示或隐藏右侧面板；`⌘⇧L` / `Ctrl+Shift+L` 切换亮暗主题
-- `Session` 菜单：新建、保存或关闭会话，连接、清空终端，切换上一个 / 下一个会话
-- `View` 菜单：查找（及上一处 / 下一处）、输出过滤、以 HEX 发送、时间戳、行号、语义配色、自动滚动、侧边面板，以及 `Theme` 子菜单中的亮暗主题；`serialX` 菜单：关于、设置、退出
-- 拖动右侧面板的左边缘调整面板宽度
-- 标题栏过滤框：`.*` 切换正则表达式（默认开启），`Aa` 切换大小写敏感，× 清空
-- 标题栏过滤框右侧：当前标签页的连接 / 断开按钮
-- 新建会话对话框：在设备列表中单选端口并可随时 `Rescan`，波特率下拉框、数据位 / 校验 / 停止位 / 流控分段开关，
-  `Tab` 一栏填别名、两排色板选标签色，栏首右侧的 `Interactive` 勾选框决定标签能否直接键入，底部实时显示配置摘要；`Save & Connect`（或 `Enter`）先保存再打开并连接，`Connect` 只打开并连接，`Esc` 取消
-- 右侧 `Sessions`：保存或恢复会话配置，双击打开，铅笔修改、垃圾桶删除；顶部的搜索框按别名、端口或波特率筛选（搜索时平铺显示匹配项），`Aa` 切换大小写敏感；右键分区标题或列表新建分组；已在标签中打开的端口会显示绿点
-- 右侧 `Quick send`：顶部的搜索框按名称或命令文本筛选（搜索时平铺显示匹配项），`Aa` 切换大小写敏感；单击把已保存的命令发到当前活跃的标签页，铅笔修改、垃圾桶删除；右键分区标题或列表新建分组；
-  面板底部的发送卡片 Enter 发送，`UTF-8 / HEX` 选编码，`↵` 下拉选行尾（`CRLF` / `LF` / `None`），书签按钮打开保存对话框，把当前输入连同别名和分组存为新命令（别名留空则以命令本身为名）
-- 单击分区标题可折叠该分区；折叠后的面板保留图标栏，单击图标即可展开对应分区
+- `Enter`: send what the composer holds
+- `⌘N` / `Ctrl+N`: new session; `⌘S` / `Ctrl+S` save the current session; `⌘W` / `Ctrl+W` close the current session
+- `⌘⇧C` / `Ctrl+Shift+C`: connect / disconnect; `⌘R` / `Ctrl+R` rescan ports
+- `⌘⇧P` / `Ctrl+Shift+P`: pause / resume receiving; `⌘K` / `Ctrl+K` clear the terminal
+- `⌘A` / `Ctrl+Alt+A`: select the whole log; `⌘C` / `Ctrl+Insert`: copy the selection (on Windows / Linux `Ctrl+C` copies too while something is selected and sends the interrupt as usual otherwise; `Ctrl+A` and `Ctrl+C` themselves stay with the device)
+- `⌘⇧H` / `Ctrl+Shift+H`: switch the composer between UTF-8 and HEX; `⌘⇧T` / `Ctrl+Shift+T` timestamps; `⌘⇧N` / `Ctrl+Shift+N` line numbers; `⌘⇧A` / `Ctrl+Shift+A` auto-scroll
+- `⌘F` / `Ctrl+F`: find in the terminal; `⌘G` / `F3` next match, `⌘⇧G` / `Shift+F3` previous, `Esc` closes the find bar; the title bar's output filter is reached from `Filter Output…` in the `View` menu, and `Esc` clears it
+- `⌘,` / `Ctrl+,`: settings (scrollback lines)
+- `⌘⇧[` / `⌘⇧]` (`Ctrl+PageUp` / `Ctrl+PageDown`): switch to the tab on the left / right
+- `⌘B` / `Ctrl+B`: show or hide the side panel; `⌘⇧L` / `Ctrl+Shift+L` switch between the light and dark themes
+- `Session` menu: new, save or close a session, connect, clear the terminal, previous / next session
+- `View` menu: find (and previous / next match), output filter, send as HEX, timestamps, line numbers, semantic colours, auto-scroll, the side panel, and the light and dark themes in the `Theme` submenu; `serialX` menu: about, settings, quit
+- Drag the side panel's left edge to resize it
+- Title bar filter box: `.*` toggles regular expressions (on by default), `Aa` toggles case sensitivity, × clears
+- Right of the title bar filter box: the active tab's connect / disconnect button
+- New session dialog: pick a port from the device list (`Rescan` at any time), the baud rate dropdown, the data bits / parity / stop bits / flow control segmented switches,
+  a name in the `Tab` field with two rows of tag swatches, the `Interactive` checkbox at the right of the section's header deciding whether the tab can be typed into, and a live summary at the foot; `Save & Connect` (or `Enter`) saves, then opens and connects, `Connect` only opens and connects, `Esc` cancels
+- `Sessions` on the right: save and restore session configurations, double-click to open, pencil to edit, trash to delete; the search box at the top filters by name, port or baud rate (matches are shown flat while searching), `Aa` toggles case sensitivity; right-click the section header or the list to make a group; a port already open in a tab shows a green dot
+- `Quick send` on the right: the search box at the top filters by name or command text (matches shown flat while searching), `Aa` toggles case sensitivity; a click sends the saved command to the active tab, pencil to edit, trash to delete; right-click the section header or the list to make a group;
+  the composer at the foot of the panel sends on Enter, `UTF-8 / HEX` picks the encoding, the `↵` dropdown the line ending (`CRLF` / `LF` / `None`), and the bookmark button opens the save dialog, which keeps the current input as a new command with a name and a group (an empty name uses the command itself)
+- Click a section header to collapse the section; the collapsed panel keeps an icon rail, and a click on an icon expands its section
 
-## 图标版权
+## Icon copyright
 
-serialX 应用图标及 `assets/icons/` 下的衍生图标资源由 miskin 设计，
-版权所有 © 2026 miskin，并与本项目一致采用 GNU GPL v3 授权。
+The serialX application icon and the derived icon assets under `assets/icons/` were designed by miskin,
+copyright © 2026 miskin, and are licensed under the GNU GPL v3 like the rest of the project.

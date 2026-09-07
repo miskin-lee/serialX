@@ -2,7 +2,9 @@
 name = "serialx"
 version = "0.2.0"
 edition = "2024"
-description = "A polished serial port workspace built with GPUI"
+# Also the repository's About on GitHub, the About dialog's line under the
+# version, and the first line of both READMEs: change them together.
+description = "A modern serial port workspace built with GPUI — a real terminal for your devices, with saved sessions and quick send."
 license = "GPL-3.0-only"
 
 [dependencies]

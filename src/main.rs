@@ -1071,14 +1071,18 @@ impl SerialWorkspace {
         });
     }
 
+    /// The line under the version is the package description from
+    /// `Cargo.toml`, which is also the repository's About on GitHub and
+    /// the READMEs' first line: the four are changed together.
     fn show_about_dialog(window: &mut Window, cx: &mut App) {
         window.open_alert_dialog(cx, |alert, _, _| {
             alert
                 .icon(Icon::new(IconName::SquareTerminal).size_5())
                 .title("serialX")
                 .description(format!(
-                    "Version {}\nA modern serial port workspace\n\nGNU GPL v3\n© 2026 miskin",
-                    env!("CARGO_PKG_VERSION")
+                    "Version {}\n{}\n\nGNU GPL v3\n© 2026 miskin",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("CARGO_PKG_DESCRIPTION")
                 ))
                 .button_props(
                     DialogButtonProps::default()

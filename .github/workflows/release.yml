@@ -236,7 +236,7 @@ jobs:
           Installed-Size: ${installed_size}
           Depends: libc6, libfontconfig1, libudev1, libvulkan1, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libxcb1
           Maintainer: serialX contributors
-          Description: Modern serial port workspace built with GPUI
+          Description: A modern serial port workspace built with GPUI — a real terminal for your devices, with saved sessions and quick send.
            serialX provides serial device discovery, ASCII and hexadecimal
            send/receive modes, timestamps, and real-time traffic statistics.
           EOF

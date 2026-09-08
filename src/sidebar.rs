@@ -429,22 +429,24 @@ impl SerialWorkspace {
         self.open_command_dialog(CommandTarget::New, &draft, window, cx);
     }
 
-    /// Sends a card's command straight to the tab in front. It does not go
-    /// through the composer: what is being typed there is left alone.
+    /// Sends a card's command straight to the tab in front, ended the way
+    /// the card was saved rather than the way the composer is set. It does
+    /// not go through the composer: what is being typed there is left
+    /// alone.
     fn send_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
-        let Some(command) = self
+        let Some((command, ending)) = self
             .presets
             .commands
             .iter()
             .find(|command| command.id == command_id)
-            .map(|command| command.command.clone())
+            .map(|command| (command.command.clone(), command.ending))
         else {
             return;
         };
         if self.active_tab().is_none() {
             return;
         }
-        self.send_line(&command, cx);
+        self.send_line(&command, ending, cx);
     }
 
     fn remove_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
@@ -1092,6 +1094,13 @@ impl SerialWorkspace {
         let command_id = saved.id;
         let alias = saved.alias().map(str::to_owned);
         let command = saved.command.clone();
+        // The card sends what it was saved with, so the tooltip says what
+        // follows it rather than leaving the composer's switch to speak for
+        // a line it does not send.
+        let sends: SharedString = match saved.ending {
+            LineEnding::None => "Click to send, with nothing after it".into(),
+            ending => format!("Click to send, ending {}", ending.label()).into(),
+        };
 
         Self::row_card(
             palette,
@@ -1102,7 +1111,7 @@ impl SerialWorkspace {
         // that rather than swallowing the click.
         .when(!has_active_tab, |row| row.cursor_default().opacity(0.55))
         .when(has_active_tab, |row| {
-            row.tooltip(|window, cx| Tooltip::new("Click to send").build(window, cx))
+            row.tooltip(move |window, cx| Tooltip::new(sends.clone()).build(window, cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.send_saved_command(command_id, cx);
                 }))

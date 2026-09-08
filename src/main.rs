@@ -491,14 +491,23 @@ impl SerialWorkspace {
     /// empty only when the workspace opens.
     fn send_to_active_tab(&mut self, cx: &mut Context<Self>) {
         let line = self.send_input.read(cx).value().to_string();
-        self.send_line(&line, cx);
+        let ending = self.composer_line_ending();
+        self.send_line(&line, ending, cx);
+    }
+
+    /// What the composer puts after a line: the ending the tab in front is
+    /// set to, and with no tab the one a line is likeliest to want.
+    pub(crate) fn composer_line_ending(&self) -> LineEnding {
+        self.active_tab()
+            .map_or_else(LineEnding::default, SerialTabState::line_ending)
     }
 
     /// Sends one line to the tab in front, in the tab's encoding and with
-    /// the tab's line ending after it. A line that is not the hex it claims
-    /// to be goes nowhere, with a note in the log saying why: a typo sent
-    /// as text would reach the device as something else entirely.
-    pub(crate) fn send_line(&mut self, line: &str, cx: &mut Context<Self>) {
+    /// `ending` after it — the composer's own, or the one a saved card was
+    /// kept with. A line that is not the hex it claims to be goes nowhere,
+    /// with a note in the log saying why: a typo sent as text would reach
+    /// the device as something else entirely.
+    pub(crate) fn send_line(&mut self, line: &str, ending: LineEnding, cx: &mut Context<Self>) {
         let value = line.trim().to_string();
         if value.is_empty() {
             return;
@@ -525,7 +534,7 @@ impl SerialWorkspace {
         } else {
             value.into_bytes()
         };
-        bytes.extend_from_slice(tab.line_ending().bytes());
+        bytes.extend_from_slice(ending.bytes());
         tab.write(bytes);
         if tab.auto_scroll {
             tab.scroll_to_bottom();

@@ -568,7 +568,8 @@ pub(crate) fn spawn_serial_worker(
 /// serial console and AT modem wants, `\n` what a Unix shell on a UART
 /// reads. Hex goes out as the frame it spells, with nothing added unless
 /// asked for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum LineEnding {
     #[default]
     CrLf,

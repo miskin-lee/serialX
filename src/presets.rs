@@ -3,6 +3,7 @@ use std::{env, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::SerialConfiguration;
+use crate::serial::LineEnding;
 use crate::theme::TagColor;
 
 /// Which of the side panel's two libraries a thing belongs to: the saved
@@ -67,6 +68,12 @@ pub(crate) struct StoredCommand {
     /// top of the list. Absent in files written before commands had groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) group: Option<u64>,
+    /// What the card sends after the command, kept with it: a card goes out
+    /// the way it was saved, whatever the composer is set to at the time.
+    /// Absent in files written before a command carried its own ending,
+    /// where it takes the one a line is likeliest to want.
+    #[serde(default)]
+    pub(crate) ending: LineEnding,
 }
 
 impl StoredCommand {
@@ -362,13 +369,14 @@ impl PresetStore {
 
     /// Keeps a command, under a name if it was given one, and says which
     /// it is. The same command saved again into the same group is the one
-    /// card, renamed, rather than a second card that sends the same thing;
-    /// a blank command is nothing to keep.
+    /// card, renamed and re-ended, rather than a second card that sends the
+    /// same thing; a blank command is nothing to keep.
     pub(crate) fn add_command(
         &mut self,
         alias: Option<String>,
         command: String,
         group: Option<u64>,
+        ending: LineEnding,
     ) -> Option<u64> {
         let command = command.trim().to_string();
         if command.is_empty() {
@@ -382,6 +390,7 @@ impl PresetStore {
             .find(|saved| saved.command == command && saved.group == group)
         {
             saved.label = label;
+            saved.ending = ending;
             let id = saved.id;
             self.persist();
             return Some(id);
@@ -392,19 +401,21 @@ impl PresetStore {
             label,
             command,
             group,
+            ending,
         });
         self.persist();
         Some(id)
     }
 
-    /// Changes a saved command: its name, its text, or where it is filed.
-    /// A blank command leaves the card as it was.
+    /// Changes a saved command: its name, its text, what follows it, or
+    /// where it is filed. A blank command leaves the card as it was.
     pub(crate) fn update_command(
         &mut self,
         id: u64,
         alias: Option<String>,
         command: String,
         group: Option<u64>,
+        ending: LineEnding,
     ) {
         let command = command.trim().to_string();
         if command.is_empty() {
@@ -415,6 +426,7 @@ impl PresetStore {
             saved.label = Self::command_label(alias, &command);
             saved.command = command;
             saved.group = group;
+            saved.ending = ending;
             self.persist();
         }
     }
@@ -517,8 +529,8 @@ fn store_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, PresetStore, Settings,
-        TagColor,
+        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, LineEnding, PresetStore,
+        Settings, TagColor,
     };
     use crate::SerialConfiguration;
 
@@ -727,7 +739,12 @@ mod tests {
     fn commands_are_named_and_not_doubled() {
         let mut store = PresetStore::default();
         let id = store
-            .add_command(Some(" Factory reset ".into()), " AT+RESTORE ".into(), None)
+            .add_command(
+                Some(" Factory reset ".into()),
+                " AT+RESTORE ".into(),
+                None,
+                LineEnding::CrLf,
+            )
             .expect("a command");
         let saved = store.command(id).unwrap();
         assert_eq!(
@@ -736,20 +753,27 @@ mod tests {
         );
         assert_eq!(saved.alias(), Some("Factory reset"));
 
-        let again = store.add_command(None, "AT+RESTORE".into(), None);
+        let again = store.add_command(None, "AT+RESTORE".into(), None, LineEnding::Lf);
         assert_eq!(again, Some(id));
         assert_eq!(store.command(id).unwrap().label, "AT+RESTORE");
         assert_eq!(store.command(id).unwrap().alias(), None);
-        assert_eq!(store.add_command(Some("Blank".into()), "  ".into(), None), None);
+        assert_eq!(
+            store.add_command(Some("Blank".into()), "  ".into(), None, LineEnding::CrLf),
+            None
+        );
         assert_eq!(store.commands.len(), 1);
         // A card saved again under a name is that card, renamed.
-        let reset = store.add_command(None, "AT+RST".into(), None).unwrap();
+        let reset = store
+            .add_command(None, "AT+RST".into(), None, LineEnding::CrLf)
+            .unwrap();
         assert_eq!(
-            store.add_command(Some("Reboot".into()), "AT+RST".into(), None),
+            store.add_command(Some("Reboot".into()), "AT+RST".into(), None, LineEnding::CrLf),
             Some(reset)
         );
         assert_eq!(store.commands.len(), 2);
         assert_eq!(store.command(reset).unwrap().label, "Reboot");
+        // Saving over a card re-ends it as well as renaming it.
+        assert_eq!(store.command(id).unwrap().ending, LineEnding::Lf);
         assert!(!serde_json::to_string(&store).unwrap().contains(r#""group""#));
     }
 
@@ -761,15 +785,20 @@ mod tests {
         let bench = store.add_group(Library::Commands, "Bench").unwrap();
         let sessions = store.add_group(Library::Sessions, "Bench").unwrap();
         let loose = store
-            .add_command(Some("Status".into()), "AT+STATUS?".into(), None)
+            .add_command(Some("Status".into()), "AT+STATUS?".into(), None, LineEnding::CrLf)
             .unwrap();
         let id = store
-            .add_command(Some("Status".into()), "AT+STATUS?".into(), Some(bench))
+            .add_command(
+                Some("Status".into()),
+                "AT+STATUS?".into(),
+                Some(bench),
+                LineEnding::CrLf,
+            )
             .unwrap();
         // The same command in another group is another card.
         assert_ne!(loose, id);
         let stray = store
-            .add_command(None, "AT+GMR".into(), Some(sessions))
+            .add_command(None, "AT+GMR".into(), Some(sessions), LineEnding::CrLf)
             .unwrap();
         assert_eq!(store.command(stray).unwrap().group, None);
 
@@ -784,9 +813,15 @@ mod tests {
         assert_eq!(restored.commands_in(None).count(), 2);
 
         let mut store = restored;
-        store.update_command(id, None, "AT+STATUS?".into(), None);
+        store.update_command(id, None, "AT+STATUS?".into(), None, LineEnding::CrLf);
         assert_eq!(store.command(id).unwrap().label, "AT+STATUS?");
-        store.update_command(id, Some("Status".into()), "AT+STATUS?".into(), Some(bench));
+        store.update_command(
+            id,
+            Some("Status".into()),
+            "AT+STATUS?".into(),
+            Some(bench),
+            LineEnding::CrLf,
+        );
         store.remove_group(bench);
         assert_eq!(store.command(id).unwrap().group, None);
         assert_eq!(store.commands_in(None).count(), 3);

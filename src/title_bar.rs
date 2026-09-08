@@ -2,14 +2,14 @@
 //! own.
 //!
 //! Centre, the *command centre*: tab arrows, the output filter and, at its
-//! right, the connect switch — the two things that belong to the session in
-//! front of you, side by side, and both change with the tab. It is sized the
-//! way VS Code sizes its own. Right, one switch: the side panel. Left, only
-//! what the platform puts there — the traffic lights on macOS, the
-//! application menus elsewhere. Which session is in front of you is said by
-//! its tab, and the ways to any other session are the tab strip, the side
-//! panel and the Session menu; a pill here saying it again would only be a
-//! second thing to look at.
+//! right, the connect switch with the session's byte counters beside it —
+//! what belongs to the session in front of you, side by side, and all of it
+//! changing with the tab. It is sized the way VS Code sizes its own. Right,
+//! one switch: the side panel. Left, only what the platform puts there —
+//! the traffic lights on macOS, the application menus elsewhere. Which
+//! session is in front of you is said by its tab, and the ways to any other
+//! session are the tab strip, the side panel and the Session menu; a pill
+//! here saying it again would only be a second thing to look at.
 //!
 //! The bar is a little taller than the component default so its pills have
 //! room to be pills, and it is painted with a faint top light rather than a
@@ -26,6 +26,7 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::Input,
+    tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -49,11 +50,15 @@ const FILTER_HEIGHT: f32 = 28.;
 /// Square size of the tab arrows, a step smaller than the icon buttons.
 const NAV_BUTTON: f32 = 24.;
 /// The centre group's share of the bar, as VS Code sizes its command centre
-/// with a connect pill added, clamped so it neither swallows a wide window
-/// nor collapses on a narrow one.
-const CENTER_FRACTION: f32 = 0.42;
-const CENTER_MAX_WIDTH: f32 = 680.;
-const CENTER_MIN_WIDTH: f32 = 360.;
+/// with a connect pill and the byte counters added, clamped so it neither
+/// swallows a wide window nor collapses on a narrow one.
+const CENTER_FRACTION: f32 = 0.46;
+const CENTER_MAX_WIDTH: f32 = 780.;
+const CENTER_MIN_WIDTH: f32 = 460.;
+/// What the number in a byte counter is given, right-aligned in it, so a
+/// count climbing from `0 B` to `1.2 MB` grows leftwards into its own space
+/// rather than shoving the filter box along with it.
+const COUNTER_VALUE_WIDTH: f32 = 40.;
 /// How faint the filter box and the connect pill go without a tab.
 const IDLE_OPACITY: f32 = 0.6;
 /// What `TitleBar` pads on the left for the macOS traffic lights.
@@ -101,6 +106,7 @@ impl SerialWorkspace {
             None => Self::render_idle_filter_box(palette),
         };
         let connect = self.render_connect_pill(active, cx);
+        let traffic = Self::render_traffic(active, palette);
 
         // Empty on macOS, where the traffic lights are all the left end holds.
         let left_column = h_flex()
@@ -154,7 +160,8 @@ impl SerialWorkspace {
                 .flex_none(),
             )
             .child(div().flex_1().min_w_0().ml_1p5().child(filter_box))
-            .child(keeps_its_press(connect).flex_none().ml_1p5());
+            .child(keeps_its_press(connect).flex_none().ml_1p5())
+            .child(keeps_its_press(traffic).flex_none().ml_1p5());
 
         let right_column = h_flex()
             .flex_1()
@@ -256,6 +263,71 @@ impl SerialWorkspace {
                 }
             }))
             .into_any_element()
+    }
+
+    /// The counters at the connect pill's right: how many bytes this
+    /// session has taken off the port and how many it has put on it.
+    ///
+    /// They are the session's, not the window's — every tab counts its own —
+    /// and they start over when its log is cleared, so the pair reads as
+    /// "what has gone past since I last looked". A plate rather than a pill,
+    /// and in the chrome's monospace: numbers that change every read should
+    /// not be numbers that move. Without a tab the plate stands faint and
+    /// zeroed, keeping the filter box and the pill company.
+    fn render_traffic(active: Option<&SerialTabSnapshot>, palette: WorkbenchPalette) -> AnyElement {
+        let rx = active.map_or(0, |tab| tab.rx_bytes);
+        let tx = active.map_or(0, |tab| tab.tx_bytes);
+
+        h_flex()
+            .id("traffic-counters")
+            .flex_none()
+            .h(px(CONTROL_HEIGHT))
+            .px_2()
+            .gap_2()
+            .items_center()
+            .rounded(px(CONTROL_HEIGHT / 2.))
+            .bg(rgb(palette.surface))
+            .border_1()
+            .border_color(rgb(palette.border_subtle))
+            .when(active.is_none(), |plate| plate.opacity(IDLE_OPACITY))
+            .child(Self::byte_counter("RX", rx, palette))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(1.))
+                    .h(px(12.))
+                    .bg(rgb(palette.border_subtle)),
+            )
+            .child(Self::byte_counter("TX", tx, palette))
+            .tooltip(|window, cx| {
+                Tooltip::new("Bytes received and sent on this session, since its log was cleared")
+                    .build(window, cx)
+            })
+            .into_any_element()
+    }
+
+    /// One counter: its two letters, then the count in the monospace face.
+    fn byte_counter(label: &'static str, bytes: u64, palette: WorkbenchPalette) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_token(MICRO)
+                    .text_color(rgb(palette.muted))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .min_w(px(COUNTER_VALUE_WIDTH))
+                    .text_right()
+                    .ui_mono_font()
+                    .text_token(MICRO)
+                    .text_color(rgb(palette.foreground))
+                    .whitespace_nowrap()
+                    .child(format_bytes(bytes)),
+            )
     }
 
     /// The accent-tinted pill a switched-on control wears: a wash of the
@@ -439,9 +511,36 @@ impl SerialWorkspace {
     }
 }
 
+/// A byte count as the bar says it: plain bytes up to a thousand, then
+/// kB, MB and GB — the decimal units the platforms label a transfer with,
+/// carrying one decimal only while there is one worth reading, so the
+/// number stays three or four glyphs wide however far it climbs.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 3] = ["kB", "MB", "GB"];
+    const STEP: f64 = 1000.;
+
+    if bytes < STEP as u64 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / STEP;
+    let mut unit = UNITS[0];
+    for next in &UNITS[1..] {
+        if value < STEP {
+            break;
+        }
+        value /= STEP;
+        unit = next;
+    }
+    if value < 10. {
+        format!("{value:.1} {unit}")
+    } else {
+        format!("{} {unit}", value.round() as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TITLE_BAR_HEIGHT, traffic_light_position};
+    use super::{TITLE_BAR_HEIGHT, format_bytes, traffic_light_position};
     use gpui_kit::px;
 
     /// The lights are 12px tall; on a 38px bar their centre has to be 19px.
@@ -449,5 +548,29 @@ mod tests {
     fn traffic_lights_sit_on_the_bars_centre_line() {
         let position = traffic_light_position();
         assert_eq!(position.y + px(6.), px(TITLE_BAR_HEIGHT / 2.));
+    }
+
+    #[test]
+    fn small_counts_are_said_in_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1), "1 B");
+        assert_eq!(format_bytes(999), "999 B");
+    }
+
+    /// A decimal while the number is one digit wide, none once it is two.
+    #[test]
+    fn larger_counts_climb_through_the_units() {
+        assert_eq!(format_bytes(1_000), "1.0 kB");
+        assert_eq!(format_bytes(1_234), "1.2 kB");
+        assert_eq!(format_bytes(45_600), "46 kB");
+        assert_eq!(format_bytes(999_000), "999 kB");
+        assert_eq!(format_bytes(1_500_000), "1.5 MB");
+        assert_eq!(format_bytes(12_000_000_000), "12 GB");
+    }
+
+    /// Past the last unit the number keeps growing rather than wrapping.
+    #[test]
+    fn the_biggest_counts_stay_in_gigabytes() {
+        assert_eq!(format_bytes(4_000_000_000_000), "4000 GB");
     }
 }

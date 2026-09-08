@@ -941,6 +941,7 @@ impl SerialWorkspace {
                     tab.note("Serial port opened; receiving data.");
                 }
                 SerialEvent::Data(bytes) => {
+                    tab.count_received(bytes.len());
                     if !tab.paused {
                         tab.receive(&bytes);
                     }

@@ -270,6 +270,11 @@ pub(crate) struct SerialTabState {
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
+    /// How many bytes have come off the port and how many have gone out
+    /// on it, since the tab was opened or the log last cleared. Kept per
+    /// tab: the title bar reads the counts of the session in front.
+    pub(crate) rx_bytes: u64,
+    pub(crate) tx_bytes: u64,
     /// Whether the composer's line goes out as the hex bytes it spells,
     /// rather than as text.
     pub(crate) hex_mode: bool,
@@ -322,6 +327,8 @@ impl SerialTabState {
             connected: false,
             connecting: false,
             paused: false,
+            rx_bytes: 0,
+            tx_bytes: 0,
             hex_mode: false,
             text_line_ending: LineEnding::default_for(false),
             hex_line_ending: LineEnding::default_for(true),
@@ -430,17 +437,32 @@ impl SerialTabState {
         }
     }
 
-    /// Empties the log: the screen, the scrollback and the stamps, and —
-    /// under the hex view — the count of bytes with them.
+    /// Counts what the port read. Called for everything that arrives,
+    /// including while the log is paused: the counter is what the link
+    /// carried, so it keeps ticking to say the device is still talking
+    /// with the screen held still.
+    pub(crate) fn count_received(&mut self, bytes: usize) {
+        self.rx_bytes = self.rx_bytes.saturating_add(bytes as u64);
+    }
+
+    /// Empties the log: the screen, the scrollback and the stamps, the
+    /// byte counters, and — under the hex view — the count of bytes with
+    /// them.
     pub(crate) fn clear_log(&mut self) {
         self.terminal.clear();
         self.dump.reset();
+        self.rx_bytes = 0;
+        self.tx_bytes = 0;
     }
 
-    /// Hands bytes to the port. Nothing happens when the tab is not open.
-    pub(crate) fn write(&self, bytes: Vec<u8>) {
+    /// Hands bytes to the port, counting what went out. Nothing happens
+    /// when the tab is not open.
+    pub(crate) fn write(&mut self, bytes: Vec<u8>) {
         if let Some(tx) = &self.command_tx {
-            let _ = tx.send(SerialCommand::Write(bytes));
+            let sent = bytes.len();
+            if tx.send(SerialCommand::Write(bytes)).is_ok() {
+                self.tx_bytes = self.tx_bytes.saturating_add(sent as u64);
+            }
         }
     }
 
@@ -475,6 +497,8 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) interactive: bool,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
+    pub(crate) rx_bytes: u64,
+    pub(crate) tx_bytes: u64,
     pub(crate) hex_mode: bool,
     pub(crate) line_ending: LineEnding,
     pub(crate) filter_input: Entity<InputState>,
@@ -489,6 +513,8 @@ impl From<&SerialTabState> for SerialTabSnapshot {
             interactive: tab.interactive,
             connected: tab.connected,
             connecting: tab.connecting,
+            rx_bytes: tab.rx_bytes,
+            tx_bytes: tab.tx_bytes,
             hex_mode: tab.hex_mode,
             line_ending: tab.line_ending(),
             filter_input: tab.filter_input.clone(),

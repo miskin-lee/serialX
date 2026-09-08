@@ -128,6 +128,14 @@ pub struct SerialWorkspace {
     /// Whether a selection is being dragged out over the terminal: from
     /// the press that began it to the release that ends it.
     selecting: bool,
+    /// While the scrollbar's thumb is held, how far down it the pointer
+    /// took hold, so the thumb rides under the same point of itself
+    /// rather than jumping its middle to the pointer.
+    scrollbar_grab: Option<f32>,
+    /// Whether the pointer is on the scrollbar's track, which brings the
+    /// thumb forward. Kept rather than drawn from a hover style, since the
+    /// thumb widens and a hover style is laid on after the layout.
+    scrollbar_hovered: bool,
     /// Wheel travel short of a whole line, carried to the next event.
     scroll_remainder: f32,
     /// The cursor's blink: whether it is in its visible half, whether a
@@ -183,6 +191,8 @@ impl SerialWorkspace {
             composing: None,
             terminal_metrics: TerminalMetrics::default(),
             selecting: false,
+            scrollbar_grab: None,
+            scrollbar_hovered: false,
             scroll_remainder: 0.,
             cursor_shown: true,
             blinking: false,
@@ -839,6 +849,53 @@ impl SerialWorkspace {
     pub(crate) fn terminal_takes_input(&self) -> bool {
         self.active_tab()
             .is_some_and(|tab| tab.connected && tab.interactive)
+    }
+
+    /// A press on the scrollbar. On the thumb it takes hold of it at the
+    /// point pressed, so the thumb does not jump its middle under the
+    /// pointer; anywhere else on the track it brings the thumb there
+    /// first, so one press both goes there and goes on dragging.
+    fn scrollbar_press(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(geometry) = self.scrollbar_geometry() else {
+            return;
+        };
+        let y = f32::from(position.y) - geometry.track_top;
+        let grab = if geometry.holds(y) {
+            y - geometry.thumb_top
+        } else {
+            geometry.thumb_height / 2.
+        };
+        self.scrollbar_grab = Some(grab);
+        self.scroll_log_to(geometry.rows_above(y - grab), cx);
+    }
+
+    /// The pointer moving with the thumb held: the view goes where the
+    /// thumb is put.
+    fn scrollbar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let (Some(grab), Some(geometry)) = (self.scrollbar_grab, self.scrollbar_geometry()) else {
+            return;
+        };
+        let y = f32::from(position.y) - geometry.track_top;
+        self.scroll_log_to(geometry.rows_above(y - grab), cx);
+    }
+
+    /// The button released: the thumb is let go.
+    fn scrollbar_release(&mut self, cx: &mut Context<Self>) {
+        if self.scrollbar_grab.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Puts the view in front where the thumb says. As with the wheel,
+    /// leaving the bottom stops the view following new output, and
+    /// returning to it resumes.
+    fn scroll_log_to(&mut self, above: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        tab.scroll_view_to(above);
+        tab.auto_scroll = tab.view_at_bottom();
+        cx.notify();
     }
 
     /// The wheel over the terminal moves through its scrollback. Scrolling

@@ -238,9 +238,38 @@ impl MaskState {
         self.anchor = None;
     }
 
+    /// How many rows the mask has to show, and how many of them stand
+    /// above the view: what the scrollbar is drawn from.
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn rows_above(&self, lines: usize) -> usize {
+        self.max_offset(lines).saturating_sub(self.offset)
+    }
+
+    /// Puts the view where `above` rows stand over it, as near as the rows
+    /// there are allow.
+    pub(crate) fn scroll_to_rows_above(&mut self, above: usize, lines: usize) {
+        self.offset = self.max_offset(lines).saturating_sub(above);
+        self.drop_anchor();
+    }
+
     pub(crate) fn is_at_bottom(&self) -> bool {
         self.offset == 0
     }
+}
+
+/// Where a view stands in the log it is over: how many rows there are in
+/// all, how many of them are on screen, and how many stand above the top
+/// of it. The two views count in rows of their own — the grid's lines, or
+/// the rows of the lines the mask keeps — so the scrollbar can be drawn
+/// from these three numbers without knowing which view it is over.
+#[derive(Clone, Copy)]
+pub(crate) struct ViewScroll {
+    pub(crate) total: usize,
+    pub(crate) visible: usize,
+    pub(crate) above: usize,
 }
 
 /// The tab's view of its log: the screen, or the mask over it, whichever
@@ -292,6 +321,38 @@ impl SerialTabState {
             self.mask.scroll(lines, self.terminal.screen_lines());
         } else {
             self.terminal.scroll(lines);
+        }
+    }
+
+    /// Where the view in front stands in the whole log, as the scrollbar
+    /// reads it.
+    pub(crate) fn view_scroll(&self) -> ViewScroll {
+        let visible = self.terminal.screen_lines();
+        if self.masking() {
+            ViewScroll {
+                total: self.mask.row_count(),
+                visible,
+                above: self.mask.rows_above(visible),
+            }
+        } else {
+            let history = self.terminal.history_lines();
+            ViewScroll {
+                total: history + visible,
+                visible,
+                above: history - self.terminal.display_offset().min(history),
+            }
+        }
+    }
+
+    /// Puts the view where `above` rows stand over it: what a drag of the
+    /// scrollbar's thumb asks for, in the rows either view is measured in.
+    pub(crate) fn scroll_view_to(&mut self, above: usize) {
+        if self.masking() {
+            self.mask
+                .scroll_to_rows_above(above, self.terminal.screen_lines());
+        } else {
+            let history = self.terminal.history_lines();
+            self.terminal.scroll_to_offset(history.saturating_sub(above));
         }
     }
 

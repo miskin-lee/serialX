@@ -70,6 +70,20 @@ const TERMINAL_LEADING: f32 = 18. / DEFAULT_TERMINAL_FONT_SIZE;
 const CARET_THICKNESS: f32 = 2.;
 /// Breathing room between the tab strip and the first line.
 const TERMINAL_TOP_INSET: f32 = 8.;
+/// The scrollbar down the log's right edge: the width of the track, which
+/// lies in the margin the rows already leave at their end, and the width
+/// of the thumb in it at rest and once the pointer is on the track.
+const SCROLLBAR_WIDTH: f32 = 12.;
+const SCROLLBAR_THUMB: f32 = 6.;
+const SCROLLBAR_THUMB_WIDE: f32 = 10.;
+/// The shortest the thumb is drawn, however long the log grows, so there
+/// is always something to take hold of.
+const SCROLLBAR_THUMB_MIN: f32 = 28.;
+/// How strongly the thumb inks: at rest, with the pointer on the track,
+/// and while it is being dragged.
+const THUMB_REST: f32 = 0.2;
+const THUMB_HOVER: f32 = 0.34;
+const THUMB_HELD: f32 = 0.48;
 /// What the log says while the filter's mask keeps every line back.
 const MASK_EMPTY_HINT: &str = "No line matches the filter";
 
@@ -89,6 +103,46 @@ pub(crate) struct TerminalMetrics {
     /// The grid's size, as last fitted to the terminal.
     pub(crate) columns: usize,
     pub(crate) lines: usize,
+    /// How tall the log stands, which is the scrollbar's track.
+    pub(crate) height: f32,
+}
+
+/// The scrollbar as it is to be drawn and dragged: where its track stands
+/// in the window, where the thumb sits in the track, and how many rows the
+/// thumb's travel is worth. Measured once per frame and read by both the
+/// element and the pointer, so a press lands where the thumb was drawn.
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollbarGeometry {
+    pub(crate) track_top: f32,
+    pub(crate) track_height: f32,
+    pub(crate) thumb_top: f32,
+    pub(crate) thumb_height: f32,
+    /// The rows above the view when the thumb is at the foot of its
+    /// travel: the whole log less what is on screen.
+    pub(crate) extent: usize,
+}
+
+impl ScrollbarGeometry {
+    /// How far the thumb can travel, which is what the rows are spread
+    /// over; nothing when the thumb fills the track.
+    fn travel(&self) -> f32 {
+        (self.track_height - self.thumb_height).max(0.)
+    }
+
+    /// The rows that would stand above the view with the thumb's top at
+    /// `top`, clamped to the ends of the log.
+    pub(crate) fn rows_above(&self, top: f32) -> usize {
+        let travel = self.travel();
+        if travel <= 0. {
+            return 0;
+        }
+        ((top / travel).clamp(0., 1.) * self.extent as f32).round() as usize
+    }
+
+    /// Whether a point down the track is on the thumb.
+    pub(crate) fn holds(&self, y: f32) -> bool {
+        (self.thumb_top..self.thumb_top + self.thumb_height).contains(&y)
+    }
 }
 
 impl SerialWorkspace {
@@ -283,6 +337,7 @@ impl SerialWorkspace {
             self.start_blinking(window, cx);
         }
         let terminal = self.render_terminal(&tab, focused, cx);
+        let scrollbar = self.render_scrollbar(cx);
         let menu = self.terminal_menu(cx);
         // The find bar floats over the log's top-right corner while it is
         // open, the way VS Code's find widget does.
@@ -326,6 +381,7 @@ impl SerialWorkspace {
                         this.scroll_terminal(delta, cx);
                     }))
                     .child(terminal)
+                    .children(scrollbar)
                     .children(find_bar)
                     .context_menu(menu),
             )
@@ -434,6 +490,7 @@ impl SerialWorkspace {
                         origin_y: f32::from(bounds.origin.y),
                         columns,
                         lines,
+                        height: f32::from(bounds.size.height),
                     };
                     if let Some(tab) = this.tab_mut(tab_id) {
                         tab.terminal.resize(columns, lines);
@@ -502,6 +559,156 @@ impl SerialWorkspace {
         .left_0()
         .right_0()
         .bottom_0()
+        .into_any_element()
+    }
+
+    /// Where the scrollbar's track and its thumb stand this frame, read
+    /// from the log the tab in front shows and the box the terminal was
+    /// last laid out in. Nothing while the whole log is on screen — there
+    /// is nothing to scroll, and so no bar — or before the log has been
+    /// laid out at all.
+    pub(crate) fn scrollbar_geometry(&self) -> Option<ScrollbarGeometry> {
+        let scroll = self.active_tab()?.view_scroll();
+        let track_height = self.terminal_metrics.height;
+        if scroll.visible == 0 || scroll.total <= scroll.visible || track_height <= 0. {
+            return None;
+        }
+        // As much of the track as the screen is of the log, but never so
+        // little that it cannot be aimed at.
+        let thumb_height = (track_height * scroll.visible as f32 / scroll.total as f32)
+            .max(SCROLLBAR_THUMB_MIN)
+            .min(track_height);
+        let extent = scroll.total - scroll.visible;
+        let thumb_top =
+            (track_height - thumb_height) * (scroll.above as f32 / extent as f32).clamp(0., 1.);
+        Some(ScrollbarGeometry {
+            track_top: self.terminal_metrics.origin_y,
+            track_height,
+            thumb_top,
+            thumb_height,
+            extent,
+        })
+    }
+
+    /// The scrollbar: a slim bar over the log's right edge, in the margin
+    /// the rows already leave at their end, so it costs the text no
+    /// columns. The thumb is as much of the track as the screen is of the
+    /// whole log and stands where the view stands in it, so a long log
+    /// says so at a glance; the pointer anywhere on the track widens the
+    /// thumb and brings it forward, and it can be thrown from one end of
+    /// fifty thousand lines to the other in a single drag, which the wheel
+    /// cannot. It is drawn only while there is more log than screen.
+    fn render_scrollbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(geometry) = self.scrollbar_geometry() else {
+            // A bar that has gone — the log cleared, the tab closed —
+            // takes the pointer's hold on it with it, since there is
+            // nothing left to see the release.
+            self.scrollbar_grab = None;
+            self.scrollbar_hovered = false;
+            return None;
+        };
+        let palette = self.interface_theme.palette();
+        let held = self.scrollbar_grab.is_some();
+        // The pointer's state is kept rather than left to a hover style:
+        // a hover style is laid on at paint, after the layout that would
+        // have to widen the thumb.
+        let near = held || self.scrollbar_hovered;
+        let ink = if held {
+            THUMB_HELD
+        } else if near {
+            THUMB_HOVER
+        } else {
+            THUMB_REST
+        };
+        let watch = held.then(|| self.watch_scrollbar_drag(cx));
+
+        Some(
+            div()
+                .id("terminal-scrollbar")
+                .absolute()
+                .top(px(TERMINAL_TOP_INSET))
+                .right_0()
+                .bottom_0()
+                .w(px(SCROLLBAR_WIDTH))
+                .cursor(CursorStyle::Arrow)
+                // Over the log, not of it, as the find bar is: a press on
+                // the bar neither focuses the log nor starts a selection
+                // in it, while the wheel over the bar still scrolls it.
+                .block_mouse_except_scroll()
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if this.scrollbar_hovered != *hovered {
+                        this.scrollbar_hovered = *hovered;
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.scrollbar_press(event.position, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(geometry.thumb_top))
+                        .left_0()
+                        .right_0()
+                        .h(px(geometry.thumb_height))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(if near {
+                                    SCROLLBAR_THUMB_WIDE
+                                } else {
+                                    SCROLLBAR_THUMB
+                                }))
+                                .rounded_full()
+                                .bg(tint(palette.foreground, ink)),
+                        ),
+                )
+                .children(watch)
+                .into_any_element(),
+        )
+    }
+
+    /// While the thumb is held the pointer is followed at the window
+    /// rather than at the bar, so the drag goes on when the pointer leaves
+    /// the track — sideways over the log, or past the window's edge — and
+    /// the release that ends it can land anywhere.
+    fn watch_scrollbar_drag(&self, cx: &mut Context<Self>) -> AnyElement {
+        let workspace = cx.entity();
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let drag = workspace.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    drag.update(cx, |this, cx| {
+                        // A release that went unseen — one that fell
+                        // between frames — shows as a move with the button
+                        // up, and ends the drag the same.
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            this.scrollbar_drag(event.position, cx);
+                        } else {
+                            this.scrollbar_release(cx);
+                        }
+                    });
+                });
+                let release = workspace.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
+                        release.update(cx, |this, cx| this.scrollbar_release(cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .inset_0()
         .into_any_element()
     }
 
@@ -939,5 +1146,68 @@ fn paint_terminal(
                 cursor_color,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SCROLLBAR_THUMB_MIN, ScrollbarGeometry};
+
+    /// The geometry as `scrollbar_geometry` builds it, for a track of
+    /// `height` over a log of `total` rows showing `visible` of them with
+    /// `above` of them above the view.
+    fn geometry(height: f32, total: usize, visible: usize, above: usize) -> ScrollbarGeometry {
+        let thumb_height = (height * visible as f32 / total as f32)
+            .max(SCROLLBAR_THUMB_MIN)
+            .min(height);
+        let extent = total - visible;
+        ScrollbarGeometry {
+            track_top: 100.,
+            track_height: height,
+            thumb_top: (height - thumb_height) * (above as f32 / extent as f32).clamp(0., 1.),
+            thumb_height,
+            extent,
+        }
+    }
+
+    /// The thumb is the screen's share of the log, and stands where the
+    /// view stands: at the top with the whole log above it, at the foot
+    /// while the view follows the newest output.
+    #[test]
+    fn the_thumb_is_the_screens_share_of_the_log() {
+        let bar = geometry(400., 100, 25, 0);
+        assert_eq!(bar.thumb_height, 100.);
+        assert_eq!(bar.thumb_top, 0.);
+        let bar = geometry(400., 100, 25, 75);
+        assert_eq!(bar.thumb_top, 300.);
+        assert!(bar.holds(300.));
+        assert!(bar.holds(399.));
+        assert!(!bar.holds(299.));
+    }
+
+    /// However long the log grows the thumb stays big enough to aim at,
+    /// and its travel still reaches both ends of the log.
+    #[test]
+    fn a_long_log_keeps_a_thumb_to_take_hold_of() {
+        let bar = geometry(400., 50_000, 25, 0);
+        assert_eq!(bar.thumb_height, SCROLLBAR_THUMB_MIN);
+        assert_eq!(bar.rows_above(0.), 0);
+        assert_eq!(bar.rows_above(400. - SCROLLBAR_THUMB_MIN), 49_975);
+        // Past either end of the travel is that end, not beyond it.
+        assert_eq!(bar.rows_above(-40.), 0);
+        assert_eq!(bar.rows_above(4_000.), 49_975);
+    }
+
+    /// A thumb that fills its track has nowhere to go.
+    #[test]
+    fn a_thumb_that_fills_the_track_stays_put() {
+        let bar = ScrollbarGeometry {
+            track_top: 0.,
+            track_height: 400.,
+            thumb_top: 0.,
+            thumb_height: 400.,
+            extent: 3,
+        };
+        assert_eq!(bar.rows_above(200.), 0);
     }
 }

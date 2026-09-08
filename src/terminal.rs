@@ -523,6 +523,22 @@ impl Terminal {
         self.term.grid().display_offset()
     }
 
+    /// How many lines the scrollback holds above the screen.
+    pub(crate) fn history_lines(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// Puts the view this many lines back from the newest, as far as the
+    /// scrollback reaches: the scrollbar's way of scrolling, which names
+    /// where to be rather than how far to go.
+    pub(crate) fn scroll_to_offset(&mut self, offset: usize) {
+        let wanted = offset.min(self.history_lines()) as i32;
+        let current = self.display_offset() as i32;
+        if wanted != current {
+            self.term.scroll_display(Scroll::Delta(wanted - current));
+        }
+    }
+
     /// A cell clamped onto the grid, as the point alacritty anchors a
     /// selection to and the side of it the pointer was on.
     fn anchor(&self, cell: GridCell) -> (Point, Side) {

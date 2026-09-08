@@ -169,6 +169,18 @@ pub(crate) fn icon_chip(glyph: Glyph, color: u32, size: f32) -> impl IntoElement
         .child(Icon::new(glyph).size(px(glyph_size)).text_color(rgb(color)))
 }
 
+/// A tag's colour as a mark of its own: a small filled square, the way a
+/// list in an editor marks a row by colour rather than by another glyph.
+/// Solid, so the hue reads at this size, and rounded just enough not to be
+/// a hard pixel square.
+pub(crate) fn color_chip(color: u32, size: f32) -> impl IntoElement {
+    div()
+        .flex_none()
+        .size(px(size))
+        .rounded(px((size * 0.28).max(2.)))
+        .bg(rgb(color))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{GLYPHS, Glyph, WorkbenchAssets};

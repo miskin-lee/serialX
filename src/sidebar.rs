@@ -2,9 +2,13 @@
 //!
 //! Two stacked sections, each a header over a scrolling list of cards. Rows are
 //! cards rather than table lines so a saved item reads as an object you can act
-//! on, and every one is anchored by a coloured glyph in the manner of VS Code's
-//! Material Icon Theme: a command is a green prompt, and a session wears its
-//! own tag colour, so the card and the tab it opens match.
+//! on, and every one is anchored by a mark in the manner of VS Code's Material
+//! Icon Theme: a command by a green prompt glyph, a session by a square of its
+//! own tag colour, so the card and the tab it opens match. A card carries one
+//! line — the name of the thing, and nothing else. What is under the name is
+//! what a click will do, not what the row is: the device a session opens and
+//! the line a command sends are read from the tooltip, so a full list stays a
+//! list of names rather than a wall of port paths and shell lines.
 //!
 //! Both lists file under groups — folders, each a row with a chevron over
 //! its cards, the way an explorer shows a directory — with the cards in no
@@ -19,8 +23,9 @@
 //! their own. The Quick send list has a search box over it once it holds
 //! anything, with the title bar filter's `Aa` switch for a search that
 //! minds case; the sessions list is short enough to read, and has none.
-//! Forgetting a session is asked about first — the bin is a small target
-//! beside the pencil, and `Enter` in the prompt is the yes.
+//! Forgetting a saved session or a saved command is asked about first — the
+//! bin is a small target beside the pencil — and `Enter` in the prompt is
+//! the yes.
 //!
 //! Two things fold here, at different grains: a section collapses to its own
 //! header, and the whole panel collapses to an icon rail that still carries the
@@ -28,15 +33,15 @@
 //! its neighbour, so the panel never holds a half-empty list above a full one.
 //!
 //! Along the panel's foot sits the composer: the one box commands are typed
-//! into, under the commands kept for reuse, so a line and the bookmark that
+//! into, under the commands kept for reuse, so a line and the word that
 //! saves it are a hand's width apart. It is built the way a chat composer
 //! is — Slack's, Linear's — one card with the text on top and a rail of
 //! switches under it: the encoding, UTF-8 or HEX, and what follows the
 //! line, `CRLF`, `LF` or nothing, with the send button at the rail's end.
-//! The bookmark that keeps the line sits at the end of the box itself, as
-//! a browser's star sits at the end of its address bar. Over the card a
-//! line names the tab it sends to, the way a mail's `To` does, with the
-//! tab's connection dot.
+//! Over the card a line names the tab it sends to, the way a mail's `To`
+//! does, with the tab's connection dot, and `Save` at that line's end
+//! keeps what is typed — a word in the accent colour rather than a second
+//! disc in the box, so the card carries one button only.
 
 use std::rc::Rc;
 
@@ -59,7 +64,7 @@ use crate::controls::{
     Choice, ChoiceText, destructive_dialog_footer, segmented, spaced_caps, tag,
 };
 use crate::groups::GroupPrompt;
-use crate::icons::{Glyph, icon_chip};
+use crate::icons::{Glyph, color_chip, icon_chip};
 use crate::presets::{Library, StoredCommand, StoredGroup, StoredSession};
 use crate::theme::{
     CAPTION, EYEBROW, LABEL, MICRO, MONO_SMALL, TITLE, TagColor, Typography, WorkbenchPalette,
@@ -106,15 +111,11 @@ const COMPOSER_INPUT_HEIGHT: f32 = 34.;
 /// read as one family.
 const COMPOSER_RAIL_HEIGHT: f32 = 32.;
 const COMPOSER_SWITCH_HEIGHT: f32 = 24.;
-/// Diameter of the two discs at the card's right edge — the bookmark at
-/// the box's end and the send button under it — as every chat composer's
-/// send is. One size, so the pair reads as a pair: the quiet one keeps,
-/// the accent one sends.
+/// Diameter of the disc at the rail's end, as every chat composer's send
+/// is.
 const ACTION_BUTTON_SIZE: f32 = 26.;
-/// The glyph in each: the plane is wide, the bookmark tall, so the
-/// bookmark takes a little more to weigh the same.
+/// The plane in it.
 const SEND_ICON_SIZE: f32 = 14.;
-const BOOKMARK_ICON_SIZE: f32 = 16.;
 /// The narrowest the ending's list opens: room for a name and its bytes.
 const ENDING_LIST_MIN_WIDTH: f32 = 148.;
 /// What the composer says while it is empty, in each encoding.
@@ -125,10 +126,17 @@ const SECTION_HEADER_HEIGHT: f32 = 38.;
 const SESSIONS_SHARE: f32 = 0.5;
 /// The rows of a list are of fixed heights, and the list is given the sum:
 /// a scroll region only scrolls from a definite height, and a list sized to
-/// its rows by the layout alone came out empty. A card is two lines of type
-/// with the padding around them; the gap is the list's `gap_1p5`; the
-/// bottom padding its `pb_2`.
-const CARD_HEIGHT: f32 = 52.;
+/// its rows by the layout alone came out empty. A card is one line of type
+/// with the padding around them — what the card is of, its port or the line
+/// it sends, is in its tooltip rather than under its name; the gap is the
+/// list's `gap_1p5`; the bottom padding its `pb_2`.
+const CARD_HEIGHT: f32 = 40.;
+/// The mark at a card's head: a glyph chip for a command, and for a session
+/// the square of its tag colour, which is what tells one session from
+/// another in the list as on its tab. Both stand in a slot of one width, so
+/// the names of the two lists line up down the panel.
+const CARD_MARK: f32 = 24.;
+const SESSION_SWATCH: f32 = 12.;
 const LIST_GAP: f32 = 6.;
 const LIST_PAD_BOTTOM: f32 = 8.;
 /// Height of the prompt an empty list shows.
@@ -449,6 +457,51 @@ impl SerialWorkspace {
         self.send_line(&command, ending, cx);
     }
 
+    /// Asks before a saved command is forgotten, as forgetting a session
+    /// is asked about: the bin is a small target beside the pencil, and a
+    /// command kept for reuse is a line someone worked out once. `Enter`
+    /// is the yes, `Escape` or the cross keeps it.
+    fn confirm_forget_command(
+        &mut self,
+        command_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(saved) = self
+            .presets
+            .commands
+            .iter()
+            .find(|saved| saved.id == command_id)
+        else {
+            return;
+        };
+        let name = saved.label.clone();
+        let palette = self.interface_theme.palette();
+        let workspace = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let workspace = workspace.clone();
+            alert
+                .width(px(CONFIRM_WIDTH))
+                .p_5()
+                .icon(icon_chip(Glyph::Trash, palette.danger, 36.))
+                .title(
+                    div()
+                        .text_token(TITLE)
+                        .text_color(rgb(palette.strong_foreground))
+                        .child("Forget this command?"),
+                )
+                .description(format!("{name} will be removed from Quick send."))
+                .close_button(true)
+                .footer(destructive_dialog_footer(palette, "Forget", Glyph::Trash))
+                .on_ok(move |_, _, cx| {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.remove_saved_command(command_id, cx);
+                    });
+                    true
+                })
+        });
+    }
+
     fn remove_saved_command(&mut self, command_id: u64, cx: &mut Context<Self>) {
         self.presets.remove_command(command_id);
         cx.notify();
@@ -687,6 +740,37 @@ impl SerialWorkspace {
             )
     }
 
+    /// A card's tooltip: what the card stands for on the first line — the
+    /// device a session opens, the line a command sends — over what a click
+    /// does with it. The cards themselves carry a name and nothing else, so
+    /// this is where the detail is read.
+    fn card_tooltip(
+        palette: WorkbenchPalette,
+        detail: SharedString,
+        hint: SharedString,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        move |window, cx| {
+            let (detail, hint) = (detail.clone(), hint.clone());
+            Tooltip::element(move |_, _| {
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .ui_mono_token(MONO_SMALL)
+                            .text_color(rgb(palette.strong_foreground))
+                            .child(detail.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_token(MICRO)
+                            .text_color(rgb(palette.faint))
+                            .child(hint.clone()),
+                    )
+            })
+            .build(window, cx)
+        }
+    }
+
     /// The shell every list row shares: a raised card that lifts on hover and
     /// only brings its buttons forward once the pointer is on it.
     fn row_card(
@@ -744,8 +828,10 @@ impl SerialWorkspace {
     }
 
     /// One saved session. A single click picks it out; a double-click opens
-    /// it; the pencil edits it and the bin forgets it. A named session shows
-    /// its name, and keeps the port on the line below beside the rate.
+    /// it; the pencil edits it and the bin forgets it. The card carries the
+    /// session's colour and its name; the device it opens and the rate it
+    /// opens at are in the tooltip, so a list of sessions reads as a list of
+    /// names rather than of port paths.
     fn render_session_card(
         &mut self,
         saved: &StoredSession,
@@ -755,11 +841,8 @@ impl SerialWorkspace {
         let saved_id = saved.id;
         let is_open = self.port_is_open(&saved.port_name);
         let selected = self.selected_saved == Some(saved_id);
-        let summary = saved.configuration.summary();
-        let (title, detail) = match &saved.alias {
-            Some(alias) => (alias.clone(), format!("{} · {summary}", saved.port_name)),
-            None => (saved.port_name.clone(), summary),
-        };
+        let title = saved.alias.clone().unwrap_or_else(|| saved.port_name.clone());
+        let detail = format!("{} · {}", saved.port_name, saved.configuration.summary());
 
         Self::row_card(
             palette,
@@ -770,7 +853,11 @@ impl SerialWorkspace {
             card.bg(tint(palette.accent, SELECTED_PLATE))
                 .border_color(tint(palette.accent, SELECTED_RING))
         })
-        .tooltip(|window, cx| Tooltip::new("Double-click to open").build(window, cx))
+        .tooltip(Self::card_tooltip(
+            palette,
+            detail.into(),
+            "Double-click to open".into(),
+        ))
         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if event.click_count() >= 2 {
                 this.open_saved_session(saved_id, window, cx);
@@ -778,34 +865,30 @@ impl SerialWorkspace {
                 this.select_saved_session(saved_id, cx);
             }
         }))
-        .child(icon_chip(Glyph::Bookmark, palette.tag(saved.color), 28.))
         .child(
-            v_flex()
+            div()
+                .flex_none()
+                .w(px(CARD_MARK))
+                .flex()
+                .justify_center()
+                .child(color_chip(palette.tag(saved.color), SESSION_SWATCH)),
+        )
+        .child(
+            h_flex()
                 .min_w_0()
                 .flex_1()
-                .child(
-                    h_flex()
-                        .min_w_0()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_token(LABEL)
-                                .text_color(rgb(palette.strong_foreground))
-                                .child(title),
-                        )
-                        .when(is_open, |row| {
-                            row.child(Self::status_dot(5., palette.success))
-                        }),
-                )
+                .gap_1p5()
                 .child(
                     div()
+                        .min_w_0()
                         .truncate()
-                        .ui_mono_token(MONO_SMALL)
-                        .text_color(rgb(palette.faint))
-                        .child(detail),
-                ),
+                        .text_token(LABEL)
+                        .text_color(rgb(palette.strong_foreground))
+                        .child(title),
+                )
+                .when(is_open, |row| {
+                    row.child(Self::status_dot(5., palette.success))
+                }),
         )
         .child(Self::row_actions(
             "saved-session",
@@ -1082,8 +1165,9 @@ impl SerialWorkspace {
     }
 
     /// One saved command. A click sends it to the session in front; the
-    /// pencil edits it and the bin forgets it. A named command shows its
-    /// name over the line it sends; one without goes by the line alone.
+    /// pencil edits it and the bin forgets it. A named command goes by its
+    /// name alone, with the line it sends in the tooltip; one saved without
+    /// a name has only the line, and shows it.
     fn render_command_card(
         &mut self,
         saved: &StoredCommand,
@@ -1093,13 +1177,16 @@ impl SerialWorkspace {
     ) -> AnyElement {
         let command_id = saved.id;
         let alias = saved.alias().map(str::to_owned);
+        let named = alias.is_some();
         let command = saved.command.clone();
         // The card sends what it was saved with, so the tooltip says what
         // follows it rather than leaving the composer's switch to speak for
-        // a line it does not send.
-        let sends: SharedString = match saved.ending {
-            LineEnding::None => "Click to send, with nothing after it".into(),
-            ending => format!("Click to send, ending {}", ending.label()).into(),
+        // a line it does not send. Without a session there is nowhere to
+        // send, and it says that instead.
+        let sends: SharedString = match (has_active_tab, saved.ending) {
+            (false, _) => "Open a session to send this".into(),
+            (true, LineEnding::None) => "Click to send, with nothing after it".into(),
+            (true, ending) => format!("Click to send, ending {}", ending.label()).into(),
         };
 
         Self::row_card(
@@ -1110,42 +1197,27 @@ impl SerialWorkspace {
         // Without a session there is nowhere to send, so the row states
         // that rather than swallowing the click.
         .when(!has_active_tab, |row| row.cursor_default().opacity(0.55))
+        .tooltip(Self::card_tooltip(palette, command.clone().into(), sends))
         .when(has_active_tab, |row| {
-            row.tooltip(move |window, cx| Tooltip::new(sends.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.send_saved_command(command_id, cx);
-                }))
+            row.on_click(cx.listener(move |this, _, _, cx| {
+                this.send_saved_command(command_id, cx);
+            }))
         })
-        .child(icon_chip(Glyph::Prompt, palette.category_command, 28.))
+        .child(icon_chip(Glyph::Prompt, palette.category_command, CARD_MARK))
         .child(
-            v_flex()
+            div()
                 .min_w_0()
                 .flex_1()
-                .when_some(alias, |body, alias| {
-                    body.child(
-                        div()
-                            .truncate()
-                            .text_token(LABEL)
-                            .text_color(rgb(palette.strong_foreground))
-                            .child(alias),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .ui_mono_token(MONO_SMALL)
-                            .text_color(rgb(palette.faint))
-                            .child(command.clone()),
-                    )
+                .truncate()
+                .map(|name| {
+                    if named {
+                        name.text_token(LABEL)
+                    } else {
+                        name.ui_mono_token(LABEL)
+                    }
                 })
-                .when(saved.alias().is_none(), |body| {
-                    body.child(
-                        div()
-                            .truncate()
-                            .ui_mono_token(LABEL)
-                            .text_color(rgb(palette.strong_foreground))
-                            .child(command),
-                    )
-                }),
+                .text_color(rgb(palette.strong_foreground))
+                .child(alias.unwrap_or(command)),
         )
         .child(Self::row_actions(
             "saved-command",
@@ -1166,9 +1238,9 @@ impl SerialWorkspace {
                 Self::row_action(
                     ("remove-command", command_id as usize),
                     Glyph::Trash,
-                    "Forget this command",
-                    cx.listener(move |this, _, _, cx| {
-                        this.remove_saved_command(command_id, cx);
+                    "Forget this command…",
+                    cx.listener(move |this, _, window, cx| {
+                        this.confirm_forget_command(command_id, window, cx);
                     }),
                 ),
             ],
@@ -1506,7 +1578,26 @@ impl SerialWorkspace {
             .child(div().flex_1())
             .when(not_hex, |line| {
                 line.child(tag(palette, palette.danger, MICRO, "Not hex"))
-            });
+            })
+            .child(
+                div()
+                    .id("save-command")
+                    .flex_none()
+                    .px(px(4.))
+                    .rounded(px(4.))
+                    .text_token(CAPTION)
+                    .text_color(rgb(palette.accent))
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .hover(|save| save.bg(tint(palette.accent, 0.14)))
+                    .tooltip(|window, cx| {
+                        Tooltip::new("Save this command to Quick send").build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_current_command(window, cx);
+                    }))
+                    .child("Save"),
+            );
 
         let input = Styled::h(
             Input::new(&self.send_input)
@@ -1526,25 +1617,10 @@ impl SerialWorkspace {
             .text_color(rgb(palette.muted)),
         )
         .when(hex_mode, |input| input.ui_mono_font())
-        .cleanable(true)
-        .suffix(
-            Button::new("save-command")
-                .ghost()
-                .with_size(px(ACTION_BUTTON_SIZE))
-                .rounded(px(ACTION_BUTTON_SIZE / 2.))
-                .bg(rgb(palette.surface))
-                .border_1()
-                .border_color(rgb(palette.border_subtle))
-                .tab_stop(false)
-                .icon(Icon::new(Glyph::Bookmark).size(px(BOOKMARK_ICON_SIZE)))
-                .tooltip("Save this command to Quick send")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.save_current_command(window, cx);
-                })),
-        );
+        .cleanable(true);
 
-        // The rail keeps the box's side padding, so the send disc hangs
-        // under the bookmark and the switches start under the glyph.
+        // The rail keeps the box's side padding, so the send disc sits at
+        // the box's edge and the switches start under the glyph.
         let rail = h_flex()
             .h(px(COMPOSER_RAIL_HEIGHT))
             .flex_none()

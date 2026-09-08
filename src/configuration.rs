@@ -13,13 +13,17 @@
 //! for telling this session's tab from the others; a new session is offered
 //! the first colour no open tab wears. Beside the name, the group the
 //! session files under in the side panel: a field that opens the list of
-//! the groups there are, with an offer to make one. Over them, at the end
-//! of the section's eyebrow, an `Interactive` switch, on unless turned off:
-//! whether the terminal is a place to type, or a log only to read, with no
-//! cursor, that the composer sends to. A summary line at the foot restates
-//! the choice in the `115200 8N1` shorthand the rest of the workbench
-//! prints, behind a tag glyph in the chosen colour, with the group named
-//! at its end and a `Read-only` tag after it when the switch is off.
+//! the groups there are, with an offer to make one. Beside the swatches,
+//! how the log will read what the device sends: `Text`, through the
+//! emulation, as the device drew it, or `Hex`, as a hex editor sets a
+//! file — the bytes down the left, the characters they stand for down the
+//! right. Over them, at the end of the section's eyebrow, an `Interactive`
+//! switch, on unless turned off: whether the terminal is a place to type,
+//! or a log only to read, with no cursor, that the composer sends to. A
+//! summary line at the foot restates the choice in the `115200 8N1`
+//! shorthand the rest of the workbench prints, behind a tag glyph in the
+//! chosen colour, with the group named at its end and `Hex` and
+//! `Read-only` tags after it when those switches say so.
 //!
 //! A new session is confirmed with `Save & Connect` — `Enter` — which keeps
 //! it in the side panel and opens it in a tab; `Connect`, beside it, only
@@ -57,6 +61,7 @@ use crate::controls::{
     Choice, ChoiceText, SecondaryConfirm, dialog_footer, eyebrow, segmented, tag,
 };
 use crate::groups::GroupPrompt;
+use crate::hex::LogView;
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{Library, StoredGroup, StoredSession};
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
@@ -298,6 +303,8 @@ struct SerialConfigurationEditor {
     baud_error: Option<BaudRateError>,
     /// Whether the tab will be a place to type, or a log only to read.
     interactive: bool,
+    /// How the log will read what arrives: as text, or as a hex dump.
+    view: LogView,
     /// Set by `Connect` just before it confirms, and taken by the confirm,
     /// so the one handler knows it was not `Save & Connect`.
     connect_only: bool,
@@ -387,6 +394,7 @@ impl SerialConfigurationEditor {
             _baud_subscription: baud_subscription,
             baud_error: None,
             interactive: saved.is_none_or(|saved| saved.interactive),
+            view: saved.map_or_else(LogView::default, |saved| saved.view),
             connect_only: false,
         }
     }
@@ -525,6 +533,11 @@ impl SerialConfigurationEditor {
 
     fn select_group(&mut self, group: Option<u64>, cx: &mut Context<Self>) {
         self.group = group;
+        cx.notify();
+    }
+
+    fn select_view(&mut self, view: LogView, cx: &mut Context<Self>) {
+        self.view = view;
         cx.notify();
     }
 
@@ -1158,6 +1171,27 @@ impl SerialConfigurationEditor {
             );
         }
 
+        // The swatches take the width they take; the log's switch has the
+        // rest of their row, so the section stays two rows deep and the
+        // choice sits with the others the tab is made of.
+        let view = segmented(
+            "config-log-view",
+            palette,
+            ChoiceText::ui(LABEL),
+            vec![
+                Choice::new(
+                    "Text",
+                    self.view == LogView::Text,
+                    cx.listener(|editor, _, _, cx| editor.select_view(LogView::Text, cx)),
+                ),
+                Choice::new(
+                    "Hex",
+                    self.view == LogView::Hex,
+                    cx.listener(|editor, _, _, cx| editor.select_view(LogView::Hex, cx)),
+                ),
+            ],
+        );
+
         Self::section(
             palette,
             "Tab",
@@ -1172,10 +1206,29 @@ impl SerialConfigurationEditor {
                         .child(group),
                 )
                 .child(
-                    v_flex()
-                        .h(px(TAG_BLOCK_HEIGHT))
-                        .gap(px(SWATCH_GAP))
-                        .children(rows),
+                    h_flex()
+                        .items_center()
+                        .gap(px(COLUMN_GAP))
+                        .child(
+                            v_flex()
+                                .flex_none()
+                                .h(px(TAG_BLOCK_HEIGHT))
+                                .gap(px(SWATCH_GAP))
+                                .children(rows),
+                        )
+                        .child(
+                            div()
+                                .id("config-log-view-field")
+                                .flex_1()
+                                .min_w_0()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(
+                                        "How the log reads what arrives: as the text the device drew, or as a hex dump — the bytes on the left, the characters they stand for on the right.",
+                                    )
+                                    .build(window, cx)
+                                })
+                                .child(view),
+                        ),
                 ),
         )
         .into_any_element()
@@ -1186,8 +1239,9 @@ impl SerialConfigurationEditor {
     /// under it the same thing in words — with the device first when a name
     /// has taken its place above. All behind a tag glyph in the chosen
     /// colour, the one place the tag is named as a tag, and with the group
-    /// as a pill at the end when there is one — and a `Read-only` pill
-    /// after it when the tab will not be typed into.
+    /// as a pill at the end when there is one, a `Hex` pill when the log
+    /// will be a dump rather than text, and a `Read-only` pill when the
+    /// tab will not be typed into.
     fn render_summary(&self, palette: WorkbenchPalette, cx: &App) -> AnyElement {
         let port = self.selected_port();
         let hue = palette.tag(self.color);
@@ -1245,6 +1299,9 @@ impl SerialConfigurationEditor {
             )
             .when_some(group, |strip, group| {
                 strip.child(tag(palette, palette.category_session, MICRO, group))
+            })
+            .when(self.view.is_hex(), |strip| {
+                strip.child(tag(palette, palette.category_signal, MICRO, "Hex"))
             })
             .when(!self.interactive, |strip| {
                 strip.child(tag(palette, palette.warning, MICRO, "Read-only"))
@@ -1442,6 +1499,7 @@ impl SerialWorkspace {
                     let alias = editor.alias(cx);
                     let group = editor.group;
                     let interactive = editor.interactive;
+                    let view = editor.view;
                     let target = editor.target;
 
                     let _ = workspace.update(cx, |workspace, cx| match target {
@@ -1454,6 +1512,7 @@ impl SerialWorkspace {
                                     alias.clone(),
                                     group,
                                     interactive,
+                                    view,
                                 );
                             }
                             let id = workspace.create_configured_tab(
@@ -1463,6 +1522,7 @@ impl SerialWorkspace {
                                 alias,
                                 group,
                                 interactive,
+                                view,
                                 window,
                                 cx,
                             );
@@ -1477,6 +1537,7 @@ impl SerialWorkspace {
                                 alias,
                                 group,
                                 interactive,
+                                view,
                             );
                             if let Some(group) =
                                 workspace.presets.resolve_group(Library::Sessions, group)
@@ -1500,6 +1561,7 @@ impl SerialWorkspace {
         alias: Option<String>,
         group: Option<u64>,
         interactive: bool,
+        view: LogView,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1512,6 +1574,7 @@ impl SerialWorkspace {
         tab.alias = alias;
         tab.group = self.presets.resolve_group(Library::Sessions, group);
         tab.interactive = interactive;
+        tab.view = view;
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {

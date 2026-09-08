@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::filter::OutputFilter;
 use crate::find::{FindState, FindView};
+use crate::hex::{HexDump, LogView};
 use crate::mask::MaskState;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
@@ -261,6 +262,11 @@ pub(crate) struct SerialTabState {
     /// cursor. Off, the log is only to read, the composer does the
     /// sending, and there is no cursor.
     pub(crate) interactive: bool,
+    /// How the log reads what arrives: as the text the device drew, or as
+    /// a hex dump of the bytes it sent.
+    pub(crate) view: LogView,
+    /// The dump's half-filled row, while the view is the hex one.
+    dump: HexDump,
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
@@ -311,6 +317,8 @@ impl SerialTabState {
             alias: None,
             group: None,
             interactive: true,
+            view: LogView::default(),
+            dump: HexDump::default(),
             connected: false,
             connecting: false,
             paused: false,
@@ -368,28 +376,65 @@ impl SerialTabState {
         self.event_rx.take()
     }
 
-    /// Prints a line of the workbench's own in the terminal.
+    /// Prints a line of the workbench's own in the terminal. Under the hex
+    /// view the row that is filling goes out first, so the line does not
+    /// land in the middle of a dump.
     pub(crate) fn note(&mut self, text: impl AsRef<str>) {
-        self.terminal.note(text.as_ref(), &now());
+        let time = now();
+        if self.view.is_hex() {
+            let rows = self.dump.flush();
+            self.terminal.feed(&rows, &time);
+        }
+        self.terminal.note(text.as_ref(), &time);
     }
 
     /// Hands what the port read to the terminal, and sends back whatever
-    /// the terminal answers with.
+    /// the terminal answers with. Under the hex view the read is not text
+    /// to the terminal at all: it fills the dump's rows, and those are
+    /// printed.
     pub(crate) fn receive(&mut self, bytes: &[u8]) {
-        let answer = self.terminal.receive(bytes, &now());
+        let time = now();
+        let answer = if self.view.is_hex() {
+            let rows = self.dump.take(bytes);
+            self.terminal.feed(&rows, &time)
+        } else {
+            self.terminal.receive(bytes, &time)
+        };
         if !answer.is_empty() {
             self.write(answer);
         }
     }
 
-    /// Lets the terminal have the read it was keeping back, nothing
-    /// having followed it within the hold, and sends back whatever it
-    /// answers with.
+    /// Lets the log have what it was keeping back — the terminal's read,
+    /// or the dump's part-filled row — nothing having followed it within
+    /// the hold, and sends back whatever the terminal answers with.
     pub(crate) fn flush(&mut self) {
-        let answer = self.terminal.flush();
+        let answer = if self.view.is_hex() {
+            let rows = self.dump.flush();
+            self.terminal.feed(&rows, &now())
+        } else {
+            self.terminal.flush()
+        };
         if !answer.is_empty() {
             self.write(answer);
         }
+    }
+
+    /// Whether the log is keeping something back for what may follow, so
+    /// the listener knows to bound its next sleep by the hold.
+    pub(crate) fn holds(&self) -> bool {
+        if self.view.is_hex() {
+            self.dump.holds()
+        } else {
+            self.terminal.holds()
+        }
+    }
+
+    /// Empties the log: the screen, the scrollback and the stamps, and —
+    /// under the hex view — the count of bytes with them.
+    pub(crate) fn clear_log(&mut self) {
+        self.terminal.clear();
+        self.dump.reset();
     }
 
     /// Hands bytes to the port. Nothing happens when the tab is not open.

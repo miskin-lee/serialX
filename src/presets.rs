@@ -3,6 +3,7 @@ use std::{env, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::SerialConfiguration;
+use crate::hex::LogView;
 use crate::serial::LineEnding;
 use crate::theme::TagColor;
 
@@ -37,6 +38,10 @@ pub(crate) struct StoredSession {
     /// a session could be read-only, when every one was typed into.
     #[serde(default = "interactive_by_default")]
     pub(crate) interactive: bool,
+    /// How the log reads what arrives. Absent in files written before a
+    /// session could be a hex dump, when every log was text.
+    #[serde(default)]
+    pub(crate) view: LogView,
 }
 
 /// What a session's `interactive` is when the file does not say: on.
@@ -223,6 +228,7 @@ impl PresetStore {
         alias: Option<String>,
         group: Option<u64>,
         interactive: bool,
+        view: LogView,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.label == label) {
@@ -232,6 +238,7 @@ impl PresetStore {
             saved.alias = alias;
             saved.group = group;
             saved.interactive = interactive;
+            saved.view = view;
         } else {
             let id = self.take_id();
             self.sessions.push(StoredSession {
@@ -243,6 +250,7 @@ impl PresetStore {
                 alias,
                 group,
                 interactive,
+                view,
             });
         }
         self.persist();
@@ -263,6 +271,7 @@ impl PresetStore {
         alias: Option<String>,
         group: Option<u64>,
         interactive: bool,
+        view: LogView,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
@@ -273,6 +282,7 @@ impl PresetStore {
             saved.alias = alias;
             saved.group = group;
             saved.interactive = interactive;
+            saved.view = view;
             self.persist();
         }
     }
@@ -529,8 +539,8 @@ fn store_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, LineEnding, PresetStore,
-        Settings, TagColor,
+        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, LineEnding, LogView,
+        PresetStore, Settings, TagColor,
     };
     use crate::SerialConfiguration;
 
@@ -600,8 +610,10 @@ mod tests {
         assert_eq!(store.sessions[0].alias, None);
         assert_eq!(store.sessions[0].group, None);
         assert!(store.groups.is_empty());
-        // A session from before there was a switch was typed into.
+        // A session from before there was a switch was typed into, and
+        // its log was text.
         assert!(store.sessions[0].interactive);
+        assert_eq!(store.sessions[0].view, LogView::Text);
 
         let mut store = store;
         store.update_session(
@@ -612,13 +624,16 @@ mod tests {
             Some("Motor board".into()),
             None,
             false,
+            LogView::Hex,
         );
         let json = serde_json::to_string(&store).unwrap();
         assert!(json.contains(r#""color":"teal""#));
         assert!(json.contains(r#""alias":"Motor board""#));
         assert!(json.contains(r#""interactive":false"#));
+        assert!(json.contains(r#""view":"hex""#));
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
         assert!(!restored.sessions[0].interactive);
+        assert_eq!(restored.sessions[0].view, LogView::Hex);
 
         // A session without a name does not write an empty field.
         store.update_session(
@@ -629,6 +644,7 @@ mod tests {
             None,
             None,
             true,
+            LogView::Text,
         );
         assert!(!serde_json::to_string(&store).unwrap().contains("alias"));
     }
@@ -649,6 +665,7 @@ mod tests {
             None,
             Some(group),
             true,
+            LogView::Text,
         );
         store.add_session(
             "/dev/tty.b · 115200 8N1".into(),
@@ -658,6 +675,7 @@ mod tests {
             None,
             None,
             true,
+            LogView::Text,
         );
 
         let json = serde_json::to_string(&store).unwrap();
@@ -709,6 +727,7 @@ mod tests {
             None,
             Some(group),
             true,
+            LogView::Text,
         );
         store.remove_group(group);
         assert!(store.groups.is_empty());
@@ -725,6 +744,7 @@ mod tests {
             None,
             Some(999),
             true,
+            LogView::Text,
         );
         assert_eq!(store.sessions[1].group, None);
         assert_eq!(store.resolve_group(Library::Sessions, Some(999)), None);

@@ -237,9 +237,10 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let name = tab.title().to_string();
         let detail: SharedString = format!(
-            "{} · {}{}",
+            "{} · {}{}{}",
             tab.selected_port().name,
             tab.configuration.summary(),
+            if tab.view.is_hex() { " · hex" } else { "" },
             if tab.interactive { "" } else { " · read-only" }
         )
         .into();

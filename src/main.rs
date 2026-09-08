@@ -8,6 +8,7 @@ mod controls;
 mod filter;
 mod find;
 mod groups;
+mod hex;
 mod highlight;
 mod icons;
 mod mask;
@@ -954,7 +955,7 @@ impl SerialWorkspace {
             tab.scroll_to_bottom();
         }
         cx.notify();
-        tab.terminal.holds()
+        tab.holds()
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -966,7 +967,7 @@ impl SerialWorkspace {
 
     fn clear_terminal(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.terminal.clear();
+            tab.clear_log();
             cx.notify();
         }
     }

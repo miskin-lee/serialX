@@ -65,6 +65,7 @@ use crate::controls::{
 };
 use crate::groups::GroupPrompt;
 use crate::icons::{Glyph, color_chip, icon_chip};
+use crate::hex::LogView;
 use crate::presets::{Library, StoredCommand, StoredGroup, StoredSession};
 use crate::theme::{
     CAPTION, EYEBROW, LABEL, MICRO, MONO_SMALL, TITLE, TagColor, Typography, WorkbenchPalette,
@@ -253,19 +254,29 @@ impl SerialWorkspace {
             return;
         };
         let port_name = tab.selected_port().name.clone();
-        let (configuration, color, alias, group, interactive) = (
+        let (configuration, color, alias, group, interactive, view) = (
             tab.configuration,
             tab.color,
             tab.alias.clone(),
             tab.group,
             tab.interactive,
+            tab.view,
         );
-        self.save_session_preset(port_name, configuration, color, alias, group, interactive);
+        self.save_session_preset(
+            port_name,
+            configuration,
+            color,
+            alias,
+            group,
+            interactive,
+            view,
+        );
         cx.notify();
     }
 
     /// Keeps a session in the panel, filed under its group, which is
     /// unfolded — as is the section — so the new card is in view.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_session_preset(
         &mut self,
         port_name: String,
@@ -274,6 +285,7 @@ impl SerialWorkspace {
         alias: Option<String>,
         group: Option<u64>,
         interactive: bool,
+        view: LogView,
     ) {
         let label = format!("{} · {}", port_name, configuration.summary());
         let group = self.presets.resolve_group(Library::Sessions, group);
@@ -285,6 +297,7 @@ impl SerialWorkspace {
             alias,
             group,
             interactive,
+            view,
         );
         self.sessions_collapsed = false;
         if let Some(group) = group {
@@ -332,6 +345,7 @@ impl SerialWorkspace {
         tab.alias = saved.alias.clone();
         tab.group = self.presets.resolve_group(Library::Sessions, saved.group);
         tab.interactive = saved.interactive;
+        tab.view = saved.view;
         match tab
             .ports
             .iter()

@@ -1,6 +1,6 @@
 [package]
 name = "serialx"
-version = "0.3.7"
+version = "0.4.1"
 edition = "2024"
 # Also the repository's About on GitHub, the About dialog's line under the
 # version, and the first line of both READMEs: change them together.

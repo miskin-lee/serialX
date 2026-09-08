@@ -50,7 +50,7 @@ use sidebar::{
 };
 use smol::Timer;
 use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
-use terminal::{GridCell, SelectionKind, key_bytes};
+use terminal::{GridCell, SelectionKind, key_bytes, paste_bytes};
 use title_bar::{FILTER_PLACEHOLDER, TITLE_BAR_HEIGHT, traffic_light_position};
 use workbench::TerminalMetrics;
 use updater::{
@@ -799,6 +799,46 @@ impl SerialWorkspace {
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         true
+    }
+
+    /// Types what is on the clipboard at the device, for ⌘V and the log's
+    /// own menu. A tab with nothing open, one whose port is down and one
+    /// that was made read-only take nothing: there the composer sends.
+    pub(crate) fn paste_into_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        if !tab.connected || !tab.interactive {
+            return;
+        }
+        let bytes = paste_bytes(&text, tab.terminal.mode());
+        tab.terminal.clear_selection();
+        tab.write(bytes);
+        if tab.auto_scroll {
+            tab.scroll_to_bottom();
+        }
+        self.wake_cursor(window, cx);
+        cx.notify();
+    }
+
+    /// Whether the log of the tab in front has anything selected to copy,
+    /// and whether what is typed at it reaches a device: what the log's
+    /// menu greys its items by.
+    pub(crate) fn terminal_has_selection(&self) -> bool {
+        self.active_tab()
+            .and_then(SerialTabState::selection_text)
+            .is_some()
+    }
+
+    pub(crate) fn terminal_takes_input(&self) -> bool {
+        self.active_tab()
+            .is_some_and(|tab| tab.connected && tab.interactive)
     }
 
     /// The wheel over the terminal moves through its scrollback. Scrolling

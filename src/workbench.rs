@@ -11,6 +11,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     h_flex,
     kbd::Kbd,
+    menu::{ContextMenuExt, PopupMenu, PopupMenuItem},
     tooltip::Tooltip,
     v_flex,
 };
@@ -18,7 +19,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
-use crate::app_menu::{NewSerialTab, SendBackTab, SendTab, TERMINAL_CONTEXT};
+use crate::app_menu::{
+    CopyTerminalSelection, NewSerialTab, PasteIntoTerminal, SelectAllInTerminal, SendBackTab,
+    SendTab, TERMINAL_CONTEXT,
+};
 use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
@@ -265,7 +269,8 @@ impl SerialWorkspace {
     /// it focus, and from then on keys go to the port of this tab — unless
     /// the tab was made read-only, when the log is only to read and the
     /// composer does the sending; the wheel moves through the scrollback,
-    /// and a drag selects, to be copied with ⌘C.
+    /// and a drag selects, to be copied with ⌘C or pasted back at the
+    /// device with ⌘V. A right-click offers the same three by name.
     pub(crate) fn render_active_tab(
         &mut self,
         tab: SerialTabSnapshot,
@@ -278,6 +283,7 @@ impl SerialWorkspace {
             self.start_blinking(window, cx);
         }
         let terminal = self.render_terminal(&tab, focused, cx);
+        let menu = self.terminal_menu(cx);
         // The find bar floats over the log's top-right corner while it is
         // open, the way VS Code's find widget does.
         let find_bar = tab.find.open.then(|| self.render_find_bar(&tab, cx));
@@ -320,9 +326,60 @@ impl SerialWorkspace {
                         this.scroll_terminal(delta, cx);
                     }))
                     .child(terminal)
-                    .children(find_bar),
+                    .children(find_bar)
+                    .context_menu(menu),
             )
             .into_any_element()
+    }
+
+    /// What a right-click on the log offers: the copy and paste every
+    /// terminal has there, and the select all that goes with them. The
+    /// items are greyed by what the log can do at that moment — nothing
+    /// selected, or a tab that takes no typing — and each carries its
+    /// keystroke, read in the log's own key context.
+    fn terminal_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let workspace = cx.weak_entity();
+        let focus = self.terminal_focus.clone();
+        let has_selection = self.terminal_has_selection();
+        let takes_input = self.terminal_takes_input();
+        move |menu, _, _| {
+            let (copy, paste, select_all) =
+                (workspace.clone(), workspace.clone(), workspace.clone());
+            menu.action_context(focus.clone())
+                .item(
+                    PopupMenuItem::new("Copy")
+                        .action(Box::new(CopyTerminalSelection))
+                        .disabled(!has_selection)
+                        .on_click(move |_, _, cx| {
+                            let _ = copy.update(cx, |this, cx| {
+                                this.copy_terminal_selection(cx);
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("Paste")
+                        .action(Box::new(PasteIntoTerminal))
+                        .disabled(!takes_input)
+                        .on_click(move |_, window, cx| {
+                            let _ = paste.update(cx, |this, cx| {
+                                this.paste_into_terminal(window, cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Select All")
+                        .action(Box::new(SelectAllInTerminal))
+                        .on_click(move |_, _, cx| {
+                            let _ = select_all.update(cx, |this, cx| {
+                                this.select_all_in_terminal(cx);
+                            });
+                        }),
+                )
+        }
     }
 
     /// The terminal itself: a canvas that fits alacritty's grid to its

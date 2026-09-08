@@ -34,6 +34,7 @@ actions!(
         CloseFind,
         SelectAllInTerminal,
         CopyTerminalSelection,
+        PasteIntoTerminal,
         SendTab,
         SendBackTab,
         OpenSettings,
@@ -90,6 +91,12 @@ keystroke!(QUIT_KEYSTROKE, "cmd-q", "ctrl-q");
 // selects all, Ctrl+Shift+A being the auto-scroll switch already.
 keystroke!(SELECT_ALL_KEYSTROKE, "cmd-a", "ctrl-alt-a");
 keystroke!(COPY_SELECTION_KEYSTROKE, "cmd-c", "ctrl-insert");
+// Pasting into the log types what was copied at the device. ⌘V on macOS;
+// elsewhere Ctrl+V is a device key like the rest, so the log takes the
+// pair every terminal there offers: Ctrl+Shift+V, and Shift+Insert.
+keystroke!(PASTE_KEYSTROKE, "cmd-v", "ctrl-shift-v");
+#[cfg(not(target_os = "macos"))]
+const PASTE_ALTERNATE_KEYSTROKE: &str = "shift-insert";
 /// Where `Escape` closes the find bar: only while the bar is in focus.
 pub(crate) const FIND_BAR_CONTEXT: &str = "FindBar";
 /// Where select all and copy act on the log: only while it is in focus,
@@ -227,6 +234,7 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new("escape", CloseFind, Some(FIND_BAR_CONTEXT)),
         KeyBinding::new(SELECT_ALL_KEYSTROKE, SelectAllInTerminal, Some(TERMINAL_CONTEXT)),
         KeyBinding::new(COPY_SELECTION_KEYSTROKE, CopyTerminalSelection, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new(PASTE_KEYSTROKE, PasteIntoTerminal, Some(TERMINAL_CONTEXT)),
         // Tab completes a line in every terminal, so the log takes it back
         // from the window, which would otherwise move on to the next
         // control: a binding on the log outranks the one on the root, and
@@ -238,6 +246,14 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(SETTINGS_KEYSTROKE, OpenSettings, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
     ]);
+    // The other paste the platform's terminals take, beside Ctrl+Shift+V,
+    // and the partner of the Ctrl+Insert that copies.
+    #[cfg(not(target_os = "macos"))]
+    cx.bind_keys([KeyBinding::new(
+        PASTE_ALTERNATE_KEYSTROKE,
+        PasteIntoTerminal,
+        Some(TERMINAL_CONTEXT),
+    )]);
     GlobalState::global_mut(cx)
         .set_app_menus(application_menus().into_iter().map(Menu::owned).collect());
     cx.set_menus(application_menus());
@@ -324,6 +340,13 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     cx.on_action(move |_: &CopyTerminalSelection, cx| {
         let _ = view.update(cx, |view, cx| {
             view.copy_terminal_selection(cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &PasteIntoTerminal, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.paste_into_terminal(window, cx);
         });
     });
 

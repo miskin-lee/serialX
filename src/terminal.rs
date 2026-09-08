@@ -1359,6 +1359,23 @@ fn blend(a: u32, b: u32, amount: f32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
+/// The bytes a paste sends. Every line ending goes as the Return key sends
+/// one, since that is what a device reads at the end of a line and a CRLF
+/// passed on whole would read as two. A program that asked for bracketed
+/// paste — a shell with a line editor, most often — gets the text between
+/// the two markers that tell it the text was pasted rather than typed, so
+/// it does not run each line as it arrives.
+pub(crate) fn paste_bytes(text: &str, mode: TermMode) -> Vec<u8> {
+    let typed = text.replace("\r\n", "\r").replace('\n', "\r");
+    if mode.contains(TermMode::BRACKETED_PASTE) {
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(typed.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        return bytes;
+    }
+    typed.into_bytes()
+}
+
 /// The bytes a key sends, the way a terminal emulator sends them: editing
 /// and cursor keys as their escape sequences, control-letter as the control
 /// character, with xterm's modifier parameter when a modifier is held.
@@ -1468,6 +1485,7 @@ mod tests {
     use super::{
         CaretShape, DEFAULT_SCROLLBACK_LINES, FindMatch, FindSpan, GridCell, GridSize,
         MIN_NUMBER_DIGITS, RenderContent, RenderRun, SelectionKind, Terminal, key_bytes,
+        paste_bytes,
     };
     use crate::{filter::OutputFilter, highlight::Role, theme::TerminalPalette};
     use alacritty_terminal::{grid::Dimensions, term::TermMode};
@@ -2222,5 +2240,16 @@ mod tests {
         assert_eq!(bytes("ctrl-[", normal), Some(vec![0x1b]));
         assert_eq!(bytes("cmd-n", normal), None);
         assert_eq!(bytes("a", normal), None);
+    }
+
+    #[test]
+    fn a_paste_types_its_lines_the_way_return_does() {
+        let normal = TermMode::empty();
+        assert_eq!(paste_bytes("ls -la", normal), b"ls -la".to_vec());
+        assert_eq!(paste_bytes("one\r\ntwo\n", normal), b"one\rtwo\r".to_vec());
+        assert_eq!(
+            paste_bytes("ls", TermMode::BRACKETED_PASTE),
+            b"\x1b[200~ls\x1b[201~".to_vec()
+        );
     }
 }

@@ -18,7 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
-use crate::app_menu::{NewSerialTab, TERMINAL_CONTEXT};
+use crate::app_menu::{NewSerialTab, SendBackTab, SendTab, TERMINAL_CONTEXT};
 use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
 use crate::find::FindView;
@@ -299,6 +299,14 @@ impl SerialWorkspace {
                     .cursor(CursorStyle::IBeam)
                     .on_key_down(cx.listener(|this, event, window, cx| {
                         this.terminal_key(event, window, cx)
+                    }))
+                    // Bound keys are matched before the key handler runs,
+                    // so Tab arrives as an action of the log's own.
+                    .on_action(cx.listener(|this, _: &SendTab, window, cx| {
+                        this.type_tab(false, window, cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &SendBackTab, window, cx| {
+                        this.type_tab(true, window, cx)
                     }))
                     .on_mouse_down(
                         MouseButton::Left,

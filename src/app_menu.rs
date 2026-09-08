@@ -34,6 +34,8 @@ actions!(
         CloseFind,
         SelectAllInTerminal,
         CopyTerminalSelection,
+        SendTab,
+        SendBackTab,
         OpenSettings,
         UseLightTheme,
         UseDarkTheme,
@@ -91,7 +93,8 @@ keystroke!(COPY_SELECTION_KEYSTROKE, "cmd-c", "ctrl-insert");
 /// Where `Escape` closes the find bar: only while the bar is in focus.
 pub(crate) const FIND_BAR_CONTEXT: &str = "FindBar";
 /// Where select all and copy act on the log: only while it is in focus,
-/// so a text box elsewhere keeps its own.
+/// so a text box elsewhere keeps its own. It is also where Tab belongs to
+/// the device rather than to the window's ring of controls.
 pub(crate) const TERMINAL_CONTEXT: &str = "Terminal";
 
 fn application_menus() -> Vec<Menu> {
@@ -224,6 +227,14 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new("escape", CloseFind, Some(FIND_BAR_CONTEXT)),
         KeyBinding::new(SELECT_ALL_KEYSTROKE, SelectAllInTerminal, Some(TERMINAL_CONTEXT)),
         KeyBinding::new(COPY_SELECTION_KEYSTROKE, CopyTerminalSelection, Some(TERMINAL_CONTEXT)),
+        // Tab completes a line in every terminal, so the log takes it back
+        // from the window, which would otherwise move on to the next
+        // control: a binding on the log outranks the one on the root, and
+        // the handler hands the key back when there is nothing to send it
+        // to. Bound rather than read from the key handler because a
+        // keystroke is matched against the bindings first.
+        KeyBinding::new("tab", SendTab, Some(TERMINAL_CONTEXT)),
+        KeyBinding::new("shift-tab", SendBackTab, Some(TERMINAL_CONTEXT)),
         KeyBinding::new(SETTINGS_KEYSTROKE, OpenSettings, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
     ]);

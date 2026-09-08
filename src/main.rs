@@ -639,14 +639,29 @@ impl SerialWorkspace {
             cx.stop_propagation();
             return;
         }
+        if self.write_key(&event.keystroke, window, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Sends what a keystroke means to a device to the tab in front, and
+    /// says whether it went: a tab with nothing open, one that is read
+    /// only, and a key the terminal has no bytes for all leave the
+    /// keystroke to whoever else wants it.
+    fn write_key(
+        &mut self,
+        keystroke: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
+            return false;
         };
         if !tab.connected || !tab.interactive {
-            return;
+            return false;
         }
-        let Some(bytes) = key_bytes(&event.keystroke, tab.terminal.mode()) else {
-            return;
+        let Some(bytes) = key_bytes(keystroke, tab.terminal.mode()) else {
+            return false;
         };
         tab.terminal.clear_selection();
         tab.write(bytes);
@@ -654,8 +669,27 @@ impl SerialWorkspace {
             tab.scroll_to_bottom();
         }
         self.wake_cursor(window, cx);
-        cx.stop_propagation();
         cx.notify();
+        true
+    }
+
+    /// Tab in a terminal completes what is being typed, so while the log
+    /// has focus it goes to the device instead of moving on to the next
+    /// control the way it does everywhere else in the window. With nothing
+    /// to send it to it is handed back, so the log is never a place the
+    /// keyboard cannot leave.
+    pub(crate) fn type_tab(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = Keystroke {
+            key: "tab".to_string(),
+            key_char: None,
+            modifiers: Modifiers {
+                shift: back,
+                ..Modifiers::default()
+            },
+        };
+        if !self.write_key(&keystroke, window, cx) {
+            cx.propagate();
+        }
     }
 
     /// A press on the terminal starts a selection at the cell under it —

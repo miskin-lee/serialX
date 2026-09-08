@@ -52,6 +52,8 @@ pub(crate) struct WorkbenchPalette {
     pub(crate) accent: u32,
     pub(crate) accent_hover: u32,
     pub(crate) accent_active: u32,
+    /// The plate under selected text: the terminal paints it as it is, and the
+    /// chrome's fields wash their way to it (see [`selection_ink`]).
     pub(crate) selection: u32,
     pub(crate) success: u32,
     pub(crate) warning: u32,
@@ -272,7 +274,7 @@ impl InterfaceTheme {
                 accent: 0x5b57d8,
                 accent_hover: 0x4d49cc,
                 accent_active: 0x413ebb,
-                selection: 0xd6d5f7,
+                selection: 0xc4c2f2,
                 success: 0x2f8a5b,
                 warning: 0xa8730f,
                 danger: 0xcb4b40,
@@ -313,7 +315,7 @@ impl InterfaceTheme {
                 accent: 0x8b87ff,
                 accent_hover: 0xa3a0ff,
                 accent_active: 0x6d68e0,
-                selection: 0x2b2b48,
+                selection: 0x34365e,
                 success: 0x4fc38a,
                 warning: 0xe0b070,
                 danger: 0xef8a83,
@@ -815,6 +817,26 @@ fn theme_color(value: u32) -> Option<SharedString> {
     Some(format!("#{value:06X}").into())
 }
 
+/// How much of the selection ink gpui-component lays over a field: it caps
+/// `selection.background` at this alpha, whatever the theme hands it.
+const SELECTION_WASH: f32 = 0.3;
+
+/// The ink that washes to `plate` over `background`.
+///
+/// A field selects in a translucent wash of the theme's selection colour, so
+/// the plate the terminal paints opaque comes out of an input nearly invisible
+/// — the wash is [`SELECTION_WASH`] of it and the field's own colour the rest.
+/// Walking the wash backwards gives both places the same plate.
+fn selection_ink(plate: u32, background: u32) -> u32 {
+    let channel = |shift: u32| {
+        let plate = ((plate >> shift) & 0xff) as f32;
+        let background = ((background >> shift) & 0xff) as f32;
+        let ink = (plate - background * (1. - SELECTION_WASH)) / SELECTION_WASH;
+        (ink.clamp(0., 255.).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
 fn workbench_theme_config(theme: InterfaceTheme) -> ThemeConfig {
     let palette = theme.palette();
     let white = theme_color(0xffffff);
@@ -876,7 +898,7 @@ fn workbench_theme_config(theme: InterfaceTheme) -> ThemeConfig {
     colors.secondary_active = theme_color(palette.active);
     colors.secondary_foreground = foreground.clone();
     colors.secondary_hover = hover.clone();
-    colors.selection = theme_color(palette.selection);
+    colors.selection = theme_color(selection_ink(palette.selection, palette.input));
     colors.sidebar = panel.clone();
     colors.sidebar_accent = hover.clone();
     colors.sidebar_accent_foreground = foreground.clone();
@@ -932,7 +954,8 @@ pub(crate) fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, 
 mod tests {
     use super::{
         BODY, CjkLanguage, FontStack, InterfaceTheme, LINUX_FONTS, MAC_FONTS, MICRO, MONO,
-        TagColor, WINDOWS_FONTS, WORDMARK, cjk_fallbacks, mix, pick_family, tint,
+        SELECTION_WASH, TagColor, WINDOWS_FONTS, WORDMARK, cjk_fallbacks, mix, pick_family,
+        selection_ink, tint,
     };
 
     fn installed(names: &[&str]) -> Vec<String> {
@@ -1229,6 +1252,22 @@ mod tests {
         assert_eq!(mix(0x000000, 0xffffff, 0.5), 0x808080);
         assert_eq!(mix(0x0b0d11, 0xffffff, 0.06), 0x1a1c1f);
         assert_eq!(mix(0x102030, 0x304050, 2.), 0x304050, "amount is clamped");
+    }
+
+    /// The plate a field selects in is only as strong as the ink behind the
+    /// wash, so the two have to be read off each other rather than picked apart.
+    #[test]
+    fn a_field_washes_the_selection_ink_back_to_the_plate() {
+        for theme in [InterfaceTheme::Light, InterfaceTheme::Dark] {
+            let palette = theme.palette();
+            let ink = selection_ink(palette.selection, palette.input);
+            assert_eq!(
+                mix(palette.input, ink, SELECTION_WASH),
+                palette.selection,
+                "{} selects in its own plate",
+                theme.name()
+            );
+        }
     }
 
     #[test]

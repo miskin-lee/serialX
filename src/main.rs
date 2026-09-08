@@ -12,6 +12,7 @@ mod hex;
 mod highlight;
 mod icons;
 mod mask;
+mod panes;
 mod presets;
 mod serial;
 mod settings;
@@ -43,6 +44,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use icons::WorkbenchAssets;
+use panes::{Pane, SplitAxis};
 use presets::PresetStore;
 use serial::*;
 use sidebar::{
@@ -86,9 +88,22 @@ enum UpdateStatus {
 }
 
 pub struct SerialWorkspace {
+    /// Every open session, in the order they were opened. Which pane shows
+    /// which of them, and in what order, is the panes' business.
     tabs: Vec<SerialTabState>,
-    active_tab: usize,
     next_tab_id: usize,
+    /// The panes the sessions are shown in, in the order they stand. Never
+    /// empty: a workspace with nothing open is one pane showing the splash.
+    panes: Vec<Pane>,
+    /// The pane worked in last — the one the title bar, the composer and
+    /// the menus mean by "the session in front".
+    active_pane: usize,
+    next_pane_id: usize,
+    /// Which way the panes stand, while there is more than one of them.
+    split_axis: SplitAxis,
+    /// The sizes the seams between the panes were dragged to. Made afresh
+    /// whenever a pane is added or taken away, so a new split opens evenly.
+    pane_layout: Entity<ResizableState>,
     interface_theme: InterfaceTheme,
     presets: PresetStore,
     update_status: UpdateStatus,
@@ -116,29 +131,9 @@ pub struct SerialWorkspace {
     _send_subscription: Subscription,
     /// The search box over the Quick send list.
     command_search: ListSearch,
-    /// The terminal log as a place to type: while it holds focus, keys go to
-    /// the port of the tab in front.
-    terminal_focus: FocusHandle,
     /// Text an input method is still composing over the terminal. Nothing
     /// is sent until the composition is committed.
     composing: Option<String>,
-    /// The terminal's cell size as last laid out, for placing the input
-    /// method's candidate window under the cursor and for telling which
-    /// cell a press landed on.
-    terminal_metrics: TerminalMetrics,
-    /// Whether a selection is being dragged out over the terminal: from
-    /// the press that began it to the release that ends it.
-    selecting: bool,
-    /// While the scrollbar's thumb is held, how far down it the pointer
-    /// took hold, so the thumb rides under the same point of itself
-    /// rather than jumping its middle to the pointer.
-    scrollbar_grab: Option<f32>,
-    /// Whether the pointer is on the scrollbar's track, which brings the
-    /// thumb forward. Kept rather than drawn from a hover style, since the
-    /// thumb widens and a hover style is laid on after the layout.
-    scrollbar_hovered: bool,
-    /// Wheel travel short of a whole line, carried to the next event.
-    scroll_remainder: f32,
     /// The cursor's blink: whether it is in its visible half, whether a
     /// timer is running it, and which timer — a keystroke starts a new one
     /// and the old one, when it fires, sees it is stale and does nothing.
@@ -167,11 +162,16 @@ impl SerialWorkspace {
         );
 
         let command_search = ListSearch::new(window, cx);
+        let first_pane = Pane::new(0, cx);
 
         let workspace = Self {
             tabs: Vec::new(),
-            active_tab: 0,
             next_tab_id: 1,
+            panes: vec![first_pane],
+            active_pane: 0,
+            next_pane_id: 1,
+            split_axis: SplitAxis::Across,
+            pane_layout: cx.new(|_| ResizableState::default()),
             interface_theme,
             presets: PresetStore::load(),
             update_status: UpdateStatus::Checking,
@@ -188,13 +188,7 @@ impl SerialWorkspace {
             send_input,
             _send_subscription: send_subscription,
             command_search,
-            terminal_focus: cx.focus_handle(),
             composing: None,
-            terminal_metrics: TerminalMetrics::default(),
-            selecting: false,
-            scrollbar_grab: None,
-            scrollbar_hovered: false,
-            scroll_remainder: 0.,
             cursor_shown: true,
             blinking: false,
             blink_epoch: 0,
@@ -326,8 +320,14 @@ impl SerialWorkspace {
         .detach();
     }
 
+    /// The session in front: the front tab of the pane worked in last.
     fn active_tab(&self) -> Option<&SerialTabState> {
-        self.tabs.get(self.active_tab)
+        self.tab(self.active_tab_id()?)
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut SerialTabState> {
+        let id = self.active_tab_id()?;
+        self.tab_mut(id)
     }
 
     fn tab_index(&self, id: usize) -> Option<usize> {
@@ -347,13 +347,7 @@ impl SerialWorkspace {
             return;
         };
         self.tabs.remove(index);
-        if self.tabs.is_empty() {
-            self.active_tab = 0;
-        } else if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if index < self.active_tab {
-            self.active_tab -= 1;
-        }
+        self.forget_tab(id, cx);
         cx.notify();
     }
 
@@ -363,20 +357,31 @@ impl SerialWorkspace {
         }
     }
 
-    /// Moves to the tab on the left, if there is one. No wrapping: the arrow
-    /// that goes grey is what tells you where you are in the row.
+    /// Moves to the tab on the left of the strip in front, if there is
+    /// one. No wrapping: the arrow that goes grey is what tells you where
+    /// you are in the row. A split strip is a row of its own, so the
+    /// arrows walk the pane you are working in and stop at its ends.
     fn select_previous_tab(&mut self, cx: &mut Context<Self>) {
-        if self.active_tab > 0 && !self.tabs.is_empty() {
-            self.active_tab -= 1;
-            cx.notify();
-        }
+        self.step_through_strip(-1, cx);
     }
 
     fn select_next_tab(&mut self, cx: &mut Context<Self>) {
-        if self.active_tab + 1 < self.tabs.len() {
-            self.active_tab += 1;
-            cx.notify();
-        }
+        self.step_through_strip(1, cx);
+    }
+
+    fn step_through_strip(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some(index) = self.active_strip_position() else {
+            return;
+        };
+        let pane = self.active_pane_index();
+        let Some(next) = index
+            .checked_add_signed(step)
+            .filter(|next| *next < self.panes[pane].tabs.len())
+        else {
+            return;
+        };
+        self.panes[pane].active = self.panes[pane].tabs[next];
+        cx.notify();
     }
 
     /// Called as the filter box changes, so the matcher is compiled once per
@@ -391,7 +396,7 @@ impl SerialWorkspace {
     }
 
     fn toggle_filter_regex(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.filter.toggle_regex();
             tab.filter_changed();
             cx.notify();
@@ -399,7 +404,7 @@ impl SerialWorkspace {
     }
 
     fn toggle_filter_match_case(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.filter.toggle_match_case();
             tab.filter_changed();
             cx.notify();
@@ -410,7 +415,7 @@ impl SerialWorkspace {
     /// showing only them. The mask opens at the newest line, and what the
     /// find found is looked for again among the lines now shown.
     fn toggle_filter_mode(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.filter.toggle_mode();
             tab.mask.scroll_to_bottom();
             tab.find.forget();
@@ -426,7 +431,7 @@ impl SerialWorkspace {
     }
 
     fn refresh_ports(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if tab.connected || tab.connecting {
@@ -524,7 +529,7 @@ impl SerialWorkspace {
             return;
         }
 
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if !tab.connected {
@@ -559,7 +564,7 @@ impl SerialWorkspace {
     /// echoes back. A read-only tab takes nothing. Typing lets go of the
     /// selection, as it does in a terminal.
     fn type_into_terminal(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if !tab.connected || !tab.interactive || text.is_empty() {
@@ -604,8 +609,7 @@ impl SerialWorkspace {
                 if this.blink_epoch != epoch {
                     return;
                 }
-                let focused =
-                    this.terminal_focus.is_focused(window) && window.is_window_active();
+                let focused = this.terminal_in_focus(window);
                 if !focused || !this.cursor_blinks() {
                     this.blinking = false;
                     this.cursor_shown = true;
@@ -665,7 +669,7 @@ impl SerialWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return false;
         };
         if !tab.connected || !tab.interactive {
@@ -708,11 +712,16 @@ impl SerialWorkspace {
     /// clicked — or, with shift held, moves the end of the one there is.
     /// The drag that follows is watched from the terminal's paint, so it
     /// goes on when the pointer leaves the log.
-    fn terminal_mouse_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let metrics = self.terminal_metrics;
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+    fn terminal_mouse_down(
+        &mut self,
+        tab_id: usize,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
+        let metrics = tab.metrics;
         let Some(cell) = Self::cell_at(tab, metrics, event.position) else {
             return;
         };
@@ -722,21 +731,21 @@ impl SerialWorkspace {
             tab.terminal
                 .begin_selection(cell, SelectionKind::for_clicks(event.click_count));
         }
-        self.selecting = true;
+        tab.selecting = true;
         cx.notify();
     }
 
     /// The pointer moving with the button down: the selection's end
     /// follows it. Past the top or bottom of the log the view scrolls a
     /// line that way, so a drag can reach into the scrollback.
-    fn terminal_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        if !self.selecting {
-            return;
-        }
-        let metrics = self.terminal_metrics;
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+    fn terminal_drag(&mut self, tab_id: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
+        if !tab.selecting {
+            return;
+        }
+        let metrics = tab.metrics;
         let y = f32::from(position.y) - metrics.origin_y;
         let past_edge = if y < 0. {
             tab.scroll_view(1);
@@ -758,14 +767,15 @@ impl SerialWorkspace {
 
     /// The button released: the drag is over. A press that moved over
     /// nothing leaves nothing selected.
-    fn terminal_release(&mut self, cx: &mut Context<Self>) {
-        if !self.selecting {
+    fn terminal_release(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        if !tab.selecting {
             return;
         }
-        self.selecting = false;
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
-            && !tab.terminal.has_selection()
-        {
+        tab.selecting = false;
+        if !tab.terminal.has_selection() {
             tab.terminal.clear_selection();
         }
         cx.notify();
@@ -795,7 +805,7 @@ impl SerialWorkspace {
 
     /// Selects the whole log of the tab in front, for ⌘A.
     fn select_all_in_terminal(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.terminal.select_all();
             cx.notify();
         }
@@ -822,7 +832,7 @@ impl SerialWorkspace {
         if text.is_empty() {
             return;
         }
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if !tab.connected || !tab.interactive {
@@ -838,26 +848,12 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    /// Whether the log of the tab in front has anything selected to copy,
-    /// and whether what is typed at it reaches a device: what the log's
-    /// menu greys its items by.
-    pub(crate) fn terminal_has_selection(&self) -> bool {
-        self.active_tab()
-            .and_then(SerialTabState::selection_text)
-            .is_some()
-    }
-
-    pub(crate) fn terminal_takes_input(&self) -> bool {
-        self.active_tab()
-            .is_some_and(|tab| tab.connected && tab.interactive)
-    }
-
     /// A press on the scrollbar. On the thumb it takes hold of it at the
     /// point pressed, so the thumb does not jump its middle under the
     /// pointer; anywhere else on the track it brings the thumb there
     /// first, so one press both goes there and goes on dragging.
-    fn scrollbar_press(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(geometry) = self.scrollbar_geometry() else {
+    fn scrollbar_press(&mut self, tab_id: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(geometry) = self.scrollbar_geometry(tab_id) else {
             return;
         };
         let y = f32::from(position.y) - geometry.track_top;
@@ -866,23 +862,28 @@ impl SerialWorkspace {
         } else {
             geometry.thumb_height / 2.
         };
-        self.scrollbar_grab = Some(grab);
-        self.scroll_log_to(geometry.rows_above(y - grab), cx);
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.scrollbar_grab = Some(grab);
+        }
+        self.scroll_log_to(tab_id, geometry.rows_above(y - grab), cx);
     }
 
     /// The pointer moving with the thumb held: the view goes where the
     /// thumb is put.
-    fn scrollbar_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let (Some(grab), Some(geometry)) = (self.scrollbar_grab, self.scrollbar_geometry()) else {
+    fn scrollbar_drag(&mut self, tab_id: usize, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let grab = self.tab(tab_id).and_then(|tab| tab.scrollbar_grab);
+        let (Some(grab), Some(geometry)) = (grab, self.scrollbar_geometry(tab_id)) else {
             return;
         };
         let y = f32::from(position.y) - geometry.track_top;
-        self.scroll_log_to(geometry.rows_above(y - grab), cx);
+        self.scroll_log_to(tab_id, geometry.rows_above(y - grab), cx);
     }
 
     /// The button released: the thumb is let go.
-    fn scrollbar_release(&mut self, cx: &mut Context<Self>) {
-        if self.scrollbar_grab.take().is_some() {
+    fn scrollbar_release(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(tab_id)
+            && tab.scrollbar_grab.take().is_some()
+        {
             cx.notify();
         }
     }
@@ -890,8 +891,8 @@ impl SerialWorkspace {
     /// Puts the view in front where the thumb says. As with the wheel,
     /// leaving the bottom stops the view following new output, and
     /// returning to it resumes.
-    fn scroll_log_to(&mut self, above: usize, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+    fn scroll_log_to(&mut self, tab_id: usize, above: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
         tab.scroll_view_to(above);
@@ -902,16 +903,16 @@ impl SerialWorkspace {
     /// The wheel over the terminal moves through its scrollback. Scrolling
     /// up stops the view following new output, which would otherwise pull
     /// it straight back down; reaching the bottom again resumes following.
-    fn scroll_terminal(&mut self, delta_lines: f32, cx: &mut Context<Self>) {
-        self.scroll_remainder += delta_lines;
-        let lines = self.scroll_remainder.trunc() as i32;
+    fn scroll_terminal(&mut self, tab_id: usize, delta_lines: f32, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        tab.scroll_remainder += delta_lines;
+        let lines = tab.scroll_remainder.trunc() as i32;
         if lines == 0 {
             return;
         }
-        self.scroll_remainder -= lines as f32;
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
+        tab.scroll_remainder -= lines as f32;
         tab.scroll_view(lines);
         tab.auto_scroll = tab.view_at_bottom();
         cx.notify();
@@ -960,14 +961,14 @@ impl SerialWorkspace {
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.paused = !tab.paused;
             cx.notify();
         }
     }
 
     fn clear_terminal(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.clear_log();
             cx.notify();
         }
@@ -975,7 +976,7 @@ impl SerialWorkspace {
 
     /// Flips the composer between text and hex, for the menu's shortcut.
     fn toggle_hex(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.hex_mode = !tab.hex_mode;
             cx.notify();
         }
@@ -984,7 +985,7 @@ impl SerialWorkspace {
     /// Selects an encoding outright, for the segmented UTF-8 / HEX switch
     /// where each half names the mode it turns on rather than flipping it.
     fn set_hex_mode(&mut self, hex_mode: bool, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+        if let Some(tab) = self.active_tab_mut()
             && tab.hex_mode != hex_mode
         {
             tab.hex_mode = hex_mode;
@@ -995,7 +996,7 @@ impl SerialWorkspace {
     /// Sets what follows a sent line, for the composer's ending switch. The
     /// tab keeps one ending per encoding, so this sets the current one.
     fn set_line_ending(&mut self, ending: LineEnding, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab)
+        if let Some(tab) = self.active_tab_mut()
             && tab.line_ending() != ending
         {
             tab.set_line_ending(ending);
@@ -1004,7 +1005,7 @@ impl SerialWorkspace {
     }
 
     fn toggle_auto_scroll(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.auto_scroll = !tab.auto_scroll;
             if tab.auto_scroll {
                 tab.scroll_to_bottom();
@@ -1353,7 +1354,7 @@ impl EntityInputHandler for SerialWorkspace {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let metrics = self.terminal_metrics;
+        let metrics = self.active_tab().map(|tab| tab.metrics).unwrap_or_default();
         let (line, column) = self
             .active_tab()
             .and_then(|tab| tab.terminal.cursor_position())
@@ -1393,19 +1394,12 @@ impl SerialWorkspace {
 impl Render for SerialWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let palette = self.interface_theme.palette();
-        // The mask and the find are brought up to the log before the frame
-        // reads any of them.
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.refresh_mask();
-        }
+        // The mask and the find are brought up to every log on screen
+        // before the frame reads any of them.
         self.refresh_find(cx);
         let active_snapshot = self.active_tab().map(SerialTabSnapshot::from);
-        let tab_strip = self.render_tab_strip(active_snapshot.as_ref(), cx);
         let title_bar = self.render_title_bar(active_snapshot.as_ref(), cx);
-        let content = match active_snapshot.clone() {
-            Some(tab) => self.render_active_tab(tab, window, cx),
-            None => self.render_empty_state(window, cx),
-        };
+        let panes = self.render_panes(window, cx);
         // The panel's height, for the saved sessions list to take its share
         // of in pixels: a percentage of a flex parent resolves to nothing.
         let panel_height: f32 = window.viewport_size().height.into();
@@ -1424,8 +1418,7 @@ impl Render for SerialWorkspace {
             .h_full()
             .min_w_0()
             .min_h_0()
-            .children(tab_strip)
-            .child(content);
+            .child(panes);
 
         // Expanded, the panel's left edge is a drag handle; collapsed, the
         // rail is a fixed strip and there is nothing to drag.

@@ -1590,7 +1590,7 @@ impl SerialWorkspace {
             configuration.summary()
         ));
         self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.show_new_tab(id);
         cx.notify();
         id
     }

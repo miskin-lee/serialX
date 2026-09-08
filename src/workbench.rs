@@ -1,8 +1,11 @@
 //! The centre column: everything between the title bar and the window's
 //! bottom edge.
 //!
-//! The workbench is two stacked bands — the tab strip and the terminal log.
-//! The strip has a fixed height so the log is the only thing that grows.
+//! A pane of the workbench is two stacked bands — the tab strip and the
+//! terminal log. The strip has a fixed height so the log is the only thing
+//! that grows. Unsplit, that pane is the whole column; split, the column
+//! holds two or three of them side by side or one above the other, each
+//! with its own strip and its own log ([`crate::panes`] divides them).
 //! What acts on the session in front lives elsewhere: connect beside the
 //! filter in the title bar, and the composer at the foot of the side panel.
 
@@ -20,8 +23,8 @@ use gpui_kit::*;
 
 use crate::app_icon::application_icon_image;
 use crate::app_menu::{
-    CopyTerminalSelection, NewSerialTab, PasteIntoTerminal, SelectAllInTerminal, SendBackTab,
-    SendTab, TERMINAL_CONTEXT,
+    CopyTerminalSelection, JoinSplit, NewSerialTab, PasteIntoTerminal, SelectAllInTerminal,
+    SendBackTab, SendTab, SplitDown, SplitRight, TERMINAL_CONTEXT,
 };
 use crate::icons::Glyph;
 use crate::filter::{FilterMode, OutputFilter};
@@ -32,6 +35,7 @@ use crate::theme::{
     BODY, CAPTION, LABEL, MONO_SMALL, TerminalPalette, Typography, WORDMARK, WorkbenchPalette,
     fonts, tint,
 };
+use crate::panes::{DROP_TARGET_WASH, DraggedTab, SplitAxis};
 use crate::{SerialTabSnapshot, SerialTabState, SerialWorkspace};
 
 /// Height of the tab strip above the terminal: two under the title bar's,
@@ -87,6 +91,23 @@ const THUMB_HELD: f32 = 0.48;
 /// What the log says while the filter's mask keeps every line back.
 const MASK_EMPTY_HINT: &str = "No line matches the filter";
 
+/// Where a tab stands and what can be done with it there: its pane and
+/// its place in that pane's strip, whether it is the tab in front and
+/// whether that pane is the one being worked in, and — asked of the pane
+/// once, before its tabs are drawn — whether this strip has a session to
+/// spare for a pane of its own on each side, and whether there is a split
+/// to fold back.
+#[derive(Clone, Copy)]
+struct TabPlace {
+    pane: usize,
+    index: usize,
+    active: bool,
+    in_front: bool,
+    across: bool,
+    down: bool,
+    can_join: bool,
+}
+
 /// How the terminal's cells map to pixels, measured each frame from the
 /// mono font. Kept on the workspace so the input method's candidate window
 /// can be put under the cursor, and so a press on the log can be told
@@ -103,6 +124,8 @@ pub(crate) struct TerminalMetrics {
     /// The grid's size, as last fitted to the terminal.
     pub(crate) columns: usize,
     pub(crate) lines: usize,
+    /// How wide the log stands, which is its pane's width.
+    pub(crate) width: f32,
     /// How tall the log stands, which is the scrollbar's track.
     pub(crate) height: f32,
 }
@@ -160,26 +183,51 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    /// The band above the terminal: one tab per session, and the way to a
-    /// new one. Connecting is done beside the filter in the title bar, and
-    /// pausing, clearing and the log's switches live in the menus with their
-    /// shortcuts, so the strip holds nothing that is not about *which*
-    /// session.
+    /// The band above a pane's log: one tab per session it holds, and the
+    /// way to a new one. Connecting is done beside the filter in the title
+    /// bar, and pausing, clearing and the log's switches live in the menus
+    /// with their shortcuts, so the strip holds nothing that is not about
+    /// *which* session.
+    ///
+    /// Every pane has one, so a split reads as two workbenches side by
+    /// side rather than as one strip over two logs; the strip of the pane
+    /// not being worked in stands back, its front tab wearing the plate a
+    /// tab at rest wears.
     pub(crate) fn render_tab_strip(
         &mut self,
-        active: Option<&SerialTabSnapshot>,
+        pane: usize,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // No strip without a tab: the empty state has the whole column.
-        active?;
         let palette = self.interface_theme.palette();
-        let active_index = self.active_tab;
+        // No strip without a tab: the empty state has the whole column.
+        if self.panes[pane].tabs.is_empty() {
+            return None;
+        }
+        let in_front = pane == self.active_pane_index();
+        let front = self.panes[pane].active_tab();
+        let ids = self.panes[pane].tabs.clone();
+        let (across, down, can_join) = (
+            self.can_split_tab_toward(ids[0], SplitAxis::Across),
+            self.can_split_tab_toward(ids[0], SplitAxis::Down),
+            self.can_join(),
+        );
 
-        let tabs = self
-            .tabs
+        let tabs = ids
             .iter()
             .enumerate()
-            .map(|(index, tab)| Self::render_tab(index, tab, index == active_index, palette, cx))
+            .filter_map(|(index, id)| {
+                let tab = self.tab(*id)?;
+                let place = TabPlace {
+                    pane,
+                    index,
+                    active: front == Some(*id),
+                    in_front,
+                    across,
+                    down,
+                    can_join,
+                };
+                Some(Self::render_tab(place, tab, palette, cx))
+            })
             .collect::<Vec<_>>();
 
         Some(
@@ -194,18 +242,28 @@ impl SerialWorkspace {
                 .border_color(rgb(palette.border))
                 .child(
                     h_flex()
+                        .id(("strip", pane))
                         .flex_1()
                         .min_w_0()
                         .gap_1()
                         .items_center()
+                        // Past the last tab is the end of the row: a tab
+                        // dropped in the air beside them lands there.
+                        .drag_over::<DraggedTab>(move |style, _, _, _| {
+                            style.bg(tint(palette.accent, DROP_TARGET_WASH))
+                        })
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                            this.move_tab_to_pane(dragged.tab, pane, None, window, cx);
+                        }))
                         .children(tabs)
                         .child(
-                            Button::new("new-tab")
+                            Button::new(("new-tab", pane))
                                 .ghost()
                                 .with_size(px(TAB_HEIGHT))
                                 .icon(IconName::Plus)
                                 .tooltip_with_action("New session", &NewSerialTab, None)
-                                .on_click(cx.listener(|this, _, window, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_pane(pane);
                                     this.open_new_serial_tab_dialog(window, cx);
                                 })),
                         ),
@@ -228,12 +286,18 @@ impl SerialWorkspace {
     /// without the name changing colour. The dot keeps saying whether the
     /// port is open.
     fn render_tab(
-        index: usize,
+        place: TabPlace,
         tab: &SerialTabState,
-        active: bool,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let TabPlace {
+            pane,
+            index,
+            active,
+            in_front,
+            ..
+        } = place;
         let tab_id = tab.id;
         let name = tab.title().to_string();
         let detail: SharedString = format!(
@@ -253,6 +317,14 @@ impl SerialWorkspace {
         };
         let hue = palette.tag(tab.color);
         let group: SharedString = format!("session-tab-{tab_id}").into();
+        let dragged = DraggedTab {
+            tab: tab_id,
+            name: name.clone().into(),
+            hue,
+            status,
+            ink: palette.strong_foreground,
+            plate: palette.card,
+        };
 
         h_flex()
             .id(("session-tab", tab_id))
@@ -268,20 +340,41 @@ impl SerialWorkspace {
             .border_1()
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
-            .when(active, |tab| {
+            // Only the pane being worked in raises its front tab: two
+            // raised plates in two strips would both claim to be the
+            // session the title bar is speaking to.
+            .when(active && in_front, |tab| {
                 tab.bg(tint(hue, TAG_PLATE_ACTIVE))
                     .border_color(tint(hue, TAG_RING_ACTIVE))
             })
-            .when(!active, |tab| {
+            .when(!(active && in_front), |tab| {
                 tab.bg(tint(hue, TAG_PLATE_REST))
                     .border_color(transparent_black())
                     .hover(move |tab| tab.bg(tint(hue, TAG_PLATE_HOVER)))
             })
             .on_click(cx.listener(move |this, _, _, cx| {
-                if index < this.tabs.len() {
-                    this.active_tab = index;
-                    cx.notify();
+                this.select_pane(pane);
+                if let Some(pane) = this.panes.get_mut(pane) {
+                    pane.active = tab_id;
                 }
+                cx.notify();
+            }))
+            // A tab is dragged the way an editor's is: to another place in
+            // its own strip, or into another pane's, which is what moves a
+            // session across a split.
+            .on_drag(dragged, |dragged, _, _, cx| {
+                let dragged = dragged.clone();
+                cx.new(|_| dragged)
+            })
+            .drag_over::<DraggedTab>(move |style, dragged, _, _| {
+                if dragged.tab == tab_id {
+                    style
+                } else {
+                    style.border_l_2().border_color(rgb(palette.accent))
+                }
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                this.move_tab_to_pane(dragged.tab, pane, Some(index), window, cx);
             }))
             .child(Self::status_dot(6., status))
             .child(
@@ -290,8 +383,10 @@ impl SerialWorkspace {
                     .min_w_0()
                     .truncate()
                     .text_token(LABEL)
-                    .text_color(rgb(if active {
+                    .text_color(rgb(if active && in_front {
                         palette.strong_foreground
+                    } else if active {
+                        palette.foreground
                     } else {
                         palette.muted
                     }))
@@ -317,7 +412,74 @@ impl SerialWorkspace {
                             })),
                     ),
             )
+            .context_menu(Self::tab_menu(tab_id, place, cx))
             .into_any_element()
+    }
+
+    /// What a right-click on a tab offers: the two ways to hand this
+    /// session a pane of its own, the way back from a split, and the close
+    /// the cross beside the name does. The splits grey out when there is
+    /// nowhere to split to — one session in the strip, or three panes
+    /// already — so the menu says what the window can do rather than
+    /// failing quietly.
+    fn tab_menu(
+        tab_id: usize,
+        place: TabPlace,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let workspace = cx.weak_entity();
+        let TabPlace {
+            across,
+            down,
+            can_join,
+            ..
+        } = place;
+        move |menu, _, _| {
+            let (right, below, join, close) = (
+                workspace.clone(),
+                workspace.clone(),
+                workspace.clone(),
+                workspace.clone(),
+            );
+            menu.item(
+                PopupMenuItem::new("Split Right")
+                    .action(Box::new(SplitRight))
+                    .disabled(!across)
+                    .on_click(move |_, window, cx| {
+                        let _ = right.update(cx, |this, cx| {
+                            this.split_tab(tab_id, SplitAxis::Across, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Split Down")
+                    .action(Box::new(SplitDown))
+                    .disabled(!down)
+                    .on_click(move |_, window, cx| {
+                        let _ = below.update(cx, |this, cx| {
+                            this.split_tab(tab_id, SplitAxis::Down, window, cx);
+                        });
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Join Split")
+                    .action(Box::new(JoinSplit))
+                    .disabled(!can_join)
+                    .on_click(move |_, window, cx| {
+                        let _ = join.update(cx, |this, cx| {
+                            this.join_active_pane(window, cx);
+                        });
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Close Session").on_click(move |_, _, cx| {
+                    let _ = close.update(cx, |this, cx| {
+                        this.close_tab(tab_id, cx);
+                    });
+                }),
+            )
+        }
     }
 
     /// The terminal. It is a place to type as well as to read: a click gives
@@ -326,60 +488,89 @@ impl SerialWorkspace {
     /// composer does the sending; the wheel moves through the scrollback,
     /// and a drag selects, to be copied with ⌘C or pasted back at the
     /// device with ⌘V. A right-click offers the same three by name.
-    pub(crate) fn render_active_tab(
+    pub(crate) fn render_pane_log(
         &mut self,
+        pane: usize,
         tab: SerialTabSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
-        let focused = self.terminal_focus.is_focused(window) && window.is_window_active();
+        let focus = self.panes[pane].focus.clone();
+        let focused = focus.is_focused(window) && window.is_window_active();
         if focused && tab.interactive {
             self.start_blinking(window, cx);
         }
-        let terminal = self.render_terminal(&tab, focused, cx);
-        let scrollbar = self.render_scrollbar(cx);
-        let menu = self.terminal_menu(cx);
+        let tab_id = tab.id;
+        let terminal = self.render_terminal(&tab, pane, focused, cx);
+        let scrollbar = self.render_scrollbar(tab_id, cx);
+        let menu = self.terminal_menu(pane, cx);
         // The find bar floats over the log's top-right corner while it is
         // open, the way VS Code's find widget does.
         let find_bar = tab.find.open.then(|| self.render_find_bar(&tab, cx));
 
         v_flex()
+            .id(("pane-log", tab_id))
             .flex_1()
             .min_h_0()
             .bg(rgb(palette.editor))
             .overflow_hidden()
+            // A tab let go over a log joins that pane, at the end of its
+            // strip. The log washes over while the tab is held above it,
+            // so the pane that would take it says so before the release.
+            .drag_over::<DraggedTab>(move |style, _, _, _| {
+                style.bg(tint(palette.accent, DROP_TARGET_WASH))
+            })
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                this.move_tab_to_pane(dragged.tab, pane, None, window, cx);
+            }))
             .child(
                 div()
-                    .id("terminal")
+                    .id(("terminal", tab_id))
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .track_focus(&self.terminal_focus)
+                    .track_focus(&focus)
                     .key_context(TERMINAL_CONTEXT)
                     .cursor(CursorStyle::IBeam)
-                    .on_key_down(cx.listener(|this, event, window, cx| {
+                    // A key arriving here says which pane holds the
+                    // cursor, whatever was clicked last: what is typed
+                    // goes to the log it is typed at.
+                    .on_key_down(cx.listener(move |this, event, window, cx| {
+                        this.select_pane(pane);
                         this.terminal_key(event, window, cx)
                     }))
                     // Bound keys are matched before the key handler runs,
                     // so Tab arrives as an action of the log's own.
-                    .on_action(cx.listener(|this, _: &SendTab, window, cx| {
+                    .on_action(cx.listener(move |this, _: &SendTab, window, cx| {
+                        this.select_pane(pane);
                         this.type_tab(false, window, cx)
                     }))
-                    .on_action(cx.listener(|this, _: &SendBackTab, window, cx| {
+                    .on_action(cx.listener(move |this, _: &SendBackTab, window, cx| {
+                        this.select_pane(pane);
                         this.type_tab(true, window, cx)
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.terminal_mouse_down(event, cx)
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.select_pane(pane);
+                            this.terminal_mouse_down(tab_id, event, cx)
                         }),
                     )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    // The menu a right-click opens is this pane's, so the
+                    // press that opens it works here from then on.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.select_pane(pane);
+                            cx.notify();
+                        }),
+                    )
+                    .on_scroll_wheel(cx.listener(move |this, event: &ScrollWheelEvent, _, cx| {
                         let line_height = px(this.terminal_type().line_height);
                         let delta = event.delta.pixel_delta(line_height).y / line_height;
-                        this.scroll_terminal(delta, cx);
+                        this.scroll_terminal(tab_id, delta, cx);
                     }))
                     .child(terminal)
                     .children(scrollbar)
@@ -396,12 +587,17 @@ impl SerialWorkspace {
     /// keystroke, read in the log's own key context.
     fn terminal_menu(
         &self,
+        pane: usize,
         cx: &mut Context<Self>,
     ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let workspace = cx.weak_entity();
-        let focus = self.terminal_focus.clone();
-        let has_selection = self.terminal_has_selection();
-        let takes_input = self.terminal_takes_input();
+        let focus = self.panes[pane].focus.clone();
+        // What the items can do is asked of *this* pane's log, not of the
+        // one in front: a right-click in the pane beside you is about the
+        // log you right-clicked.
+        let tab = self.panes[pane].active_tab().and_then(|id| self.tab(id));
+        let has_selection = tab.and_then(SerialTabState::selection_text).is_some();
+        let takes_input = tab.is_some_and(|tab| tab.connected && tab.interactive);
         move |menu, _, _| {
             let (copy, paste, select_all) =
                 (workspace.clone(), workspace.clone(), workspace.clone());
@@ -412,6 +608,7 @@ impl SerialWorkspace {
                         .disabled(!has_selection)
                         .on_click(move |_, _, cx| {
                             let _ = copy.update(cx, |this, cx| {
+                                this.select_pane(pane);
                                 this.copy_terminal_selection(cx);
                             });
                         }),
@@ -422,6 +619,7 @@ impl SerialWorkspace {
                         .disabled(!takes_input)
                         .on_click(move |_, window, cx| {
                             let _ = paste.update(cx, |this, cx| {
+                                this.select_pane(pane);
                                 this.paste_into_terminal(window, cx);
                             });
                         }),
@@ -432,6 +630,7 @@ impl SerialWorkspace {
                         .action(Box::new(SelectAllInTerminal))
                         .on_click(move |_, _, cx| {
                             let _ = select_all.update(cx, |this, cx| {
+                                this.select_pane(pane);
                                 this.select_all_in_terminal(cx);
                             });
                         }),
@@ -455,6 +654,7 @@ impl SerialWorkspace {
     fn render_terminal(
         &mut self,
         tab: &SerialTabSnapshot,
+        pane: usize,
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -466,10 +666,10 @@ impl SerialWorkspace {
         let digits = self
             .tab(tab_id)
             .map_or(0, |tab| tab.terminal.number_digits());
-        let focus = self.terminal_focus.clone();
+        let focus = self.panes[pane].focus.clone();
         let composing = self.composing.clone();
         let cursor_shown = self.cursor_shown;
-        let selecting = self.selecting;
+        let selecting = self.tab(tab_id).is_some_and(|tab| tab.selecting);
         let interactive = tab.interactive;
         let fit = cx.entity();
         let paint = cx.entity();
@@ -483,17 +683,18 @@ impl SerialWorkspace {
                 let columns = columns.floor().max(0.) as usize;
                 let lines = lines.floor().max(0.) as usize;
                 fit.update(cx, |this, _| {
-                    this.terminal_metrics = TerminalMetrics {
-                        cell_width: f32::from(layout.cell_width),
-                        line_height: text.line_height,
-                        text_left: f32::from(layout.gutter),
-                        origin_x: f32::from(bounds.origin.x),
-                        origin_y: f32::from(bounds.origin.y),
-                        columns,
-                        lines,
-                        height: f32::from(bounds.size.height),
-                    };
                     if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.metrics = TerminalMetrics {
+                            cell_width: f32::from(layout.cell_width),
+                            line_height: text.line_height,
+                            text_left: f32::from(layout.gutter),
+                            origin_x: f32::from(bounds.origin.x),
+                            origin_y: f32::from(bounds.origin.y),
+                            columns,
+                            lines,
+                            width: f32::from(bounds.size.width),
+                            height: f32::from(bounds.size.height),
+                        };
                         tab.terminal.resize(columns, lines);
                     }
                 });
@@ -514,16 +715,16 @@ impl SerialWorkspace {
                             // between frames — shows as a move with the
                             // button up, and ends the drag the same.
                             if event.pressed_button == Some(MouseButton::Left) {
-                                this.terminal_drag(event.position, cx);
+                                this.terminal_drag(tab_id, event.position, cx);
                             } else {
-                                this.terminal_release(cx);
+                                this.terminal_release(tab_id, cx);
                             }
                         });
                     });
                     let release = paint.clone();
                     window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                         if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
-                            release.update(cx, |this, cx| this.terminal_release(cx));
+                            release.update(cx, |this, cx| this.terminal_release(tab_id, cx));
                         }
                     });
                 }
@@ -568,9 +769,10 @@ impl SerialWorkspace {
     /// last laid out in. Nothing while the whole log is on screen — there
     /// is nothing to scroll, and so no bar — or before the log has been
     /// laid out at all.
-    pub(crate) fn scrollbar_geometry(&self) -> Option<ScrollbarGeometry> {
-        let scroll = self.active_tab()?.view_scroll();
-        let track_height = self.terminal_metrics.height;
+    pub(crate) fn scrollbar_geometry(&self, tab_id: usize) -> Option<ScrollbarGeometry> {
+        let tab = self.tab(tab_id)?;
+        let scroll = tab.view_scroll();
+        let track_height = tab.metrics.height;
         if scroll.visible == 0 || scroll.total <= scroll.visible || track_height <= 0. {
             return None;
         }
@@ -583,7 +785,7 @@ impl SerialWorkspace {
         let thumb_top =
             (track_height - thumb_height) * (scroll.above as f32 / extent as f32).clamp(0., 1.);
         Some(ScrollbarGeometry {
-            track_top: self.terminal_metrics.origin_y,
+            track_top: tab.metrics.origin_y,
             track_height,
             thumb_top,
             thumb_height,
@@ -599,21 +801,23 @@ impl SerialWorkspace {
     /// thumb and brings it forward, and it can be thrown from one end of
     /// fifty thousand lines to the other in a single drag, which the wheel
     /// cannot. It is drawn only while there is more log than screen.
-    fn render_scrollbar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let Some(geometry) = self.scrollbar_geometry() else {
+    fn render_scrollbar(&mut self, tab_id: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Some(geometry) = self.scrollbar_geometry(tab_id) else {
             // A bar that has gone — the log cleared, the tab closed —
             // takes the pointer's hold on it with it, since there is
             // nothing left to see the release.
-            self.scrollbar_grab = None;
-            self.scrollbar_hovered = false;
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.scrollbar_grab = None;
+                tab.scrollbar_hovered = false;
+            }
             return None;
         };
         let palette = self.interface_theme.palette();
-        let held = self.scrollbar_grab.is_some();
+        let held = self.tab(tab_id).is_some_and(|tab| tab.scrollbar_grab.is_some());
         // The pointer's state is kept rather than left to a hover style:
         // a hover style is laid on at paint, after the layout that would
         // have to widen the thumb.
-        let near = held || self.scrollbar_hovered;
+        let near = held || self.tab(tab_id).is_some_and(|tab| tab.scrollbar_hovered);
         let ink = if held {
             THUMB_HELD
         } else if near {
@@ -621,11 +825,11 @@ impl SerialWorkspace {
         } else {
             THUMB_REST
         };
-        let watch = held.then(|| self.watch_scrollbar_drag(cx));
+        let watch = held.then(|| self.watch_scrollbar_drag(tab_id, cx));
 
         Some(
             div()
-                .id("terminal-scrollbar")
+                .id(("terminal-scrollbar", tab_id))
                 .absolute()
                 .top(px(TERMINAL_TOP_INSET))
                 .right_0()
@@ -636,16 +840,18 @@ impl SerialWorkspace {
                 // the bar neither focuses the log nor starts a selection
                 // in it, while the wheel over the bar still scrolls it.
                 .block_mouse_except_scroll()
-                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                    if this.scrollbar_hovered != *hovered {
-                        this.scrollbar_hovered = *hovered;
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if let Some(tab) = this.tab_mut(tab_id)
+                        && tab.scrollbar_hovered != *hovered
+                    {
+                        tab.scrollbar_hovered = *hovered;
                         cx.notify();
                     }
                 }))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.scrollbar_press(event.position, cx);
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.scrollbar_press(tab_id, event.position, cx);
                     }),
                 )
                 .child(
@@ -679,7 +885,7 @@ impl SerialWorkspace {
     /// rather than at the bar, so the drag goes on when the pointer leaves
     /// the track — sideways over the log, or past the window's edge — and
     /// the release that ends it can land anywhere.
-    fn watch_scrollbar_drag(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn watch_scrollbar_drag(&self, tab_id: usize, cx: &mut Context<Self>) -> AnyElement {
         let workspace = cx.entity();
         canvas(
             |_, _, _| (),
@@ -694,16 +900,16 @@ impl SerialWorkspace {
                         // between frames — shows as a move with the button
                         // up, and ends the drag the same.
                         if event.pressed_button == Some(MouseButton::Left) {
-                            this.scrollbar_drag(event.position, cx);
+                            this.scrollbar_drag(tab_id, event.position, cx);
                         } else {
-                            this.scrollbar_release(cx);
+                            this.scrollbar_release(tab_id, cx);
                         }
                     });
                 });
                 let release = workspace.clone();
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                     if phase == DispatchPhase::Capture && event.button == MouseButton::Left {
-                        release.update(cx, |this, cx| this.scrollbar_release(cx));
+                        release.update(cx, |this, cx| this.scrollbar_release(tab_id, cx));
                     }
                 });
             },

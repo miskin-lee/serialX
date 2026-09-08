@@ -10,6 +10,7 @@
 use gpui_kit::component::GlobalState;
 use gpui_kit::*;
 
+use crate::panes::SplitAxis;
 use crate::{REPOSITORY_URL, SerialWorkspace, theme::InterfaceTheme};
 
 actions!(
@@ -27,6 +28,9 @@ actions!(
         ToggleSidePanel,
         PreviousTab,
         NextTab,
+        SplitRight,
+        SplitDown,
+        JoinSplit,
         FocusOutputFilter,
         FindInOutput,
         FindNext,
@@ -72,6 +76,12 @@ keystroke!(HEX_KEYSTROKE, "cmd-shift-h", "ctrl-shift-h");
 keystroke!(AUTO_SCROLL_KEYSTROKE, "cmd-shift-a", "ctrl-shift-a");
 keystroke!(THEME_KEYSTROKE, "cmd-shift-l", "ctrl-shift-l");
 keystroke!(SIDE_PANEL_KEYSTROKE, "cmd-b", "ctrl-b");
+// Splitting follows VS Code's editor split: ⌘\ beside, and the same with
+// shift below. Folding a split back has no key of its own — it is the menu
+// item and the button in the title bar, and closing a pane's last session
+// does it anyway.
+keystroke!(SPLIT_RIGHT_KEYSTROKE, "cmd-\\", "ctrl-\\");
+keystroke!(SPLIT_DOWN_KEYSTROKE, "cmd-shift-\\", "ctrl-shift-\\");
 // Tab navigation follows VS Code's editor bindings on each platform.
 keystroke!(PREVIOUS_TAB_KEYSTROKE, "cmd-shift-[", "ctrl-pageup");
 keystroke!(NEXT_TAB_KEYSTROKE, "cmd-shift-]", "ctrl-pagedown");
@@ -150,6 +160,10 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::action("Send as HEX", ToggleHex),
             MenuItem::action("Toggle Auto-scroll", ToggleAutoScroll),
             MenuItem::separator(),
+            MenuItem::action("Split Right", SplitRight),
+            MenuItem::action("Split Down", SplitDown),
+            MenuItem::action("Join Split", JoinSplit),
+            MenuItem::separator(),
             MenuItem::action("Toggle Side Panel", ToggleSidePanel),
             MenuItem::separator(),
             // The submenu names the two themes and nothing else: picking one
@@ -226,6 +240,8 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new(AUTO_SCROLL_KEYSTROKE, ToggleAutoScroll, None),
         KeyBinding::new(THEME_KEYSTROKE, ToggleTheme, None),
         KeyBinding::new(SIDE_PANEL_KEYSTROKE, ToggleSidePanel, None),
+        KeyBinding::new(SPLIT_RIGHT_KEYSTROKE, SplitRight, None),
+        KeyBinding::new(SPLIT_DOWN_KEYSTROKE, SplitDown, None),
         KeyBinding::new(PREVIOUS_TAB_KEYSTROKE, PreviousTab, None),
         KeyBinding::new(NEXT_TAB_KEYSTROKE, NextTab, None),
         KeyBinding::new(FIND_KEYSTROKE, FindInOutput, None),
@@ -307,6 +323,27 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &ClearTerminal, cx| {
         let _ = view.update(cx, |view, cx| view.clear_terminal(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &SplitRight, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.split_active_tab(SplitAxis::Across, window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &SplitDown, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.split_active_tab(SplitAxis::Down, window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &JoinSplit, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.join_active_pane(window, cx);
+        });
     });
 
     let view = workspace.downgrade();

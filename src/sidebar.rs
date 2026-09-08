@@ -326,12 +326,13 @@ impl SerialWorkspace {
         };
         self.selected_saved = Some(saved_id);
 
-        if let Some(index) = self
+        if let Some(open) = self
             .tabs
             .iter()
-            .position(|tab| tab.selected_port().name == saved.port_name)
+            .find(|tab| tab.selected_port().name == saved.port_name)
+            .map(|tab| tab.id)
         {
-            self.active_tab = index;
+            self.reveal_tab(open, window, cx);
             cx.notify();
             return;
         }
@@ -362,7 +363,7 @@ impl SerialWorkspace {
         }
         tab.note(format!("Restored saved session: {}", saved.label));
         self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
+        self.show_new_tab(id);
         self.connect_if_attached(id, cx);
         cx.notify();
     }

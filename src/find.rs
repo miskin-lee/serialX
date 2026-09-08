@@ -252,7 +252,7 @@ impl SerialWorkspace {
     /// regular expressions — and the occurrence selected is the one in
     /// hand, so the view stays where it is.
     pub(crate) fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         tab.find.open = true;
@@ -292,10 +292,11 @@ impl SerialWorkspace {
     /// Puts the bar away and hands focus back to the terminal. What was
     /// typed stays in the box for the next time.
     pub(crate) fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.find.open = false;
         }
-        window.focus(&self.terminal_focus, cx);
+        let focus = self.active_pane().focus.clone();
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -316,7 +317,7 @@ impl SerialWorkspace {
     }
 
     pub(crate) fn toggle_find_match_case(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.find.matcher.toggle_match_case();
             tab.find.forget();
             self.find_step(None, cx);
@@ -324,7 +325,7 @@ impl SerialWorkspace {
     }
 
     pub(crate) fn toggle_find_regex(&mut self, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+        if let Some(tab) = self.active_tab_mut() {
             tab.find.matcher.toggle_regex();
             tab.find.forget();
             self.find_step(None, cx);
@@ -335,7 +336,7 @@ impl SerialWorkspace {
     /// the next or the previous occurrence; either way the terminal
     /// scrolls to whatever the find lands on.
     pub(crate) fn find_step(&mut self, forward: Option<bool>, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+        let Some(tab) = self.active_tab_mut() else {
             return;
         };
         tab.refresh_mask();
@@ -356,16 +357,22 @@ impl SerialWorkspace {
     /// when the grid has changed and the interval allows, and when it may
     /// not yet, arranges for a frame once it may.
     pub(crate) fn refresh_find(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
-            return;
-        };
-        tab.refresh_mask();
-        let owed = tab
-            .find
-            .refresh(&tab.terminal, tab.filter.masking().then_some(&tab.mask), false);
-        if let Some(span) = tab.find.take_landing() {
-            tab.reveal_line(span.line);
-            tab.auto_scroll = tab.view_at_bottom();
+        // Every log on screen, not only the one in front: a split shows
+        // two, and a find left open in the pane beside you goes on
+        // counting what arrives in it.
+        let mut owed = false;
+        for tab_id in self.visible_tabs() {
+            let Some(tab) = self.tab_mut(tab_id) else {
+                continue;
+            };
+            tab.refresh_mask();
+            owed |= tab
+                .find
+                .refresh(&tab.terminal, tab.filter.masking().then_some(&tab.mask), false);
+            if let Some(span) = tab.find.take_landing() {
+                tab.reveal_line(span.line);
+                tab.auto_scroll = tab.view_at_bottom();
+            }
         }
         if owed && !self.find_refresh_pending {
             self.find_refresh_pending = true;

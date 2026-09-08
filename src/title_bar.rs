@@ -5,11 +5,13 @@
 //! right, the connect switch with the session's byte counters beside it —
 //! what belongs to the session in front of you, side by side, and all of it
 //! changing with the tab. It is sized the way VS Code sizes its own. Right,
-//! one switch: the side panel. Left, only what the platform puts there —
-//! the traffic lights on macOS, the application menus elsewhere. Which
-//! session is in front of you is said by its tab, and the ways to any other
-//! session are the tab strip, the side panel and the Session menu; a pill
-//! here saying it again would only be a second thing to look at.
+//! the switches for how the window is divided: the split, the way back from
+//! one while there is one, and the side panel. Left, only what the platform
+//! puts there — the traffic lights on macOS, the application menus
+//! elsewhere. Which session is in front of you is said by its tab, and the
+//! ways to any other session are the tab strip, the side panel and the
+//! Session menu; a pill here saying it again would only be a second thing
+//! to look at.
 //!
 //! The bar is a little taller than the component default so its pills have
 //! room to be pills, and it is painted with a faint top light rather than a
@@ -31,7 +33,10 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::app_menu::{NextTab, PreviousTab, ToggleConnection, ToggleSidePanel};
+use crate::app_menu::{
+    JoinSplit, NextTab, PreviousTab, SplitRight, ToggleConnection, ToggleSidePanel,
+};
+use crate::panes::{MAX_PANES, SplitAxis};
 use crate::filter::FilterMode;
 use crate::icons::Glyph;
 use crate::theme::{LABEL, MICRO, Typography, WorkbenchPalette, mix, tint};
@@ -99,8 +104,22 @@ impl SerialWorkspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let palette = self.interface_theme.palette();
-        let has_previous = self.active_tab > 0 && !self.tabs.is_empty();
-        let has_next = self.active_tab + 1 < self.tabs.len();
+        // What the split switch offers, and — when it offers nothing —
+        // which of the three reasons to say so in its tooltip.
+        let can_split = self.can_split_toward(SplitAxis::Across);
+        let split_reason = if can_split {
+            "Show this session beside the others"
+        } else if self.panes.len() >= MAX_PANES {
+            "The window is divided as far as it goes"
+        } else if self.active_pane().tabs.len() < 2 {
+            "Open a second session to show one beside the other"
+        } else {
+            "The window is too narrow for another pane"
+        };
+        let strip = self.active_pane().tabs.len();
+        let position = self.active_strip_position();
+        let has_previous = position.is_some_and(|index| index > 0);
+        let has_next = position.is_some_and(|index| index + 1 < strip);
         let filter_box = match active {
             Some(tab) => self.render_filter_box(tab, cx),
             None => Self::render_idle_filter_box(palette),
@@ -173,6 +192,41 @@ impl SerialWorkspace {
             .when(cfg!(target_os = "macos"), |column| {
                 column.flex_basis(px(TRAFFIC_LIGHT_INSET))
             })
+            // Splitting stands beside the panel switch: both are about how
+            // the window is divided, not about what is in it.
+            .when(self.can_join(), |column| {
+                column.child(
+                    keeps_its_press(
+                        Button::new("title-join-split")
+                            .ghost()
+                            .with_size(px(CONTROL_HEIGHT))
+                            .icon(Glyph::Join)
+                            .tooltip_with_action(
+                                "Fold this pane back into the others",
+                                &JoinSplit,
+                                None,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.join_active_pane(window, cx);
+                            })),
+                    )
+                    .flex_none(),
+                )
+            })
+            .child(
+                keeps_its_press(
+                    Button::new("title-split")
+                        .ghost()
+                        .with_size(px(CONTROL_HEIGHT))
+                        .icon(Glyph::Split)
+                        .disabled(!can_split)
+                        .tooltip_with_action(split_reason, &SplitRight, None)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.split_active_tab(SplitAxis::Across, window, cx);
+                        })),
+                )
+                .flex_none(),
+            )
             .child(
                 keeps_its_press(
                     Button::new("title-side-panel")

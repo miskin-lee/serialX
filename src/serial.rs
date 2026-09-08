@@ -19,6 +19,7 @@ use crate::hex::{HexDump, LogView};
 use crate::mask::MaskState;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
+use crate::workbench::TerminalMetrics;
 
 /// The rates the session dialog lists. Any other rate can be typed in; these
 /// are the ones a device is most likely to want.
@@ -270,6 +271,23 @@ pub(crate) struct SerialTabState {
     pub(crate) connected: bool,
     pub(crate) connecting: bool,
     pub(crate) paused: bool,
+    /// How this tab's log stands on screen, measured each frame it is
+    /// drawn. A tab is shown by one pane at a time, so its metrics — and
+    /// the pointer's hold on its selection and its scrollbar below — are
+    /// the tab's own, and two panes side by side each keep their place.
+    pub(crate) metrics: TerminalMetrics,
+    /// Whether a selection is being dragged out over this log.
+    pub(crate) selecting: bool,
+    /// While the scrollbar's thumb is held, how far down it the pointer
+    /// took hold, so the thumb rides under the same point of itself
+    /// rather than jumping its middle to the pointer.
+    pub(crate) scrollbar_grab: Option<f32>,
+    /// Whether the pointer is on the scrollbar's track, which brings the
+    /// thumb forward. Kept rather than drawn from a hover style, since the
+    /// thumb widens and a hover style is laid on after the layout.
+    pub(crate) scrollbar_hovered: bool,
+    /// Wheel travel short of a whole line, carried to the next event.
+    pub(crate) scroll_remainder: f32,
     /// How many bytes have come off the port and how many have gone out
     /// on it, since the tab was opened or the log last cleared. Kept per
     /// tab: the title bar reads the counts of the session in front.
@@ -327,6 +345,11 @@ impl SerialTabState {
             connected: false,
             connecting: false,
             paused: false,
+            metrics: TerminalMetrics::default(),
+            selecting: false,
+            scrollbar_grab: None,
+            scrollbar_hovered: false,
+            scroll_remainder: 0.,
             rx_bytes: 0,
             tx_bytes: 0,
             hex_mode: false,

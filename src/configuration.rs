@@ -34,7 +34,7 @@
 use std::{
     cell::Cell,
     rc::Rc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use gpui_kit::component::{
@@ -176,15 +176,37 @@ enum ConfigurationTarget {
 }
 
 /// The colour to offer a new session, given the colours of the open tabs:
-/// the first in picker order that none of them wears, and once every colour
-/// is taken, the picker wraps around by how many tabs there are.
+/// one none of them wears, drawn at random rather than in picker order, so
+/// a run of new sessions comes out a spread of hues instead of the first
+/// few of the strip. Once every colour is taken, any of them.
 fn suggest_tag(used: impl Iterator<Item = TagColor>) -> TagColor {
+    pick_tag(used, tag_roll())
+}
+
+/// The pick itself, given the number drawn, so what it does with a full
+/// strip and an empty one can be checked without the clock.
+fn pick_tag(used: impl Iterator<Item = TagColor>, roll: usize) -> TagColor {
     let used = used.collect::<Vec<_>>();
-    TagColor::HUES
+    let free = TagColor::HUES
         .iter()
         .copied()
-        .find(|color| !used.contains(color))
-        .unwrap_or(TagColor::HUES[used.len() % TagColor::HUES.len()])
+        .filter(|color| !used.contains(color))
+        .collect::<Vec<_>>();
+    let pool = if free.is_empty() {
+        &TagColor::HUES[..]
+    } else {
+        &free[..]
+    };
+    pool[roll % pool.len()]
+}
+
+/// The number to draw with. A colour is not worth a dependency for its
+/// entropy: the nanoseconds of the moment the dialog opens are as unrelated
+/// to the last session's as this asks for.
+fn tag_roll() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos() as usize)
 }
 
 /// The frame parameters: the ones picked from a fixed list. The baud rate is
@@ -1516,7 +1538,7 @@ mod tests {
     use super::{
         DIALOG_FIXED_HEIGHT, DIALOG_MAX_HEIGHT_FRACTION, PORT_ROW_HEIGHT, SWATCH_COLUMNS,
         SWATCH_GAP, SWATCH_ROWS, SWATCH_TARGET, TAG_BLOCK_HEIGHT, TAG_HUE_COUNT, TagColor,
-        port_list_height, suggest_tag,
+        pick_tag, port_list_height,
     };
 
     /// A tall window shows up to four rows, and a list that fits is exactly
@@ -1558,18 +1580,34 @@ mod tests {
         assert_eq!(TAG_BLOCK_HEIGHT, 2. * SWATCH_TARGET + SWATCH_GAP);
     }
 
-    /// A new session takes the first free colour, and never a used one while
-    /// a free one is left.
+    /// A new session is never offered a colour a tab already wears while a
+    /// free one is left, wherever the draw falls; with the strip full it
+    /// takes any of them.
     #[test]
     fn a_new_session_is_offered_a_colour_no_tab_wears() {
-        assert_eq!(suggest_tag([].into_iter()), TagColor::Red);
+        let used = [TagColor::Red, TagColor::Amber];
+        for roll in 0..2 * TAG_HUE_COUNT {
+            let picked = pick_tag(used.into_iter(), roll);
+            assert!(!used.contains(&picked), "{roll} picked a colour in use");
+        }
+        assert_eq!(pick_tag([].into_iter(), 0), TagColor::HUES[0]);
         assert_eq!(
-            suggest_tag([TagColor::Red, TagColor::Amber].into_iter()),
-            TagColor::Orange
+            pick_tag([TagColor::HUES[0]].into_iter(), 0),
+            TagColor::HUES[1]
         );
-        let all = TagColor::HUES.into_iter();
-        assert_eq!(suggest_tag(all), TagColor::Red);
-        let all_and_one = TagColor::HUES.into_iter().chain([TagColor::Red]);
-        assert_eq!(suggest_tag(all_and_one), TagColor::Orange);
+        let all = || TagColor::HUES.into_iter();
+        assert_eq!(pick_tag(all(), 3), TagColor::HUES[3]);
+        assert_eq!(pick_tag(all(), TAG_HUE_COUNT), TagColor::HUES[0]);
+    }
+
+    /// The draw reaches every hue rather than clustering on a few.
+    #[test]
+    fn the_draw_spreads_over_the_whole_strip() {
+        let drawn = (0..TAG_HUE_COUNT)
+            .map(|roll| pick_tag([].into_iter(), roll))
+            .collect::<Vec<_>>();
+        for color in TagColor::HUES {
+            assert!(drawn.contains(&color), "{color:?} is never drawn");
+        }
     }
 }

@@ -273,8 +273,9 @@ impl SerialWorkspace {
 
     /// One tab: a status dot, its name — the alias it was given, else the
     /// port's path — and a close mark that shows on the active tab and on
-    /// hover; the port and its parameters are in the tooltip, so a named tab
-    /// still tells you what it is plugged into. The active tab is a raised plate and the
+    /// hover; the port and its parameters are in the tooltip, along with
+    /// whether the log is a dump, read-only, or being written to a file, so
+    /// a named tab still tells you what it is plugged into. The active tab is a raised plate and the
     /// others sit nearly flat on the strip until pointed at — the rule the
     /// segmented switches follow, so every exclusive choice in the workbench
     /// reads the same way. Tabs share the strip: when it fills, they shrink
@@ -300,11 +301,14 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let name = tab.title().to_string();
         let detail: SharedString = format!(
-            "{} · {}{}{}",
+            "{} · {}{}{}{}",
             tab.selected_port().name,
             tab.configuration.summary(),
             if tab.view.is_hex() { " · hex" } else { "" },
-            if tab.interactive { "" } else { " · read-only" }
+            if tab.interactive { "" } else { " · read-only" },
+            // The live state, not the switch: it says a file is being
+            // written now, which is what you hover a recording tab to ask.
+            if tab.recording() { " · recording" } else { "" }
         )
         .into();
         let status = if tab.connected {

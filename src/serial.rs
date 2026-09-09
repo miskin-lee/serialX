@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Write},
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,6 +18,7 @@ use crate::filter::OutputFilter;
 use crate::find::{FindState, FindView};
 use crate::hex::{HexDump, LogView};
 use crate::mask::MaskState;
+use crate::recorder::Recorder;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
 use crate::workbench::TerminalMetrics;
@@ -266,6 +268,11 @@ pub(crate) struct SerialTabState {
     /// How the log reads what arrives: as the text the device drew, or as
     /// a hex dump of the bytes it sent.
     pub(crate) view: LogView,
+    /// Whether the session keeps a file of what the device says, chosen in
+    /// the session dialog: a file of its own for every connection.
+    pub(crate) record: bool,
+    /// The file this connection is being written to, while one is open.
+    recorder: Option<Recorder>,
     /// The dump's half-filled row, while the view is the hex one.
     dump: HexDump,
     pub(crate) connected: bool,
@@ -341,6 +348,8 @@ impl SerialTabState {
             group: None,
             interactive: true,
             view: LogView::default(),
+            record: false,
+            recorder: None,
             dump: HexDump::default(),
             connected: false,
             connecting: false,
@@ -460,6 +469,67 @@ impl SerialTabState {
         }
     }
 
+    /// Opens the file this connection is recorded into, when the session
+    /// records, and says in the log where it went — or why there is none.
+    /// One connection is one file, so this is called each time the port
+    /// opens rather than once for the tab.
+    pub(crate) fn begin_recording(&mut self, folder: Option<&Path>) {
+        if !self.record {
+            return;
+        }
+        let Some(folder) = folder else {
+            self.note("Recording: nowhere to write. Choose a folder in Settings.");
+            return;
+        };
+        let title = self.title().to_string();
+        match Recorder::start(folder, &title) {
+            Ok(recorder) => {
+                let path = recorder.path().display().to_string();
+                self.recorder = Some(recorder);
+                self.note(format!("Recording to {path}"));
+            }
+            Err(error) => self.note(format!("Recording failed: {error}")),
+        }
+    }
+
+    /// Closes the recording, if there is one: the file is a connection's,
+    /// and the next one starts a file of its own.
+    pub(crate) fn end_recording(&mut self) {
+        if let Some(mut recorder) = self.recorder.take() {
+            let _ = recorder.flush();
+        }
+    }
+
+    /// Writes what the port read into the recording. Called for everything
+    /// that arrives, a paused log included: the file is what the device
+    /// said, not what the screen was showing. A write that fails — a full
+    /// disk, a volume pulled out — ends the recording, said once.
+    pub(crate) fn record_received(&mut self, bytes: &[u8]) {
+        let Some(recorder) = self.recorder.as_mut() else {
+            return;
+        };
+        if let Err(error) = recorder.write(bytes) {
+            self.recorder = None;
+            self.note(format!("Recording stopped: {error}"));
+        }
+    }
+
+    /// Puts what has been written where a reader would find it, once a
+    /// batch of reads is in.
+    pub(crate) fn flush_recording(&mut self) {
+        if let Some(recorder) = self.recorder.as_mut()
+            && let Err(error) = recorder.flush()
+        {
+            self.recorder = None;
+            self.note(format!("Recording stopped: {error}"));
+        }
+    }
+
+    /// Whether this session is writing to a file right now.
+    pub(crate) fn recording(&self) -> bool {
+        self.recorder.is_some()
+    }
+
     /// Counts what the port read. Called for everything that arrives,
     /// including while the log is paused: the counter is what the link
     /// carried, so it keeps ticking to say the device is still talking
@@ -493,6 +563,7 @@ impl SerialTabState {
         if let Some(tx) = self.command_tx.take() {
             let _ = tx.send(SerialCommand::Stop);
         }
+        self.end_recording();
         self.connected = false;
         self.connecting = false;
     }

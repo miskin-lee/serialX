@@ -14,6 +14,7 @@ mod icons;
 mod mask;
 mod panes;
 mod presets;
+mod recorder;
 mod serial;
 mod settings;
 mod sidebar;
@@ -943,6 +944,15 @@ impl SerialWorkspace {
         events: Vec<SerialEvent>,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Where a session that records writes, read before the tab is held:
+        // the folder is the workbench's, the file the session's. Only a
+        // batch that opens the port needs it, which is not the batch a
+        // streaming device arrives in.
+        let folder = events
+            .iter()
+            .any(|event| matches!(event, SerialEvent::Connected))
+            .then(|| recorder::recordings_folder(self.presets.settings.recording_root()))
+            .flatten();
         let Some(tab) = self.tab_mut(tab_id) else {
             return false;
         };
@@ -955,9 +965,11 @@ impl SerialWorkspace {
                     tab.connecting = false;
                     tab.connected = true;
                     tab.note("Serial port opened; receiving data.");
+                    tab.begin_recording(folder.as_deref());
                 }
                 SerialEvent::Data(bytes) => {
                     tab.count_received(bytes.len());
+                    tab.record_received(&bytes);
                     if !tab.paused {
                         tab.receive(&bytes);
                     }
@@ -968,6 +980,7 @@ impl SerialWorkspace {
                 }
             }
         }
+        tab.flush_recording();
         if tab.auto_scroll {
             tab.scroll_to_bottom();
         }

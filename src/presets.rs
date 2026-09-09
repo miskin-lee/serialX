@@ -1,4 +1,7 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +45,11 @@ pub(crate) struct StoredSession {
     /// session could be a hex dump, when every log was text.
     #[serde(default)]
     pub(crate) view: LogView,
+    /// Whether the session keeps a file of what its device says, one per
+    /// connection. Absent in files written before a session could record,
+    /// when none did.
+    #[serde(default)]
+    pub(crate) record: bool,
 }
 
 /// What a session's `interactive` is when the file does not say: on.
@@ -128,7 +136,7 @@ pub(crate) fn usable_font_size(size: f32) -> f32 {
 
 /// What is the workbench's to set rather than a session's, kept in the
 /// same file as the presets.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Settings {
     /// Lines kept above the screen to scroll back through, per terminal.
     #[serde(default = "default_scrollback_lines")]
@@ -137,6 +145,18 @@ pub(crate) struct Settings {
     /// the gutters follow it, so the whole log grows together.
     #[serde(default = "default_terminal_font_size")]
     pub(crate) terminal_font_size: f32,
+    /// The folder the recordings keep their tree in, when one has been
+    /// chosen; nothing leaves them in the account's documents. Absent in
+    /// files written before a session could record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) recording_root: Option<PathBuf>,
+}
+
+impl Settings {
+    /// The folder chosen for recordings, if one was.
+    pub(crate) fn recording_root(&self) -> Option<&Path> {
+        self.recording_root.as_deref()
+    }
 }
 
 impl Default for Settings {
@@ -144,6 +164,7 @@ impl Default for Settings {
         Self {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            recording_root: None,
         }
     }
 }
@@ -229,6 +250,7 @@ impl PresetStore {
         group: Option<u64>,
         interactive: bool,
         view: LogView,
+        record: bool,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.label == label) {
@@ -239,6 +261,7 @@ impl PresetStore {
             saved.group = group;
             saved.interactive = interactive;
             saved.view = view;
+            saved.record = record;
         } else {
             let id = self.take_id();
             self.sessions.push(StoredSession {
@@ -251,6 +274,7 @@ impl PresetStore {
                 group,
                 interactive,
                 view,
+                record,
             });
         }
         self.persist();
@@ -272,6 +296,7 @@ impl PresetStore {
         group: Option<u64>,
         interactive: bool,
         view: LogView,
+        record: bool,
     ) {
         let group = self.resolve_group(Library::Sessions, group);
         if let Some(saved) = self.sessions.iter_mut().find(|saved| saved.id == id) {
@@ -283,6 +308,7 @@ impl PresetStore {
             saved.group = group;
             saved.interactive = interactive;
             saved.view = view;
+            saved.record = record;
             self.persist();
         }
     }
@@ -543,6 +569,7 @@ mod tests {
         PresetStore, Settings, TagColor,
     };
     use crate::SerialConfiguration;
+    use std::path::{Path, PathBuf};
 
     /// A file from before there were settings comes up with the defaults,
     /// and a setting written down comes back.
@@ -553,15 +580,51 @@ mod tests {
         assert_eq!(store.settings.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
         assert_eq!(store.settings.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
 
+        assert_eq!(store.settings.recording_root(), None);
+
         let mut store = PresetStore::default();
         store.set_settings(Settings {
             scrollback_lines: 1_234,
             terminal_font_size: 16.,
+            recording_root: Some(PathBuf::from("/Users/someone/Desktop")),
         });
         let json = serde_json::to_string(&store).unwrap();
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.settings.scrollback_lines, 1_234);
         assert_eq!(restored.settings.terminal_font_size, 16.);
+        assert_eq!(
+            restored.settings.recording_root(),
+            Some(Path::new("/Users/someone/Desktop"))
+        );
+    }
+
+    /// A session saved before there was recording does not record, and one
+    /// that does says so in the file.
+    #[test]
+    fn recording_is_kept_with_the_session() {
+        let json = r#"{"sessions":[{"id":7,"label":"/dev/tty.usb · 115200 8N1",
+            "port_name":"/dev/tty.usb","configuration":{"baud_rate":115200,
+            "data_bits_index":3,"stop_bits_index":0,"parity_index":0,
+            "flow_control_index":0}}],"commands":[],"next_id":8}"#;
+        let store: PresetStore = serde_json::from_str(json).unwrap();
+        assert!(!store.sessions[0].record);
+
+        let mut store = PresetStore::default();
+        store.add_session(
+            "/dev/tty.a · 115200 8N1".into(),
+            "/dev/tty.a".into(),
+            SerialConfiguration::default(),
+            TagColor::Red,
+            None,
+            None,
+            true,
+            LogView::Text,
+            true,
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        assert!(json.contains(r#""record":true"#));
+        let restored: PresetStore = serde_json::from_str(&json).unwrap();
+        assert!(restored.sessions[0].record);
     }
 
     #[test]
@@ -625,6 +688,7 @@ mod tests {
             None,
             false,
             LogView::Hex,
+            true,
         );
         let json = serde_json::to_string(&store).unwrap();
         assert!(json.contains(r#""color":"teal""#));
@@ -645,6 +709,7 @@ mod tests {
             None,
             true,
             LogView::Text,
+            false,
         );
         assert!(!serde_json::to_string(&store).unwrap().contains("alias"));
     }
@@ -666,6 +731,7 @@ mod tests {
             Some(group),
             true,
             LogView::Text,
+            false,
         );
         store.add_session(
             "/dev/tty.b · 115200 8N1".into(),
@@ -676,6 +742,7 @@ mod tests {
             None,
             true,
             LogView::Text,
+            false,
         );
 
         let json = serde_json::to_string(&store).unwrap();
@@ -728,6 +795,7 @@ mod tests {
             Some(group),
             true,
             LogView::Text,
+            false,
         );
         store.remove_group(group);
         assert!(store.groups.is_empty());
@@ -745,6 +813,7 @@ mod tests {
             Some(999),
             true,
             LogView::Text,
+            false,
         );
         assert_eq!(store.sessions[1].group, None);
         assert_eq!(store.resolve_group(Library::Sessions, Some(999)), None);

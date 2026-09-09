@@ -1,10 +1,20 @@
 //! Settings: what is the workbench's to set rather than a session's.
 //!
-//! Two so far — how many lines a terminal keeps above its screen, typed as a
-//! number, and the size its log is set in, picked from the list of sizes the
-//! setting offers — opened from the application menu with ⌘, as every macOS
-//! application opens its own. What is set is written to the workspace file
-//! beside the presets, and takes effect at once in every open session.
+//! Three so far — how many lines a terminal keeps above its screen, typed as
+//! a number; the size its log is set in, picked from the list of sizes the
+//! setting offers; and the folder the sessions that record write into,
+//! chosen with the platform's own folder picker — opened from the
+//! application menu with ⌘, as every macOS application opens its own. What
+//! is set is written to the workspace file beside the presets, and takes
+//! effect at once in every open session.
+//!
+//! The recordings keep a tree of their own — `serialX`, then the day —
+//! inside the folder that is chosen, so the setting can name the desktop
+//! without a year of loose days landing on it. The field shows the folder
+//! the files will actually be written to, which is that tree's head; what
+//! the picker chooses is the folder it stands in.
+
+use std::path::PathBuf;
 
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
@@ -12,8 +22,10 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
+    tooltip::Tooltip,
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::SerialWorkspace;
@@ -22,6 +34,7 @@ use crate::icons::{Glyph, icon_chip};
 use crate::presets::{
     MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES, usable_font_size,
 };
+use crate::recorder::recordings_folder;
 use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
 
 /// Width of the dialog: a number, and a sentence about it.
@@ -33,6 +46,9 @@ const SECTION_GAP: f32 = 14.;
 /// Width of the size field: a couple of digits, a `pt` and a caret. The list
 /// it opens is at least as wide as the field it hangs from.
 const SIZE_FIELD_WIDTH: f32 = 108.;
+/// What the folder field says when the platform will not name a documents
+/// folder and none has been chosen — nowhere to record to.
+const NO_FOLDER: &str = "No folder";
 
 /// Reads a count of lines as typed: digits, with the thousands separators
 /// anyone might put in, within the bounds the setting takes.
@@ -80,6 +96,9 @@ struct SettingsEditor {
     lines_input: Entity<InputState>,
     _lines_subscription: Subscription,
     font_size: f32,
+    /// The folder the recordings' own tree is made in, while one has been
+    /// chosen; none leaves them in the account's documents.
+    recording_root: Option<PathBuf>,
 }
 
 impl SettingsEditor {
@@ -113,6 +132,7 @@ impl SettingsEditor {
             // A file from before the sizes were whole opens on the size the
             // log is actually laid out at, so the list has a row ticked.
             font_size: usable_font_size(current.terminal_font_size),
+            recording_root: current.recording_root,
         }
     }
 
@@ -135,6 +155,105 @@ impl SettingsEditor {
     fn select_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.font_size = size;
         cx.notify();
+    }
+
+    /// Asks the platform for a folder to keep the recordings in. The
+    /// picker is the system's, so it opens where the user last was and can
+    /// make a folder on the spot; a cancelled pick leaves the setting
+    /// where it stood.
+    fn choose_recording_folder(&mut self, cx: &mut Context<Self>) {
+        let chosen = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |editor, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(folder) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = editor.update(cx, |editor, cx| {
+                editor.recording_root = Some(folder);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Back to the folder the workbench picks itself.
+    fn use_default_recording_folder(&mut self, cx: &mut Context<Self>) {
+        self.recording_root = None;
+        cx.notify();
+    }
+
+    /// The recordings' folder: the path they will actually be written
+    /// under, read whole in a tooltip when it is too long for the field,
+    /// then the picker, and the way back to the default while the folder
+    /// is not it.
+    fn render_recording_field(
+        &mut self,
+        palette: WorkbenchPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let folder: SharedString = recordings_folder(self.recording_root.as_deref())
+            .map_or_else(|| NO_FOLDER.into(), |folder| folder.display().to_string())
+            .into();
+        let chosen = self.recording_root.is_some();
+        let full = folder.clone();
+
+        h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                h_flex()
+                    .id("settings-recording-folder")
+                    .flex_1()
+                    .min_w_0()
+                    .h(px(FIELD_HEIGHT))
+                    .px_2p5()
+                    .items_center()
+                    .rounded(px(8.))
+                    .bg(rgb(palette.input))
+                    .border_1()
+                    .border_color(rgb(palette.input_border))
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .ui_mono_token(LABEL)
+                            .text_color(rgb(palette.strong_foreground))
+                            .child(folder),
+                    )
+                    .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
+            )
+            .child(
+                Button::new("settings-recording-choose")
+                    .outline()
+                    .small()
+                    .h(px(FIELD_HEIGHT))
+                    .label("Choose…")
+                    .tooltip("Pick the folder the serialX recordings folder sits in")
+                    .on_click(cx.listener(|editor, _, _, cx| {
+                        editor.choose_recording_folder(cx);
+                    })),
+            )
+            .when(chosen, |row| {
+                row.child(
+                    Button::new("settings-recording-default")
+                        .ghost()
+                        .small()
+                        .h(px(FIELD_HEIGHT))
+                        .label("Default")
+                        .tooltip("Keep the recordings in the account's documents again")
+                        .on_click(cx.listener(|editor, _, _, cx| {
+                            editor.use_default_recording_folder(cx);
+                        })),
+                )
+            })
+            .into_any_element()
     }
 
     /// The size field: the size it is set to and a caret, drawn as the other
@@ -234,6 +353,7 @@ impl Render for SettingsEditor {
                     .child("lines"),
             );
         let size = self.render_size_field(palette, cx);
+        let recording = self.render_recording_field(palette, cx);
 
         v_flex()
             .gap(px(SECTION_GAP))
@@ -251,6 +371,12 @@ impl Render for SettingsEditor {
                 "Terminal text",
                 size,
                 Ok("The size the log is set in, in every session. The line numbers, the timestamps and the line height follow it."),
+            ))
+            .child(setting_section(
+                palette,
+                "Recordings",
+                recording,
+                Ok("Where a session with Record on writes what its device says: a file of its own for every connection, filed under the day. Choose a folder to keep this one somewhere else."),
             ))
     }
 }
@@ -285,7 +411,7 @@ impl SerialWorkspace {
     pub(crate) fn open_settings_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let theme = self.interface_theme;
         let palette = theme.palette();
-        let current = self.presets.settings;
+        let current = self.presets.settings.clone();
         let editor = cx.new(|cx| SettingsEditor::new(theme, current, window, cx));
         let field = editor.clone();
         let workspace = cx.weak_entity();
@@ -316,11 +442,13 @@ impl SerialWorkspace {
                         return false;
                     };
                     let terminal_font_size = editor.read(cx).font_size;
+                    let recording_root = editor.read(cx).recording_root.clone();
                     let _ = workspace.update(cx, |workspace, cx| {
                         workspace.apply_settings(
                             Settings {
                                 scrollback_lines,
                                 terminal_font_size,
+                                recording_root,
                             },
                             cx,
                         );
@@ -340,9 +468,10 @@ impl SerialWorkspace {
     /// Takes the settings as given: writes them down, and hands every open
     /// terminal its new scrollback.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
+        let scrollback_lines = settings.scrollback_lines;
         self.presets.set_settings(settings);
         for tab in &mut self.tabs {
-            tab.terminal.set_scrollback(settings.scrollback_lines);
+            tab.terminal.set_scrollback(scrollback_lines);
         }
         cx.notify();
     }

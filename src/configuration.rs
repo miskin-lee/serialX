@@ -17,13 +17,16 @@
 //! how the log will read what the device sends: `Text`, through the
 //! emulation, as the device drew it, or `Hex`, as a hex editor sets a
 //! file — the bytes down the left, the characters they stand for down the
-//! right. Over them, at the end of the section's eyebrow, an `Interactive`
-//! switch, on unless turned off: whether the terminal is a place to type,
-//! or a log only to read, with no cursor, that the composer sends to. A
-//! summary line at the foot restates the choice in the `115200 8N1`
-//! shorthand the rest of the workbench prints, behind a tag glyph in the
-//! chosen colour, with the group named at its end and `Hex` and
-//! `Read-only` tags after it when those switches say so.
+//! right. Over them, at the end of the section's eyebrow, two switches: a
+//! `Record` switch, off unless asked for, which keeps a file of
+//! everything the device says — one file per connection, under the folder
+//! Settings names — and an `Interactive` switch, on unless turned off:
+//! whether the terminal is a place to type, or a log only to read, with no
+//! cursor, that the composer sends to. A summary line at the foot restates
+//! the choice in the `115200 8N1` shorthand the rest of the workbench
+//! prints, behind a tag glyph in the chosen colour, with the group named at
+//! its end and `Hex`, `Read-only` and `Recording` tags after it when those
+//! switches say so.
 //!
 //! A new session is confirmed with `Save & Connect` — `Enter` — which keeps
 //! it in the side panel and opens it in a tab; `Connect`, beside it, only
@@ -303,6 +306,8 @@ struct SerialConfigurationEditor {
     baud_error: Option<BaudRateError>,
     /// Whether the tab will be a place to type, or a log only to read.
     interactive: bool,
+    /// Whether the session will keep a file of what the device says.
+    record: bool,
     /// How the log will read what arrives: as text, or as a hex dump.
     view: LogView,
     /// Set by `Connect` just before it confirms, and taken by the confirm,
@@ -394,6 +399,7 @@ impl SerialConfigurationEditor {
             _baud_subscription: baud_subscription,
             baud_error: None,
             interactive: saved.is_none_or(|saved| saved.interactive),
+            record: saved.is_some_and(|saved| saved.record),
             view: saved.map_or_else(LogView::default, |saved| saved.view),
             connect_only: false,
         }
@@ -538,6 +544,11 @@ impl SerialConfigurationEditor {
 
     fn select_view(&mut self, view: LogView, cx: &mut Context<Self>) {
         self.view = view;
+        cx.notify();
+    }
+
+    fn set_record(&mut self, record: bool, cx: &mut Context<Self>) {
+        self.record = record;
         cx.notify();
     }
 
@@ -1128,23 +1139,42 @@ impl SerialConfigurationEditor {
     /// The tab, in two rows under one eyebrow: its name beside its group, a
     /// column each, and under them its colour — the bright dozen over the
     /// deep dozen, so a column holds two colours that read as kin. At the
-    /// end of the eyebrow, the `Interactive` switch: on, and the terminal
-    /// is typed into; off, and it is only read.
+    /// end of the eyebrow, two switches: `Record`, off unless asked for,
+    /// which keeps a file of what the device says, one for every
+    /// connection; and `Interactive` — on, and the terminal is typed into;
+    /// off, and it is only read.
     fn render_tab_section(
         &mut self,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let interactive = Checkbox::new("config-interactive")
-            .small()
-            .checked(self.interactive)
-            .label("Interactive")
-            .tooltip(
-                "Type into the terminal: keys go straight to the port, at a cursor. Off, the log is read-only, with no cursor, and the composer does the sending.",
+        let switches = h_flex()
+            .items_center()
+            .gap_3()
+            .child(
+                Checkbox::new("config-record")
+                    .small()
+                    .checked(self.record)
+                    .label("Record")
+                    .tooltip(
+                        "Keep a file of everything this device sends: a new one each time the session connects, filed under the day in the folder Settings names.",
+                    )
+                    .on_click(cx.listener(|editor, checked: &bool, _, cx| {
+                        editor.set_record(*checked, cx);
+                    })),
             )
-            .on_click(cx.listener(|editor, checked: &bool, _, cx| {
-                editor.set_interactive(*checked, cx);
-            }))
+            .child(
+                Checkbox::new("config-interactive")
+                    .small()
+                    .checked(self.interactive)
+                    .label("Interactive")
+                    .tooltip(
+                        "Type into the terminal: keys go straight to the port, at a cursor. Off, the log is read-only, with no cursor, and the composer does the sending.",
+                    )
+                    .on_click(cx.listener(|editor, checked: &bool, _, cx| {
+                        editor.set_interactive(*checked, cx);
+                    })),
+            )
             .into_any_element();
         let name = field_frame(Input::new(&self.alias_input).small())
             .text_token(LABEL)
@@ -1195,7 +1225,7 @@ impl SerialConfigurationEditor {
         Self::section(
             palette,
             "Tab",
-            Some(interactive),
+            Some(switches),
             v_flex()
                 .gap_2p5()
                 .child(
@@ -1240,8 +1270,9 @@ impl SerialConfigurationEditor {
     /// has taken its place above. All behind a tag glyph in the chosen
     /// colour, the one place the tag is named as a tag, and with the group
     /// as a pill at the end when there is one, a `Hex` pill when the log
-    /// will be a dump rather than text, and a `Read-only` pill when the
-    /// tab will not be typed into.
+    /// will be a dump rather than text, a `Read-only` pill when the tab
+    /// will not be typed into, and a `Recording` pill when the session
+    /// will keep a file of what it hears.
     fn render_summary(&self, palette: WorkbenchPalette, cx: &App) -> AnyElement {
         let port = self.selected_port();
         let hue = palette.tag(self.color);
@@ -1305,6 +1336,9 @@ impl SerialConfigurationEditor {
             })
             .when(!self.interactive, |strip| {
                 strip.child(tag(palette, palette.warning, MICRO, "Read-only"))
+            })
+            .when(self.record, |strip| {
+                strip.child(tag(palette, palette.danger, MICRO, "Recording"))
             })
             .into_any_element()
     }
@@ -1499,6 +1533,7 @@ impl SerialWorkspace {
                     let alias = editor.alias(cx);
                     let group = editor.group;
                     let interactive = editor.interactive;
+                    let record = editor.record;
                     let view = editor.view;
                     let target = editor.target;
 
@@ -1513,6 +1548,7 @@ impl SerialWorkspace {
                                     group,
                                     interactive,
                                     view,
+                                    record,
                                 );
                             }
                             let id = workspace.create_configured_tab(
@@ -1523,6 +1559,7 @@ impl SerialWorkspace {
                                 group,
                                 interactive,
                                 view,
+                                record,
                                 window,
                                 cx,
                             );
@@ -1538,6 +1575,7 @@ impl SerialWorkspace {
                                 group,
                                 interactive,
                                 view,
+                                record,
                             );
                             if let Some(group) =
                                 workspace.presets.resolve_group(Library::Sessions, group)
@@ -1562,6 +1600,7 @@ impl SerialWorkspace {
         group: Option<u64>,
         interactive: bool,
         view: LogView,
+        record: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1575,6 +1614,7 @@ impl SerialWorkspace {
         tab.group = self.presets.resolve_group(Library::Sessions, group);
         tab.interactive = interactive;
         tab.view = view;
+        tab.record = record;
         if let Some(index) = tab.ports.iter().position(|port| port.name == port_name) {
             tab.selected_port = index;
         } else {

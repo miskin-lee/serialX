@@ -254,13 +254,14 @@ impl SerialWorkspace {
             return;
         };
         let port_name = tab.selected_port().name.clone();
-        let (configuration, color, alias, group, interactive, view) = (
+        let (configuration, color, alias, group, interactive, view, record) = (
             tab.configuration,
             tab.color,
             tab.alias.clone(),
             tab.group,
             tab.interactive,
             tab.view,
+            tab.record,
         );
         self.save_session_preset(
             port_name,
@@ -270,6 +271,7 @@ impl SerialWorkspace {
             group,
             interactive,
             view,
+            record,
         );
         cx.notify();
     }
@@ -286,6 +288,7 @@ impl SerialWorkspace {
         group: Option<u64>,
         interactive: bool,
         view: LogView,
+        record: bool,
     ) {
         let label = format!("{} · {}", port_name, configuration.summary());
         let group = self.presets.resolve_group(Library::Sessions, group);
@@ -298,6 +301,7 @@ impl SerialWorkspace {
             group,
             interactive,
             view,
+            record,
         );
         self.sessions_collapsed = false;
         if let Some(group) = group {
@@ -347,6 +351,7 @@ impl SerialWorkspace {
         tab.group = self.presets.resolve_group(Library::Sessions, saved.group);
         tab.interactive = saved.interactive;
         tab.view = saved.view;
+        tab.record = saved.record;
         match tab
             .ports
             .iter()

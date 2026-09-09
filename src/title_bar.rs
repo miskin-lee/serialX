@@ -233,10 +233,15 @@ impl SerialWorkspace {
                     Button::new("title-side-panel")
                         .ghost()
                         .with_size(px(CONTROL_HEIGHT))
+                        // The panel's switch is drawn in the workbench's own
+                        // family, as the split and the join beside it are:
+                        // the three sit on one 24-grid frame, so the row
+                        // reads as three switches of one size rather than a
+                        // hairline icon lodged between two solid ones.
                         .icon(if self.side_panel_collapsed {
-                            IconName::PanelRightOpen
+                            Glyph::ShowPanel
                         } else {
-                            IconName::PanelRightClose
+                            Glyph::HidePanel
                         })
                         .tooltip_with_action("Show / hide the side panel", &ToggleSidePanel, None)
                         .on_click(cx.listener(|this, _, _, cx| {

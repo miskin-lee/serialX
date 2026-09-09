@@ -1097,7 +1097,13 @@ impl Terminal {
                     if flags.contains(Flags::HIDDEN) {
                         glyph.push(' ');
                     } else {
-                        glyph.push(cell.c);
+                        // A tab is left in the cell it landed on, so that
+                        // what is copied out keeps it. Set, it is not one
+                        // cell wide — nothing in the font says it should be
+                        // — and the rest of the run slides off the grid,
+                        // over the colour beside it. It is drawn as the
+                        // blank the device meant by it.
+                        glyph.push(if cell.c == '\t' { ' ' } else { cell.c });
                         if let Some(marks) = cell.zerowidth() {
                             glyph.extend(marks);
                         }
@@ -2073,6 +2079,24 @@ mod tests {
         assert_eq!(temperature.column, 0);
         assert_eq!(temperature.text.trim_end(), "温度 25°C");
         assert!(temperature.width >= 9);
+    }
+
+    /// A tab is left in the cell it landed on, so what is copied out keeps
+    /// it; what is drawn there is the blank it stands for, and every run
+    /// stays as wide as the cells it covers.
+    #[test]
+    fn a_tab_is_drawn_as_the_blank_it_stands_for() {
+        let mut terminal = terminal(40, 2);
+        terminal.feed(b"name\tvalue:12\r\n", "1");
+        let content = terminal.render(&TerminalPalette::DARK);
+        let row = &content.rows[0];
+        assert!(row.text.starts_with("name\t"), "the text keeps the tab");
+        for run in &row.runs {
+            assert!(!run.text.contains('\t'), "a tab is not set: {:?}", run.text);
+            assert_eq!(run.text.chars().count(), run.width);
+        }
+        // The tab stop is the eighth column, so the value begins there.
+        assert_eq!(run(&content, 0, "12").column, 14);
     }
 
     /// The run on `line` whose text is exactly `text`.

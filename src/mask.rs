@@ -401,6 +401,17 @@ impl SerialTabState {
             self.terminal.selection_text()
         }
     }
+
+    /// The same selection with the time of each line at its head, as the
+    /// gutter shows it — through the mask, only the lines shown.
+    pub(crate) fn selection_text_stamped(&self) -> Option<String> {
+        if self.masking() {
+            self.terminal
+                .selection_text_stamped(|number| self.mask.is_shown(number))
+        } else {
+            self.terminal.selection_text_stamped(|_| true)
+        }
+    }
 }
 
 #[cfg(test)]

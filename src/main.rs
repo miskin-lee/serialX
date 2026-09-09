@@ -822,6 +822,21 @@ impl SerialWorkspace {
         true
     }
 
+    /// The same copy with each line's time at its head, for the log's own
+    /// menu: what the gutter shows, laid down the left of the text, so a
+    /// stretch of log pasted into a report or a ticket still says when it
+    /// arrived. Through the mask, only the lines shown, as the plain copy
+    /// takes only those.
+    fn copy_terminal_selection_with_stamps(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self
+            .active_tab()
+            .and_then(SerialTabState::selection_text_stamped)
+        else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     /// Types what is on the clipboard at the device, for ⌘V and the log's
     /// own menu. A tab with nothing open, one whose port is down and one
     /// that was made read-only take nothing: there the composer sends.

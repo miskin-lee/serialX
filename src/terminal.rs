@@ -86,6 +86,10 @@ use crate::{
 /// Stamps kept past the scrollback, for the lines on screen: the screen is
 /// rarely this tall, and a stamp is small.
 const STAMP_SLACK: usize = INITIAL_LINES * 8;
+/// How wide a stamp reads — `14:32:40.018` — and what stands between it and
+/// the line, for the copy that takes the stamps along.
+const STAMP_WIDTH: usize = 12;
+const STAMP_GAP: &str = "  ";
 /// The fewest digits the line-number gutter is sized for, so it does not
 /// widen at every power of ten while a log is short.
 const MIN_NUMBER_DIGITS: usize = 4;
@@ -634,6 +638,52 @@ impl Terminal {
     ///
     /// [`selection_text`]: Self::selection_text
     pub(crate) fn selection_text_within(&self, keep: impl Fn(i64) -> bool) -> Option<String> {
+        let (lines, whole_lines) = self.selection_lines(keep)?;
+        let mut text = lines
+            .iter()
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            return None;
+        }
+        if whole_lines {
+            text.push('\n');
+        }
+        Some(text)
+    }
+
+    /// The same selection with the time of each line before it, laid out
+    /// as the gutter lays it: the stamp, then the line. A line the log has
+    /// no stamp for — the blank rows a cleared grid starts with — keeps
+    /// the column and says nothing in it, so the text stays in one column
+    /// however the stamps run.
+    pub(crate) fn selection_text_stamped(&self, keep: impl Fn(i64) -> bool) -> Option<String> {
+        let (lines, whole_lines) = self.selection_lines(keep)?;
+        if lines.iter().all(|(_, text)| text.is_empty()) {
+            return None;
+        }
+        let mut text = lines
+            .iter()
+            .map(|(number, text)| {
+                let stamp = self
+                    .stamp_for(*number)
+                    .map_or_else(String::new, |(stamp, _)| stamp);
+                format!("{stamp:<STAMP_WIDTH$}{STAMP_GAP}{text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if whole_lines {
+            text.push('\n');
+        }
+        Some(text)
+    }
+
+    /// The lines the selection covers, in order, each with its number and
+    /// what it says — the rows the terminal wrapped joined back together,
+    /// and the lines `keep` leaves out left out — and whether the
+    /// selection is of whole lines, which a copy ends with a newline.
+    fn selection_lines(&self, keep: impl Fn(i64) -> bool) -> Option<(Vec<(i64, String)>, bool)> {
         let selection = self.term.selection.as_ref()?;
         let range = selection.to_range(&self.term)?;
         let last_column = self.term.last_column();
@@ -655,16 +705,9 @@ impl Terminal {
             } else {
                 Point::new(Line(line.end - 1), last_column)
             };
-            parts.push(self.term.bounds_to_string(start, end));
+            parts.push((line.number, self.term.bounds_to_string(start, end)));
         }
-        let mut text = parts.join("\n");
-        if text.is_empty() {
-            return None;
-        }
-        if matches!(selection.ty, SelectionType::Lines) {
-            text.push('\n');
-        }
-        Some(text)
+        Some((parts, matches!(selection.ty, SelectionType::Lines)))
     }
 
     /// How wide the line numbers run: the digits of the highest number in
@@ -2189,6 +2232,27 @@ mod tests {
         assert!(terminal.clear_selection());
         assert!(!terminal.has_selection());
         assert!(!terminal.clear_selection());
+    }
+
+    /// The copy that brings the times along puts each line's stamp at its
+    /// head, in a column the text lines up after, and leaves out the lines
+    /// the mask is holding back, as the plain copy does.
+    #[test]
+    fn a_selection_can_be_copied_with_its_times() {
+        let mut terminal = terminal(20, 4);
+        terminal.feed(b"first\r\n", "14:32:40.018");
+        terminal.feed(b"second\r\n", "14:32:41.700");
+        terminal.select_all();
+        assert_eq!(
+            terminal.selection_text_stamped(|_| true).as_deref(),
+            Some("14:32:40.018  first\n14:32:41.700  second\n")
+        );
+        assert_eq!(
+            terminal.selection_text_stamped(|number| number == 2).as_deref(),
+            Some("14:32:41.700  second\n")
+        );
+        terminal.clear_selection();
+        assert_eq!(terminal.selection_text_stamped(|_| true), None);
     }
 
     /// Two clicks take the word, three the line, and select all the log;

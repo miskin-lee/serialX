@@ -591,10 +591,11 @@ impl SerialWorkspace {
     }
 
     /// What a right-click on the log offers: the copy and paste every
-    /// terminal has there, and the select all that goes with them. The
-    /// items are greyed by what the log can do at that moment — nothing
-    /// selected, or a tab that takes no typing — and each carries its
-    /// keystroke, read in the log's own key context.
+    /// terminal has there, the copy that brings the timestamps with it,
+    /// and the select all that goes with them. The items are greyed by
+    /// what the log can do at that moment — nothing selected, or a tab
+    /// that takes no typing — and each carries its keystroke, read in the
+    /// log's own key context.
     fn terminal_menu(
         &self,
         pane: usize,
@@ -609,8 +610,12 @@ impl SerialWorkspace {
         let has_selection = tab.and_then(SerialTabState::selection_text).is_some();
         let takes_input = tab.is_some_and(|tab| tab.connected && tab.interactive);
         move |menu, _, _| {
-            let (copy, paste, select_all) =
-                (workspace.clone(), workspace.clone(), workspace.clone());
+            let (copy, stamped, paste, select_all) = (
+                workspace.clone(),
+                workspace.clone(),
+                workspace.clone(),
+                workspace.clone(),
+            );
             menu.action_context(focus.clone())
                 .item(
                     PopupMenuItem::new("Copy")
@@ -620,6 +625,19 @@ impl SerialWorkspace {
                             let _ = copy.update(cx, |this, cx| {
                                 this.select_pane(pane);
                                 this.copy_terminal_selection(cx);
+                            });
+                        }),
+                )
+                // The gutter's times come along with the text, each at the
+                // head of its line — no keystroke of its own, since it is
+                // the copy you go to the menu for.
+                .item(
+                    PopupMenuItem::new("Copy with Timestamps")
+                        .disabled(!has_selection)
+                        .on_click(move |_, _, cx| {
+                            let _ = stamped.update(cx, |this, cx| {
+                                this.select_pane(pane);
+                                this.copy_terminal_selection_with_stamps(cx);
                             });
                         }),
                 )

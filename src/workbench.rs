@@ -38,24 +38,33 @@ use crate::theme::{
 use crate::panes::{DROP_TARGET_WASH, DraggedTab, SplitAxis};
 use crate::{SerialTabSnapshot, SerialTabState, SerialWorkspace};
 
-/// Height of the tab strip above the terminal: two under the title bar's,
-/// so the two bands read as one piece of chrome without repeating it.
-const TAB_STRIP_HEIGHT: f32 = 36.;
+/// Height of the tab strip above the terminal: well under the title bar's,
+/// so the band that only says *which* session reads as the slimmer of the
+/// two and gives its rows back to the log.
+const TAB_STRIP_HEIGHT: f32 = 28.;
 /// Height of a tab, and of every control that shares the strip with it.
-const TAB_HEIGHT: f32 = 26.;
+const TAB_HEIGHT: f32 = 22.;
 /// The close mark inside a tab.
-const TAB_CLOSE: f32 = 18.;
+const TAB_CLOSE: f32 = 16.;
 /// The widest a tab grows before its name truncates.
 const TAB_MAX_WIDTH: f32 = 260.;
 /// The narrowest a tab shrinks to when the strip is full.
 const TAB_MIN_WIDTH: f32 = 120.;
-/// How strongly a tag's hue washes the active tab's plate, and its ring.
-const TAG_PLATE_ACTIVE: f32 = 0.18;
-const TAG_RING_ACTIVE: f32 = 0.45;
+/// How strongly a tag's hue washes the plate of the tab being worked in, and
+/// its ring: a filled plate under a bright outline, so the session the title
+/// bar is speaking to is picked out of a full strip at a glance.
+const TAG_PLATE_ACTIVE: f32 = 0.34;
+const TAG_RING_ACTIVE: f32 = 0.9;
+/// The front tab of a pane that is *not* being worked in: still plated and
+/// ringed, so a split says which session each half holds, but a step back
+/// from the one in hand.
+const TAG_PLATE_BEHIND: f32 = 0.12;
+const TAG_RING_BEHIND: f32 = 0.22;
 /// The wash on a tab that is not in front, at rest and under the pointer:
-/// faint enough to sit nearly flat, strong enough to read as the tag.
-const TAG_PLATE_REST: f32 = 0.1;
-const TAG_PLATE_HOVER: f32 = 0.18;
+/// faint enough to sit flat on the strip, strong enough to keep saying which
+/// tag the session wears.
+const TAG_PLATE_REST: f32 = 0.06;
+const TAG_PLATE_HOVER: f32 = 0.16;
 /// Width of the timestamp gutter, wide enough for `14:32:40.018`.
 const TIME_GUTTER: f32 = 82.;
 /// Side padding of a log row, and the gap between its gutters and its text.
@@ -183,11 +192,12 @@ impl SerialWorkspace {
             .bg(rgb(color))
     }
 
-    /// The band above a pane's log: one tab per session it holds, and the
-    /// way to a new one. Connecting is done beside the filter in the title
-    /// bar, and pausing, clearing and the log's switches live in the menus
-    /// with their shortcuts, so the strip holds nothing that is not about
-    /// *which* session.
+    /// The band above a pane's log: one tab per session it holds, and
+    /// nothing else. A new session is opened from the File menu, its
+    /// shortcut, or the empty state's own button; connecting is done beside
+    /// the filter in the title bar, and pausing, clearing and the log's
+    /// switches live in the menus with their shortcuts, so the strip carries
+    /// only the sessions themselves.
     ///
     /// Every pane has one, so a split reads as two workbenches side by
     /// side rather than as one strip over two logs; the strip of the pane
@@ -255,18 +265,7 @@ impl SerialWorkspace {
                         .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                             this.move_tab_to_pane(dragged.tab, pane, None, window, cx);
                         }))
-                        .children(tabs)
-                        .child(
-                            Button::new(("new-tab", pane))
-                                .ghost()
-                                .with_size(px(TAB_HEIGHT))
-                                .icon(IconName::Plus)
-                                .tooltip_with_action("New session", &NewSerialTab, None)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_pane(pane);
-                                    this.open_new_serial_tab_dialog(window, cx);
-                                })),
-                        ),
+                        .children(tabs),
                 )
                 .into_any_element(),
         )
@@ -340,14 +339,18 @@ impl SerialWorkspace {
             .border_1()
             .cursor_pointer()
             .tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
-            // Only the pane being worked in raises its front tab: two
-            // raised plates in two strips would both claim to be the
-            // session the title bar is speaking to.
+            // Only the pane being worked in raises its front tab all the
+            // way: two plates that bright in two strips would both claim to
+            // be the session the title bar is speaking to.
             .when(active && in_front, |tab| {
                 tab.bg(tint(hue, TAG_PLATE_ACTIVE))
                     .border_color(tint(hue, TAG_RING_ACTIVE))
             })
-            .when(!(active && in_front), |tab| {
+            .when(active && !in_front, |tab| {
+                tab.bg(tint(hue, TAG_PLATE_BEHIND))
+                    .border_color(tint(hue, TAG_RING_BEHIND))
+            })
+            .when(!active, |tab| {
                 tab.bg(tint(hue, TAG_PLATE_REST))
                     .border_color(transparent_black())
                     .hover(move |tab| tab.bg(tint(hue, TAG_PLATE_HOVER)))
@@ -390,6 +393,13 @@ impl SerialWorkspace {
                     } else {
                         palette.muted
                     }))
+                    // The name of the session in hand is set a weight above
+                    // the rest, so the strip reads as one tab in front of
+                    // the others even where the plates are hard to tell
+                    // apart — a colour-blind bench, a dimmed screen.
+                    .when(active && in_front, |name| {
+                        name.font_weight(FontWeight::SEMIBOLD)
+                    })
                     .child(name),
             )
             .child(

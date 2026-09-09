@@ -62,8 +62,9 @@ const CENTER_MAX_WIDTH: f32 = 780.;
 const CENTER_MIN_WIDTH: f32 = 460.;
 /// What the number in a byte counter is given, right-aligned in it, so a
 /// count climbing from `0 B` to `1.2 MB` grows leftwards into its own space
-/// rather than shoving the filter box along with it.
-const COUNTER_VALUE_WIDTH: f32 = 40.;
+/// rather than shoving the filter box along with it. Wide enough for the
+/// longest thing it says — a hair under a megabyte, spelled out in bytes.
+const COUNTER_VALUE_WIDTH: f32 = 54.;
 /// How faint the filter box and the connect pill go without a tab.
 const IDLE_OPACITY: f32 = 0.6;
 /// What `TitleBar` pads on the left for the macOS traffic lights.
@@ -565,18 +566,20 @@ impl SerialWorkspace {
     }
 }
 
-/// A byte count as the bar says it: plain bytes up to a thousand, then
-/// kB, MB and GB — the decimal units the platforms label a transfer with,
-/// carrying one decimal only while there is one worth reading, so the
-/// number stays three or four glyphs wide however far it climbs.
+/// A byte count as the bar says it: plain bytes up to a megabyte, then MB
+/// and GB — the decimal units the platforms label a transfer with, carrying
+/// one decimal only while there is one worth reading. A session's traffic is
+/// read as a count first and a size second, so there is no kilobyte step in
+/// between: the exact number of bytes stands until it is too long to read.
 fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 3] = ["kB", "MB", "GB"];
+    const UNITS: [&str; 2] = ["MB", "GB"];
     const STEP: f64 = 1000.;
+    const MEGABYTE: u64 = 1_000_000;
 
-    if bytes < STEP as u64 {
+    if bytes < MEGABYTE {
         return format!("{bytes} B");
     }
-    let mut value = bytes as f64 / STEP;
+    let mut value = bytes as f64 / MEGABYTE as f64;
     let mut unit = UNITS[0];
     for next in &UNITS[1..] {
         if value < STEP {
@@ -604,21 +607,25 @@ mod tests {
         assert_eq!(position.y + px(6.), px(TITLE_BAR_HEIGHT / 2.));
     }
 
+    /// Everything under a megabyte is said as the count it is: no kilobyte
+    /// step rounds a session's first few thousand bytes away.
     #[test]
-    fn small_counts_are_said_in_bytes() {
+    fn counts_under_a_megabyte_are_said_in_bytes() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1), "1 B");
         assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_234), "1234 B");
+        assert_eq!(format_bytes(999_999), "999999 B");
     }
 
     /// A decimal while the number is one digit wide, none once it is two.
     #[test]
     fn larger_counts_climb_through_the_units() {
-        assert_eq!(format_bytes(1_000), "1.0 kB");
-        assert_eq!(format_bytes(1_234), "1.2 kB");
-        assert_eq!(format_bytes(45_600), "46 kB");
-        assert_eq!(format_bytes(999_000), "999 kB");
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
         assert_eq!(format_bytes(1_500_000), "1.5 MB");
+        assert_eq!(format_bytes(45_600_000), "46 MB");
+        assert_eq!(format_bytes(999_000_000), "999 MB");
+        assert_eq!(format_bytes(1_500_000_000), "1.5 GB");
         assert_eq!(format_bytes(12_000_000_000), "12 GB");
     }
 

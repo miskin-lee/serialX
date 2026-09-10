@@ -24,6 +24,7 @@ pub(crate) enum Glyph {
     Bolt,
     Bookmark,
     Cable,
+    Copy,
     Folder,
     FolderPlus,
     Hex,
@@ -47,6 +48,7 @@ impl Glyph {
             Self::Bolt => "icons/ui/bolt.svg",
             Self::Bookmark => "icons/ui/bookmark.svg",
             Self::Cable => "icons/ui/cable.svg",
+            Self::Copy => "icons/ui/copy.svg",
             Self::Folder => "icons/ui/folder.svg",
             Self::FolderPlus => "icons/ui/folder-plus.svg",
             Self::Hex => "icons/ui/hex.svg",
@@ -85,6 +87,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/cable.svg",
         include_bytes!("../assets/icons/ui/cable.svg"),
+    ),
+    (
+        "icons/ui/copy.svg",
+        include_bytes!("../assets/icons/ui/copy.svg"),
     ),
     (
         "icons/ui/folder.svg",
@@ -215,6 +221,7 @@ mod tests {
         Glyph::Bolt,
         Glyph::Bookmark,
         Glyph::Cable,
+        Glyph::Copy,
         Glyph::Folder,
         Glyph::FolderPlus,
         Glyph::Hex,

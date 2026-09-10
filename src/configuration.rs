@@ -28,6 +28,12 @@
 //! its end and `Hex`, `Read-only` and `Recording` tags after it when those
 //! switches say so.
 //!
+//! A device row also hands its path to the clipboard: a copy button at its
+//! end, faint until the pointer is on the row, or `Copy Path` on a
+//! right-click, with `Copy Description` under it for the path and what the
+//! device is. The row says `Copied` for a moment after. The path is the one
+//! thing here a terminal or a bug report wants in its own words.
+//!
 //! A new session is confirmed with `Save & Connect` — `Enter` — which keeps
 //! it in the side panel and opens it in a tab; `Connect`, beside it, only
 //! opens the tab.
@@ -50,7 +56,7 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
-    menu::{DropdownMenu, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement,
     tooltip::Tooltip,
     v_flex,
@@ -118,6 +124,14 @@ const FLASH_PULSES: f32 = 2.;
 const FLASH_TICK: Duration = Duration::from_millis(16);
 /// Height of one device row.
 const PORT_ROW_HEIGHT: f32 = 44.;
+/// The copy button at a device row's end: its size, and how faint it is
+/// until the pointer is on the row — the side panel's cards fade their
+/// buttons the same way.
+const PORT_ACTION_SIZE: f32 = 22.;
+const PORT_ACTION_REST: f32 = 0.35;
+/// How long a device row says `Copied` after its path is put on the
+/// clipboard: long enough to be read, short enough not to be a state.
+const COPIED_DURATION: Duration = Duration::from_millis(1500);
 /// The most device rows the list shows before it scrolls.
 const PORT_ROWS_MAX: usize = 4;
 /// The fewest it shows when the window is short, so the list stays a list.
@@ -227,6 +241,25 @@ enum ConfigurationField {
     FlowControl,
 }
 
+/// What a device row can put on the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PortCopy {
+    /// The port's path alone: what a terminal or a script wants.
+    Path,
+    /// The path with what the device is after it, the way the side panel's
+    /// tooltips print a session: for a note or a bug report.
+    Description,
+}
+
+impl PortCopy {
+    fn text(self, port: &PortItem) -> String {
+        match self {
+            Self::Path => port.name.clone(),
+            Self::Description => format!("{} · {}", port.name, port.subtitle),
+        }
+    }
+}
+
 /// Where the dialog stands on screen, read back from the parts this module
 /// hands it as they are laid out: the icon that starts the header, the
 /// content, and the footer. The surface around them is the kit's, and its
@@ -280,6 +313,9 @@ struct SerialConfigurationEditor {
     frame: Rc<DialogFrame>,
     /// When a press past the dialog last set it flashing.
     flash: Option<Instant>,
+    /// The device whose path was last put on the clipboard, and when: its
+    /// row says `Copied` for a moment after.
+    copied: Option<(usize, Instant)>,
     /// The workspace the dialog was opened from: where a group made from
     /// here is kept.
     workspace: WeakEntity<SerialWorkspace>,
@@ -386,6 +422,7 @@ impl SerialConfigurationEditor {
             theme,
             frame: Rc::default(),
             flash: None,
+            copied: None,
             workspace,
             ports,
             selected_port,
@@ -530,6 +567,53 @@ impl SerialConfigurationEditor {
         self.ports = ports;
         self.sync_name_placeholder(window, cx);
         cx.notify();
+    }
+
+    /// Puts what a device row says on the clipboard — its path, or the
+    /// path with its description — and has the row say `Copied` for a
+    /// moment. A copy during the moment starts it again, and the timer
+    /// that ends it only ends the one it was started for.
+    fn copy_port(&mut self, index: usize, what: PortCopy, cx: &mut Context<Self>) {
+        let Some(port) = self.ports.get(index) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(what.text(port)));
+        let stamp = Instant::now();
+        self.copied = Some((index, stamp));
+        cx.notify();
+        cx.spawn(async move |editor, cx| {
+            Timer::after(COPIED_DURATION).await;
+            let _ = editor.update(cx, |editor, cx| {
+                if editor.copied.is_some_and(|(_, at)| at == stamp) {
+                    editor.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// What a right-click on a device row offers: its path for the
+    /// clipboard, and the path with the device's description after it.
+    fn port_menu(
+        editor: WeakEntity<Self>,
+        index: usize,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        move |menu, _, _| {
+            let (path, description) = (editor.clone(), editor.clone());
+            menu.item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+                let _ = path.update(cx, |editor, cx| {
+                    editor.copy_port(index, PortCopy::Path, cx);
+                });
+            }))
+            .item(
+                PopupMenuItem::new("Copy Description").on_click(move |_, _, cx| {
+                    let _ = description.update(cx, |editor, cx| {
+                        editor.copy_port(index, PortCopy::Description, cx);
+                    });
+                }),
+            )
+        }
     }
 
     fn select_color(&mut self, color: TagColor, cx: &mut Context<Self>) {
@@ -723,6 +807,8 @@ impl SerialConfigurationEditor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let selected_index = self.selected_port;
+        let copied_index = self.copied.map(|(index, _)| index);
+        let editor = cx.weak_entity();
         let list_height = port_list_height(self.ports.len(), viewport_height);
         // The scrollbar lies over the list's right edge. When the rows
         // outnumber the ones that fit it has somewhere to be, so the rows
@@ -734,6 +820,7 @@ impl SerialConfigurationEditor {
             .enumerate()
             .map(|(index, port)| {
                 let selected = index == selected_index;
+                let copied = copied_index == Some(index);
                 let name_color = if port.kind == PortKind::Unavailable {
                     palette.muted
                 } else {
@@ -742,6 +829,7 @@ impl SerialConfigurationEditor {
 
                 h_flex()
                     .id(("config-port", index))
+                    .group("config-port")
                     .h(px(PORT_ROW_HEIGHT))
                     .flex_none()
                     .px_3()
@@ -779,7 +867,31 @@ impl SerialConfigurationEditor {
                     .when(port.kind == PortKind::Unavailable, |row| {
                         row.child(tag(palette, palette.warning, MICRO, "Offline"))
                     })
+                    .when(copied, |row| {
+                        row.child(tag(palette, palette.accent, MICRO, "Copied"))
+                    })
+                    // The copy button: faint at rest, full once the pointer
+                    // is on the row. Its click stops short of the row, so
+                    // copying a path never also picks the device.
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .opacity(PORT_ACTION_REST)
+                            .group_hover("config-port", |actions| actions.opacity(1.))
+                            .child(
+                                Button::new(("config-port-copy", index))
+                                    .ghost()
+                                    .with_size(px(PORT_ACTION_SIZE))
+                                    .icon(Glyph::Copy)
+                                    .tooltip("Copy path")
+                                    .on_click(cx.listener(move |editor, _, _, cx| {
+                                        cx.stop_propagation();
+                                        editor.copy_port(index, PortCopy::Path, cx);
+                                    })),
+                            ),
+                    )
                     .child(Self::radio_mark(palette, selected))
+                    .context_menu(Self::port_menu(editor.clone(), index))
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -1639,9 +1751,9 @@ impl SerialWorkspace {
 #[cfg(test)]
 mod tests {
     use super::{
-        DIALOG_FIXED_HEIGHT, DIALOG_MAX_HEIGHT_FRACTION, PORT_ROW_HEIGHT, SWATCH_COLUMNS,
-        SWATCH_GAP, SWATCH_ROWS, SWATCH_TARGET, TAG_BLOCK_HEIGHT, TAG_HUE_COUNT, TagColor,
-        pick_tag, port_list_height,
+        DIALOG_FIXED_HEIGHT, DIALOG_MAX_HEIGHT_FRACTION, PORT_ROW_HEIGHT, PortCopy, PortItem,
+        SWATCH_COLUMNS, SWATCH_GAP, SWATCH_ROWS, SWATCH_TARGET, TAG_BLOCK_HEIGHT, TAG_HUE_COUNT,
+        TagColor, pick_tag, port_list_height,
     };
 
     /// A tall window shows up to four rows, and a list that fits is exactly
@@ -1712,5 +1824,15 @@ mod tests {
         for color in TagColor::HUES {
             assert!(drawn.contains(&color), "{color:?} is never drawn");
         }
+    }
+
+    #[test]
+    fn a_copied_device_is_its_path_first() {
+        let port = PortItem::unavailable("/dev/cu.usbserial-1420".into(), "USB Serial");
+        assert_eq!(PortCopy::Path.text(&port), "/dev/cu.usbserial-1420");
+        assert_eq!(
+            PortCopy::Description.text(&port),
+            "/dev/cu.usbserial-1420 · USB Serial"
+        );
     }
 }

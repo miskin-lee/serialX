@@ -12,6 +12,7 @@ mod hex;
 mod highlight;
 mod icons;
 mod mask;
+mod modem;
 mod panes;
 mod presets;
 mod recorder;
@@ -21,6 +22,7 @@ mod sidebar;
 mod terminal;
 mod theme;
 mod title_bar;
+mod transfer;
 mod updater;
 mod workbench;
 
@@ -480,6 +482,7 @@ impl SerialWorkspace {
             tab.configuration,
             command_rx,
             tab.event_tx.clone(),
+            tab.tap.clone(),
         );
         cx.notify();
     }
@@ -934,10 +937,6 @@ impl SerialWorkspace {
         cx.notify();
     }
 
-    /// Feeds a tab what its port reported. An empty batch is the hold on
-    /// a read running out (see [`LINE_HOLD`]): the read goes in by itself.
-    /// Says whether the terminal is now keeping one back, so the listener
-    /// knows to bound its next sleep.
     fn handle_serial_events(
         &mut self,
         tab_id: usize,
@@ -959,6 +958,7 @@ impl SerialWorkspace {
         if events.is_empty() {
             tab.flush();
         }
+        let mut announced = None;
         for event in events {
             match event {
                 SerialEvent::Connected => {
@@ -970,10 +970,18 @@ impl SerialWorkspace {
                 SerialEvent::Data(bytes) => {
                     tab.count_received(bytes.len());
                     tab.record_received(&bytes);
+                    // ZMODEM announcing itself, while no transfer has
+                    // the port: answered once the batch is in.
+                    if tab.transfer.is_none()
+                        && let Some(direction) = tab.sniffer.hear(&bytes)
+                    {
+                        announced = Some(direction);
+                    }
                     if !tab.paused {
                         tab.receive(&bytes);
                     }
                 }
+                SerialEvent::Transfer(event) => tab.transfer_event(event),
                 SerialEvent::Error(message) => {
                     tab.disconnect();
                     tab.note(message);
@@ -985,7 +993,11 @@ impl SerialWorkspace {
             tab.scroll_to_bottom();
         }
         cx.notify();
-        tab.holds()
+        let holds = tab.holds();
+        if let Some(direction) = announced {
+            self.zmodem_announced(tab_id, direction, cx);
+        }
+        holds
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {

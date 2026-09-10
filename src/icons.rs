@@ -25,6 +25,7 @@ pub(crate) enum Glyph {
     Bookmark,
     Cable,
     Copy,
+    Download,
     Folder,
     FolderPlus,
     Hex,
@@ -40,6 +41,7 @@ pub(crate) enum Glyph {
     Tag,
     Terminal,
     Trash,
+    Upload,
 }
 
 impl Glyph {
@@ -49,6 +51,7 @@ impl Glyph {
             Self::Bookmark => "icons/ui/bookmark.svg",
             Self::Cable => "icons/ui/cable.svg",
             Self::Copy => "icons/ui/copy.svg",
+            Self::Download => "icons/ui/download.svg",
             Self::Folder => "icons/ui/folder.svg",
             Self::FolderPlus => "icons/ui/folder-plus.svg",
             Self::Hex => "icons/ui/hex.svg",
@@ -64,6 +67,7 @@ impl Glyph {
             Self::Tag => "icons/ui/tag.svg",
             Self::Terminal => "icons/ui/terminal.svg",
             Self::Trash => "icons/ui/trash.svg",
+            Self::Upload => "icons/ui/upload.svg",
         }
     }
 }
@@ -91,6 +95,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/copy.svg",
         include_bytes!("../assets/icons/ui/copy.svg"),
+    ),
+    (
+        "icons/ui/download.svg",
+        include_bytes!("../assets/icons/ui/download.svg"),
     ),
     (
         "icons/ui/folder.svg",
@@ -151,6 +159,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/trash.svg",
         include_bytes!("../assets/icons/ui/trash.svg"),
+    ),
+    (
+        "icons/ui/upload.svg",
+        include_bytes!("../assets/icons/ui/upload.svg"),
     ),
 ];
 
@@ -222,6 +234,7 @@ mod tests {
         Glyph::Bookmark,
         Glyph::Cable,
         Glyph::Copy,
+        Glyph::Download,
         Glyph::Folder,
         Glyph::FolderPlus,
         Glyph::Hex,
@@ -237,6 +250,7 @@ mod tests {
         Glyph::Tag,
         Glyph::Terminal,
         Glyph::Trash,
+        Glyph::Upload,
     ];
 
     /// A glyph whose file is missing renders as nothing at all, with no error,

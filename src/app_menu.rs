@@ -10,6 +10,7 @@
 use gpui_kit::component::GlobalState;
 use gpui_kit::*;
 
+use crate::modem::Direction;
 use crate::panes::SplitAxis;
 use crate::{REPOSITORY_URL, SerialWorkspace, theme::InterfaceTheme};
 
@@ -23,6 +24,8 @@ actions!(
         ToggleConnection,
         TogglePause,
         ClearTerminal,
+        SendFile,
+        ReceiveFile,
         ToggleHex,
         ToggleAutoScroll,
         ToggleSidePanel,
@@ -146,6 +149,9 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Connect / Disconnect", ToggleConnection),
             MenuItem::action("Clear Terminal", ClearTerminal),
+            MenuItem::separator(),
+            MenuItem::action("Send File…", SendFile),
+            MenuItem::action("Receive File…", ReceiveFile),
             MenuItem::separator(),
             MenuItem::action("Previous Session", PreviousTab),
             MenuItem::action("Next Session", NextTab),
@@ -323,6 +329,20 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     let view = workspace.downgrade();
     cx.on_action(move |_: &ClearTerminal, cx| {
         let _ = view.update(cx, |view, cx| view.clear_terminal(cx));
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &SendFile, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_transfer_dialog(Direction::Send, window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ReceiveFile, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_transfer_dialog(Direction::Receive, window, cx);
+        });
     });
 
     let view = workspace.downgrade();
@@ -559,5 +579,19 @@ mod tests {
         let labels = labels(session);
         assert!(!labels.iter().any(|label| label.starts_with("Rescan")));
         assert!(!labels.iter().any(|label| label.starts_with("Pause")));
+    }
+
+    /// A file goes to the device or comes from it by name, from the
+    /// session menu: what happens to the session in front.
+    #[test]
+    fn session_menu_offers_a_file_each_way() {
+        let menus = application_menus();
+        let session = menus
+            .iter()
+            .find(|menu| menu.name == "Session")
+            .expect("a Session menu");
+        let labels = labels(session);
+        assert!(labels.iter().any(|label| label == "Send File…"));
+        assert!(labels.iter().any(|label| label == "Receive File…"));
     }
 }

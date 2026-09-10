@@ -18,7 +18,9 @@ use crate::filter::OutputFilter;
 use crate::find::{FindState, FindView};
 use crate::hex::{HexDump, LogView};
 use crate::mask::MaskState;
+use crate::modem::{Sniffer, Tap, TransferEvent};
 use crate::recorder::Recorder;
+use crate::transfer::Transfer;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
 use crate::workbench::TerminalMetrics;
@@ -80,6 +82,8 @@ pub(crate) enum SerialEvent {
     Connected,
     Data(Vec<u8>),
     Error(String),
+    /// What a file transfer on the port reports, from its own thread.
+    Transfer(TransferEvent),
 }
 
 /// How long a read waits for bytes before checking whether it should stop.
@@ -273,6 +277,14 @@ pub(crate) struct SerialTabState {
     pub(crate) record: bool,
     /// The file this connection is being written to, while one is open.
     recorder: Option<Recorder>,
+    /// The file transfer running on the port, while one is: the reader
+    /// hands it what it reads, and nothing else is written meanwhile.
+    pub(crate) transfer: Option<Transfer>,
+    /// Where the port's reader is told to hand its reads while a
+    /// transfer runs; the transfer's link fills and clears it.
+    pub(crate) tap: Tap,
+    /// Listens in what arrives for ZMODEM announcing itself.
+    pub(crate) sniffer: Sniffer,
     /// The dump's half-filled row, while the view is the hex one.
     dump: HexDump,
     pub(crate) connected: bool,
@@ -350,6 +362,9 @@ impl SerialTabState {
             view: LogView::default(),
             record: false,
             recorder: None,
+            transfer: None,
+            tap: Tap::default(),
+            sniffer: Sniffer::default(),
             dump: HexDump::default(),
             connected: false,
             connecting: false,
@@ -549,8 +564,12 @@ impl SerialTabState {
     }
 
     /// Hands bytes to the port, counting what went out. Nothing happens
-    /// when the tab is not open.
+    /// when the tab is not open — or while a transfer has the port, when
+    /// a keystroke in the middle of its packets would only break one.
     pub(crate) fn write(&mut self, bytes: Vec<u8>) {
+        if self.transfer.is_some() {
+            return;
+        }
         if let Some(tx) = &self.command_tx {
             let sent = bytes.len();
             if tx.send(SerialCommand::Write(bytes)).is_ok() {
@@ -560,6 +579,13 @@ impl SerialTabState {
     }
 
     pub(crate) fn disconnect(&mut self) {
+        // A transfer loses its port with the tab; its thread is told
+        // and finds the writer gone, and what it reports afterwards
+        // finds no transfer to report to.
+        if let Some(transfer) = self.transfer.take() {
+            transfer.cancel();
+            self.note("Transfer cancelled: the port closed.");
+        }
         if let Some(tx) = self.command_tx.take() {
             let _ = tx.send(SerialCommand::Stop);
         }
@@ -598,6 +624,8 @@ pub(crate) struct SerialTabSnapshot {
     pub(crate) filter_input: Entity<InputState>,
     pub(crate) filter: OutputFilter,
     pub(crate) find: FindView,
+    /// The file transfer running on the port, for the strip over the log.
+    pub(crate) transfer: Option<Transfer>,
 }
 
 impl From<&SerialTabState> for SerialTabSnapshot {
@@ -620,6 +648,7 @@ impl From<&SerialTabState> for SerialTabSnapshot {
                 status: tab.find.status(),
                 input: tab.find_input.clone(),
             },
+            transfer: tab.transfer.clone(),
         }
     }
 }
@@ -661,11 +690,16 @@ pub(crate) fn discover_ports() -> Vec<PortItem> {
 /// it is typed, and what arrives is passed on the moment it is read. The
 /// writer stops when it is told to or when its channel closes with the tab;
 /// the reader notices on its next timeout and follows.
+///
+/// While a file transfer runs, the tap holds where the reads go instead
+/// of to the terminal; the transfer clears it when it is over, and a tap
+/// whose transfer is gone without clearing it is cleared on the way past.
 pub(crate) fn spawn_serial_worker(
     port_name: String,
     configuration: SerialConfiguration,
     commands: Receiver<SerialCommand>,
     events: smol::channel::Sender<SerialEvent>,
+    tap: Tap,
 ) {
     thread::spawn(move || {
         let opened = serialport::new(&port_name, configuration.baud_rate())
@@ -710,9 +744,18 @@ pub(crate) fn spawn_serial_worker(
         while !stopped.load(Ordering::Relaxed) {
             match reader.read(&mut buffer) {
                 Ok(count) if count > 0 => {
-                    if events
-                        .send_blocking(SerialEvent::Data(buffer[..count].to_vec()))
-                        .is_err()
+                    let mut bytes = Some(buffer[..count].to_vec());
+                    {
+                        let mut tap = tap.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if let Some(transfer) = tap.as_ref()
+                            && let Err(returned) = transfer.send(bytes.take().expect("just read"))
+                        {
+                            *tap = None;
+                            bytes = Some(returned.0);
+                        }
+                    }
+                    if let Some(bytes) = bytes
+                        && events.send_blocking(SerialEvent::Data(bytes)).is_err()
                     {
                         break;
                     }

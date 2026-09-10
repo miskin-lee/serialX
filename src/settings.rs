@@ -412,6 +412,10 @@ impl SerialWorkspace {
         let theme = self.interface_theme;
         let palette = theme.palette();
         let current = self.presets.settings.clone();
+        // What the transfer dialog keeps here is not this dialog's to
+        // change, so it goes back as it was.
+        let transfer_folder = current.transfer_folder.clone();
+        let transfer_protocol = current.transfer_protocol;
         let editor = cx.new(|cx| SettingsEditor::new(theme, current, window, cx));
         let field = editor.clone();
         let workspace = cx.weak_entity();
@@ -419,6 +423,7 @@ impl SerialWorkspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let workspace = workspace.clone();
             let editor = editor.clone();
+            let transfer_folder = transfer_folder.clone();
             alert
                 .width(px(DIALOG_WIDTH))
                 .p_5()
@@ -449,6 +454,8 @@ impl SerialWorkspace {
                                 scrollback_lines,
                                 terminal_font_size,
                                 recording_root,
+                                transfer_folder: transfer_folder.clone(),
+                                transfer_protocol,
                             },
                             cx,
                         );

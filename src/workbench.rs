@@ -301,14 +301,15 @@ impl SerialWorkspace {
         let tab_id = tab.id;
         let name = tab.title().to_string();
         let detail: SharedString = format!(
-            "{} · {}{}{}{}",
+            "{} · {}{}{}{}{}",
             tab.selected_port().name,
             tab.configuration.summary(),
             if tab.view.is_hex() { " · hex" } else { "" },
             if tab.interactive { "" } else { " · read-only" },
             // The live state, not the switch: it says a file is being
             // written now, which is what you hover a recording tab to ask.
-            if tab.recording() { " · recording" } else { "" }
+            if tab.recording() { " · recording" } else { "" },
+            if tab.transfer.is_some() { " · transferring a file" } else { "" }
         )
         .into();
         let status = if tab.connected {
@@ -522,6 +523,12 @@ impl SerialWorkspace {
         // The find bar floats over the log's top-right corner while it is
         // open, the way VS Code's find widget does.
         let find_bar = tab.find.open.then(|| self.render_find_bar(&tab, cx));
+        // A file going over the port has a strip along the top of the
+        // log, until it is there.
+        let transfer = tab
+            .transfer
+            .as_ref()
+            .map(|transfer| self.render_transfer_strip(tab_id, transfer, cx));
 
         v_flex()
             .id(("pane-log", tab_id))
@@ -538,6 +545,7 @@ impl SerialWorkspace {
             .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
                 this.move_tab_to_pane(dragged.tab, pane, None, window, cx);
             }))
+            .children(transfer)
             .child(
                 div()
                     .id(("terminal", tab_id))

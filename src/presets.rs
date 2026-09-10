@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::SerialConfiguration;
 use crate::hex::LogView;
+use crate::modem::Protocol;
 use crate::serial::LineEnding;
 use crate::theme::TagColor;
 
@@ -150,6 +151,13 @@ pub(crate) struct Settings {
     /// files written before a session could record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recording_root: Option<PathBuf>,
+    /// Where received files go, once a folder has been chosen in the
+    /// receive dialog; nothing leaves them in the account's downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) transfer_folder: Option<PathBuf>,
+    /// The protocol the last transfer used, so the dialog opens on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) transfer_protocol: Option<Protocol>,
 }
 
 impl Settings {
@@ -165,6 +173,8 @@ impl Default for Settings {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
             recording_root: None,
+            transfer_folder: None,
+            transfer_protocol: None,
         }
     }
 }
@@ -587,6 +597,8 @@ mod tests {
             scrollback_lines: 1_234,
             terminal_font_size: 16.,
             recording_root: Some(PathBuf::from("/Users/someone/Desktop")),
+            transfer_folder: None,
+            transfer_protocol: None,
         });
         let json = serde_json::to_string(&store).unwrap();
         let restored: PresetStore = serde_json::from_str(&json).unwrap();

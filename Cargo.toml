@@ -3,8 +3,10 @@ name = "serialx"
 version = "0.5.0"
 edition = "2024"
 # Also the repository's About on GitHub, the About dialog's line under the
-# version, and the first line of both READMEs: change them together.
-description = "A modern serial port workspace built with GPUI — a real terminal for your devices, with saved sessions and quick send."
+# version, the first line of both READMEs, the Comment in
+# packaging/linux/serialx.desktop and the .deb Description in
+# .github/workflows/release.yml: change them together.
+description = "Cross-platform serial port workspace built in Rust with GPUI. A real terminal for your devices in an editor-like workbench: organise ports as saved sessions and split panes, read traffic as text or hex with timestamps, filter and find, record every byte, and move files over XMODEM/YMODEM/ZMODEM."
 license = "GPL-3.0-only"
 
 [dependencies]

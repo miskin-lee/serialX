@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=serialX
-Comment=A modern serial port workspace built with GPUI — a real terminal for your devices, with saved sessions and quick send.
+Comment=Cross-platform serial port workspace built in Rust with GPUI. A real terminal for your devices in an editor-like workbench: organise ports as saved sessions and split panes, read traffic as text or hex with timestamps, filter and find, record every byte, and move files over XMODEM/YMODEM/ZMODEM.
 Exec=serialx
 Icon=serialx
 Terminal=false

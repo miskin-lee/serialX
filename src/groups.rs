@@ -22,8 +22,8 @@ use crate::theme::{LABEL, TITLE, Typography};
 
 /// Width of the prompt: a name, and a sentence about where it goes.
 const PROMPT_WIDTH: f32 = 420.;
-/// Height of the name field, the same as the session dialog's fields.
-const FIELD_HEIGHT: f32 = 30.;
+/// Height of the name field, the same as the other standalone dialogs' fields.
+const FIELD_HEIGHT: f32 = 32.;
 
 /// What the prompt is for: a group there is not yet, in one of the two
 /// libraries, or a new name for one there is.
@@ -94,6 +94,21 @@ impl SerialWorkspace {
             let workspace = workspace.clone();
             let input = input.clone();
             let on_saved = on_saved.clone();
+            // `Input::h` is the multi-line box's own and shadows the style,
+            // so the frame is given its height through `Styled`, or a
+            // single line keeps the height of its size.
+            let name_field = Styled::h(
+                Input::new(&input)
+                    .small()
+                    .text_token(LABEL)
+                    .font_weight(FontWeight::NORMAL)
+                    .bg(rgb(palette.input))
+                    .border_color(rgb(palette.input_border))
+                    .rounded(px(8.))
+                    .px_2p5()
+                    .cleanable(true),
+                px(FIELD_HEIGHT),
+            );
             alert
                 .width(px(PROMPT_WIDTH))
                 .p_5()
@@ -106,18 +121,7 @@ impl SerialWorkspace {
                 )
                 .description(blurb)
                 .close_button(true)
-                .child(
-                    Input::new(&input)
-                        .small()
-                        .h(px(FIELD_HEIGHT))
-                        .text_token(LABEL)
-                        .font_weight(FontWeight::NORMAL)
-                        .bg(rgb(palette.input))
-                        .border_color(rgb(palette.input_border))
-                        .rounded(px(8.))
-                        .px_2p5()
-                        .cleanable(true),
-                )
+                .child(name_field)
                 .footer(dialog_footer(palette, confirm, Glyph::Folder, None))
                 .on_ok(move |_, window, cx| {
                     // A blank name keeps the prompt open with the field in

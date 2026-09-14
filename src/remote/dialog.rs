@@ -200,15 +200,21 @@ impl RemoteEditor {
         ))
     }
 
+    /// A text field at the dialog's field height. `Input::h` is the
+    /// multi-line box's own and shadows the style, so the frame is given
+    /// its height through `Styled`, or a single line keeps the height of
+    /// its size.
     fn field(palette: WorkbenchPalette, input: &Entity<InputState>) -> Input {
-        Input::new(input)
-            .small()
-            .h(px(FIELD_HEIGHT))
-            .ui_mono_token(LABEL)
-            .bg(rgb(palette.input))
-            .border_color(rgb(palette.input_border))
-            .rounded(px(8.))
-            .px_2p5()
+        Styled::h(
+            Input::new(input)
+                .small()
+                .ui_mono_token(LABEL)
+                .bg(rgb(palette.input))
+                .border_color(rgb(palette.input_border))
+                .rounded(px(8.))
+                .px_2p5(),
+            px(FIELD_HEIGHT),
+        )
     }
 
     fn section(

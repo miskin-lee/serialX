@@ -59,7 +59,7 @@ use crate::{SerialWorkspace, format_bytes};
 /// Width of the dialog: the four protocol names on one rail at the label
 /// size, with air.
 const DIALOG_WIDTH: f32 = 480.;
-const FIELD_HEIGHT: f32 = 30.;
+const FIELD_HEIGHT: f32 = 32.;
 const SECTION_GAP: f32 = 16.;
 /// Height of the strip over the log while a transfer runs.
 const STRIP_HEIGHT: f32 = 30.;
@@ -1233,17 +1233,22 @@ impl TransferEditor {
     }
 
     fn render_name(&self, palette: WorkbenchPalette) -> impl IntoElement {
-        Self::section(
-            palette,
-            "File name",
+        // `Input::h` is the multi-line box's own and shadows the style, so
+        // the frame is given its height through `Styled`.
+        let field = Styled::h(
             Input::new(&self.name_input)
                 .small()
-                .h(px(FIELD_HEIGHT))
                 .ui_mono_token(LABEL)
                 .bg(rgb(palette.input))
                 .border_color(rgb(palette.input_border))
                 .rounded(px(8.))
                 .px_2p5(),
+            px(FIELD_HEIGHT),
+        );
+        Self::section(
+            palette,
+            "File name",
+            field,
             Ok(format!(
                 "{} carries no name, so the file needs one from here. The last block is padded out with 0x1A, as the protocol does.",
                 self.protocol.label()

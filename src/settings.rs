@@ -44,7 +44,7 @@ use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchP
 /// Width of the dialog: a number, and a sentence about it.
 const DIALOG_WIDTH: f32 = 420.;
 /// Height of a field, the same as the session dialog's fields.
-const FIELD_HEIGHT: f32 = 30.;
+const FIELD_HEIGHT: f32 = 32.;
 /// The gap between the two settings.
 const SECTION_GAP: f32 = 14.;
 /// Width of the size field: a couple of digits, a `pt` and a caret. The list
@@ -383,25 +383,30 @@ impl Render for SettingsEditor {
         let palette = self.theme.palette();
         // The field says as it is typed whether the number will do.
         let verdict = self.scrollback_lines(cx);
-        let lines = Input::new(&self.lines_input)
-            .small()
-            .h(px(FIELD_HEIGHT))
-            .ui_mono_token(LABEL)
-            .bg(rgb(palette.input))
-            .border_color(rgb(if verdict.is_ok() {
-                palette.input_border
-            } else {
-                palette.danger
-            }))
-            .rounded(px(8.))
-            .px_2p5()
-            .focus_bordered(verdict.is_ok())
-            .suffix(
-                div()
-                    .text_token(CAPTION)
-                    .text_color(rgb(palette.faint))
-                    .child("lines"),
-            );
+        // `Input::h` is the multi-line box's own and shadows the style, so
+        // the frame is given its height through `Styled`, or a single line
+        // keeps the height of its size.
+        let lines = Styled::h(
+            Input::new(&self.lines_input)
+                .small()
+                .ui_mono_token(LABEL)
+                .bg(rgb(palette.input))
+                .border_color(rgb(if verdict.is_ok() {
+                    palette.input_border
+                } else {
+                    palette.danger
+                }))
+                .rounded(px(8.))
+                .px_2p5()
+                .focus_bordered(verdict.is_ok())
+                .suffix(
+                    div()
+                        .text_token(CAPTION)
+                        .text_color(rgb(palette.faint))
+                        .child("lines"),
+                ),
+            px(FIELD_HEIGHT),
+        );
         let size = self.render_size_field(palette, cx);
         let recording = self.render_recording_field(palette, cx);
 

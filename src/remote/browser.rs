@@ -228,17 +228,22 @@ impl RemoteBrowser {
     }
 
     fn render_path_row(&self, palette: WorkbenchPalette, cx: &mut Context<Self>) -> AnyElement {
-        let field = Input::new(&self.path_input)
-            .small()
-            .ui_mono_token(LABEL)
-            .bg(rgb(palette.input))
-            .border_color(rgb(palette.input_border))
-            .rounded(px(8.))
-            .px_2p5();
+        // `Input::h` is the multi-line box's own and shadows the style, so
+        // the frame is given its height through `Styled`.
+        let field = Styled::h(
+            Input::new(&self.path_input)
+                .small()
+                .ui_mono_token(LABEL)
+                .bg(rgb(palette.input))
+                .border_color(rgb(palette.input_border))
+                .rounded(px(8.))
+                .px_2p5(),
+            px(FIELD_HEIGHT),
+        );
         h_flex()
             .items_center()
             .gap_1p5()
-            .child(div().flex_1().min_w_0().h(px(FIELD_HEIGHT)).child(field))
+            .child(div().flex_1().min_w_0().child(field))
             .child(
                 Button::new("remote-browser-up")
                     .outline()

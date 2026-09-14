@@ -1,6 +1,5 @@
 use std::{
     io::{Read, Write},
-    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,7 +18,7 @@ use crate::find::{FindState, FindView};
 use crate::hex::{HexDump, LogView};
 use crate::mask::MaskState;
 use crate::modem::{Sniffer, Tap, TransferEvent};
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, RecordingTarget};
 use crate::transfer::Transfer;
 use crate::terminal::Terminal;
 use crate::theme::TagColor;
@@ -55,7 +54,7 @@ pub(crate) enum PortKind {
     Unavailable,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PortItem {
     pub(crate) name: String,
     pub(crate) subtitle: String,
@@ -340,9 +339,11 @@ pub(crate) struct SerialTabState {
 }
 
 impl SerialTabState {
-    /// A tab with its boxes wired, keeping `scrollback` lines of log.
+    /// A tab with its boxes wired, keeping `scrollback` lines of log, offered
+    /// `ports` — the devices attached wherever the workbench is.
     pub(crate) fn new(
         id: usize,
+        ports: Vec<PortItem>,
         filter_input: Entity<InputState>,
         filter_subscription: Subscription,
         find_input: Entity<InputState>,
@@ -352,7 +353,7 @@ impl SerialTabState {
         let (event_tx, event_rx) = smol::channel::unbounded();
         Self {
             id,
-            ports: discover_ports(),
+            ports,
             selected_port: 0,
             configuration: SerialConfiguration::default(),
             color: TagColor::default(),
@@ -488,18 +489,18 @@ impl SerialTabState {
     /// records, and says in the log where it went — or why there is none.
     /// One connection is one file, so this is called each time the port
     /// opens rather than once for the tab.
-    pub(crate) fn begin_recording(&mut self, folder: Option<&Path>) {
+    pub(crate) fn begin_recording(&mut self, target: Option<RecordingTarget>) {
         if !self.record {
             return;
         }
-        let Some(folder) = folder else {
+        let Some(target) = target else {
             self.note("Recording: nowhere to write. Choose a folder in Settings.");
             return;
         };
         let title = self.title().to_string();
-        match Recorder::start(folder, &title) {
+        match Recorder::open(target, &title) {
             Ok(recorder) => {
-                let path = recorder.path().display().to_string();
+                let path = recorder.path().to_string();
                 self.recorder = Some(recorder);
                 self.note(format!("Recording to {path}"));
             }

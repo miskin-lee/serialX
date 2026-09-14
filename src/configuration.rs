@@ -73,6 +73,7 @@ use crate::groups::GroupPrompt;
 use crate::hex::LogView;
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{Library, StoredGroup, StoredSession};
+use crate::remote::RemoteContext;
 use crate::serial::{BaudRateError, DEFAULT_BAUD_RATE, is_listed_baud_rate, parse_baud_rate};
 use crate::theme::{
     BODY_STRONG, CAPTION, InterfaceTheme, LABEL, MICRO, TAG_HUE_COUNT, TITLE, TagColor, Typography,
@@ -80,7 +81,7 @@ use crate::theme::{
 };
 use crate::{
     BAUD_RATES, DATA_BITS, FLOW_CONTROLS, PARITIES, PortItem, PortKind, STOP_BITS,
-    SerialConfiguration, SerialWorkspace, discover_ports,
+    SerialConfiguration, SerialWorkspace,
 };
 
 /// Width of the dialog: room for a two-column frame, and for the baud field
@@ -319,6 +320,9 @@ struct SerialConfigurationEditor {
     /// The workspace the dialog was opened from: where a group made from
     /// here is kept.
     workspace: WeakEntity<SerialWorkspace>,
+    /// The host the workbench is on, whose devices the list shows and
+    /// whose agent a rescan asks.
+    remote: Option<RemoteContext>,
     ports: Vec<PortItem>,
     selected_port: usize,
     configuration: SerialConfiguration,
@@ -361,10 +365,11 @@ impl SerialConfigurationEditor {
         color: TagColor,
         group: Option<u64>,
         groups: Vec<StoredGroup>,
+        mut ports: Vec<PortItem>,
+        remote: Option<RemoteContext>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut ports = discover_ports();
         let mut selected_port = 0;
         let configuration = saved
             .map(|saved| saved.configuration.sanitized())
@@ -424,6 +429,7 @@ impl SerialConfigurationEditor {
             flash: None,
             copied: None,
             workspace,
+            remote,
             ports,
             selected_port,
             configuration,
@@ -550,10 +556,29 @@ impl SerialConfigurationEditor {
 
     /// Looks for devices again, keeping the current choice if it is still
     /// there — and keeping an absent saved device listed, so editing a saved
-    /// session never silently retargets it.
+    /// session never silently retargets it. On a host the agent does the
+    /// looking, and the list follows when its answer comes.
     fn rescan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(remote) = self.remote.clone() {
+            cx.spawn_in(window, async move |editor, cx| {
+                let outcome = remote.link.list_ports().await;
+                let _ = editor.update_in(cx, |editor, window, cx| {
+                    if let Ok(ports) = outcome {
+                        let _ = editor.workspace.update(cx, |workspace, cx| {
+                            workspace.adopt_host_ports(ports.clone(), cx);
+                        });
+                        editor.adopt_ports(ports, window, cx);
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.adopt_ports(crate::discover_ports(), window, cx);
+    }
+
+    fn adopt_ports(&mut self, mut ports: Vec<PortItem>, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.selected_port().cloned();
-        let mut ports = discover_ports();
         if let Some(current) = &current {
             if current.kind == PortKind::Unavailable
                 && !ports.iter().any(|port| port.name == current.name)
@@ -1533,6 +1558,9 @@ impl SerialWorkspace {
             .groups_in(Library::Sessions)
             .cloned()
             .collect::<Vec<_>>();
+        // The devices to list are the host's while the workbench is on one.
+        let ports = self.discover_ports();
+        let remote = self.remote_context();
         let workspace = cx.weak_entity();
         let editor = cx.new(|cx| {
             SerialConfigurationEditor::new(
@@ -1543,6 +1571,8 @@ impl SerialWorkspace {
                 color,
                 group,
                 groups,
+                ports,
+                remote,
                 window,
                 cx,
             )
@@ -1719,7 +1749,8 @@ impl SerialWorkspace {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let scrollback = self.presets.settings.scrollback_lines;
-        let mut tab = Self::build_tab(id, scrollback, window, cx);
+        let ports = self.discover_ports();
+        let mut tab = Self::build_tab(id, scrollback, ports, window, cx);
         tab.configuration = configuration.sanitized();
         tab.color = color;
         tab.alias = alias;

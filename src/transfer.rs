@@ -21,12 +21,13 @@
 //! opens the dialog with ZMODEM chosen.
 
 use std::{
-    env, io,
+    env, fs, io,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -38,11 +39,17 @@ use gpui_kit::component::{
     tooltip::Tooltip,
     v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::controls::{Choice, ChoiceText, dialog_footer, eyebrow, segmented, tag};
 use crate::icons::{Glyph, icon_chip};
 use crate::modem::{self, Direction, Link, Protocol, TransferEvent, TransferJob, Wire};
+use crate::remote::{
+    RemoteContext, RemoteLink, WriteOptions,
+    browser::{Pick, open_remote_browser},
+    remote_file_name, remote_join,
+};
 use crate::serial::{SerialCommand, SerialEvent, SerialTabState};
 use crate::theme::{
     CAPTION, InterfaceTheme, LABEL, MICRO, MONO_SMALL, TITLE, Typography, WorkbenchPalette, tint,
@@ -83,10 +90,46 @@ pub(crate) struct Transfer {
     /// the title bar's counters can be moved by the difference.
     wire: Wire,
     cancel: Arc<AtomicBool>,
+    /// The folder on this machine a transfer on a host goes through.
+    staging: Option<Staging>,
+}
+
+/// How a transfer on a host is staged through this machine: the protocol
+/// engines read and write files here, and the connection carries them
+/// the rest of the way.
+#[derive(Clone)]
+pub(crate) enum Staging {
+    /// The files were fetched from the host into this folder, which goes
+    /// with the transfer.
+    Fetched { folder: PathBuf },
+    /// Received files land in this folder and go up to `destination` on
+    /// the host once the transfer is over.
+    Landing {
+        folder: PathBuf,
+        destination: String,
+        link: RemoteLink,
+    },
+}
+
+/// A staged transfer that is over: what to do with the staging folder,
+/// and the files that arrived in it.
+pub(crate) struct StagingOutcome {
+    staging: Staging,
+    files: Vec<(String, u64)>,
+}
+
+/// A folder of this machine's for one transfer to go through.
+fn staging_folder() -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    env::temp_dir().join(format!(
+        "serialX-transfer-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 impl Transfer {
-    fn new(job: &TransferJob, cancel: Arc<AtomicBool>) -> Self {
+    fn new(job: &TransferJob, cancel: Arc<AtomicBool>, staging: Option<Staging>) -> Self {
         Self {
             protocol: job.protocol(),
             direction: job.direction(),
@@ -96,6 +139,7 @@ impl Transfer {
             file_started: Instant::now(),
             wire: Wire::default(),
             cancel,
+            staging,
         }
     }
 
@@ -160,11 +204,13 @@ impl SerialTabState {
     /// Takes what the transfer's thread reported: moves the strip along,
     /// keeps the title bar's counters honest about what the port carried,
     /// and when the run is over says so in the log and lets the port go.
-    pub(crate) fn transfer_event(&mut self, event: TransferEvent) {
+    /// A staged transfer that is over hands back its staging, for the
+    /// workbench to finish.
+    pub(crate) fn transfer_event(&mut self, event: TransferEvent) -> Option<StagingOutcome> {
         // A transfer ended from this end — a disconnect — has nothing
         // left to hear.
         let Some(mut transfer) = self.transfer.take() else {
-            return;
+            return None;
         };
         let wire = match &event {
             TransferEvent::Progress { wire, .. }
@@ -189,10 +235,12 @@ impl SerialTabState {
                 transfer.done = 0;
                 transfer.file_started = Instant::now();
                 self.transfer = Some(transfer);
+                None
             }
             TransferEvent::Progress { done, .. } => {
                 transfer.done = done;
                 self.transfer = Some(transfer);
+                None
             }
             TransferEvent::Finished { files, elapsed, .. } => {
                 let verb = match transfer.direction {
@@ -212,6 +260,9 @@ impl SerialTabState {
                     "{verb} {what} over {protocol} in {}",
                     format_elapsed(elapsed)
                 ));
+                transfer
+                    .staging
+                    .map(|staging| StagingOutcome { staging, files })
             }
             TransferEvent::Failed {
                 reason, cancelled, ..
@@ -225,6 +276,10 @@ impl SerialTabState {
                 } else {
                     self.note(format!("{protocol} {verb} failed: {reason}"));
                 }
+                transfer.staging.map(|staging| StagingOutcome {
+                    staging,
+                    files: Vec::new(),
+                })
             }
         }
     }
@@ -293,7 +348,11 @@ impl SerialWorkspace {
             .or(self.presets.settings.transfer_protocol)
             .unwrap_or(DEFAULT_PROTOCOL);
         let folder = self.transfer_folder();
-        let editor = cx.new(|cx| TransferEditor::new(theme, direction, protocol, folder, window, cx));
+        let remote = self.remote_context();
+        let on_host = remote.as_ref().map(|remote| remote.title.clone());
+        let editor = cx.new(|cx| {
+            TransferEditor::new(theme, direction, protocol, folder, remote, window, cx)
+        });
         let workspace = cx.weak_entity();
 
         window.open_alert_dialog(cx, move |alert, _, _| {
@@ -304,7 +363,11 @@ impl SerialWorkspace {
                     Glyph::Upload,
                     "Send a file",
                     format!(
-                        "To {title}. The device has to be waiting for it: rz at a shell, or a bootloader's load command."
+                        "To {title}{}. The device has to be waiting for it: rz at a shell, or a bootloader's load command.",
+                        on_host
+                            .as_ref()
+                            .map(|host| format!(", from the files on {host}"))
+                            .unwrap_or_default()
                     ),
                     "Send",
                 ),
@@ -312,7 +375,11 @@ impl SerialWorkspace {
                     Glyph::Download,
                     "Receive a file",
                     format!(
-                        "From {title}. The device has to be sending it: sz at a shell, or a dump command."
+                        "From {title}{}. The device has to be sending it: sz at a shell, or a dump command.",
+                        on_host
+                            .as_ref()
+                            .map(|host| format!(", into a folder on {host}"))
+                            .unwrap_or_default()
                     ),
                     "Receive",
                 ),
@@ -347,7 +414,16 @@ impl SerialWorkspace {
 
     /// Where received files go: the folder chosen last, or the account's
     /// downloads, or — on a machine with neither — the temporary folder.
+    /// On a host, the folder chosen there, else the host's downloads.
     fn transfer_folder(&self) -> PathBuf {
+        if let Some(info) = self.remote_info() {
+            return self
+                .presets
+                .settings
+                .transfer_folder
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(&info.downloads));
+        }
         self.presets
             .settings
             .transfer_folder
@@ -356,10 +432,10 @@ impl SerialWorkspace {
             .unwrap_or_else(env::temp_dir)
     }
 
-    /// Runs a job on a tab's port: takes the port's reader over through
-    /// its tap, keeps the strip's state on the tab, and notes in the log
-    /// that it has begun. The choices are kept with the settings, so the
-    /// next dialog opens on them.
+    /// Runs a job on a tab's port. The choices are kept with the settings,
+    /// so the next dialog opens on them. On a host the files are the
+    /// host's: a send fetches them here first, a receive lands them here
+    /// and sends them up after.
     pub(crate) fn start_transfer(&mut self, tab_id: usize, job: TransferJob, cx: &mut Context<Self>) {
         let mut settings = self.presets.settings.clone();
         settings.transfer_protocol = Some(job.protocol());
@@ -378,6 +454,64 @@ impl SerialWorkspace {
         }
         if tab.transfer.is_some() {
             tab.note("A transfer is already running on this session.");
+            cx.notify();
+            return;
+        }
+
+        let Some(remote) = self.remote_context() else {
+            self.launch_transfer(tab_id, job, None, cx);
+            return;
+        };
+        match job {
+            TransferJob::Send { protocol, paths } => {
+                self.fetch_then_send(tab_id, protocol, paths, remote, cx);
+            }
+            TransferJob::Receive {
+                protocol,
+                folder,
+                name,
+            } => {
+                let landing = staging_folder();
+                if let Err(error) = fs::create_dir_all(&landing) {
+                    if let Some(tab) = self.tab_mut(tab_id) {
+                        tab.note(format!("Could not make a folder to receive into: {error}"));
+                    }
+                    cx.notify();
+                    return;
+                }
+                let destination = folder.to_string_lossy().into_owned();
+                self.launch_transfer(
+                    tab_id,
+                    TransferJob::Receive {
+                        protocol,
+                        folder: landing.clone(),
+                        name,
+                    },
+                    Some(Staging::Landing {
+                        folder: landing,
+                        destination,
+                        link: remote.link,
+                    }),
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Takes the port's reader over through its tap, keeps the strip's
+    /// state on the tab, and notes in the log that the job has begun.
+    fn launch_transfer(
+        &mut self,
+        tab_id: usize,
+        job: TransferJob,
+        staging: Option<Staging>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        if !tab.connected || tab.transfer.is_some() {
+            tab.note("The transfer did not start: the session changed meanwhile.");
             cx.notify();
             return;
         }
@@ -403,8 +537,8 @@ impl SerialWorkspace {
                 }
             },
         );
-        tab.note(match &job {
-            TransferJob::Send { protocol, paths } => format!(
+        tab.note(match (&job, &staging) {
+            (TransferJob::Send { protocol, paths }, _) => format!(
                 "Sending {} over {}…",
                 paths
                     .iter()
@@ -414,19 +548,189 @@ impl SerialWorkspace {
                     .join(", "),
                 protocol.label()
             ),
-            TransferJob::Receive {
-                protocol, folder, ..
-            } => format!(
+            (
+                TransferJob::Receive { protocol, .. },
+                Some(Staging::Landing { destination, .. }),
+            ) => format!(
+                "Receiving over {} into {destination} on the host…",
+                protocol.label()
+            ),
+            (
+                TransferJob::Receive {
+                    protocol, folder, ..
+                },
+                _,
+            ) => format!(
                 "Receiving over {} into {}…",
                 protocol.label(),
                 folder.display()
             ),
         });
-        tab.transfer = Some(Transfer::new(&job, cancel));
+        tab.transfer = Some(Transfer::new(&job, cancel, staging));
         modem::start(job, link, move |event| {
             let _ = events.send_blocking(SerialEvent::Transfer(event));
         });
         cx.notify();
+    }
+
+    /// Brings the host's files here, then sends them: the engines read
+    /// files, and the host's are not files to them until they are here.
+    fn fetch_then_send(
+        &mut self,
+        tab_id: usize,
+        protocol: Protocol,
+        paths: Vec<PathBuf>,
+        remote: RemoteContext,
+        cx: &mut Context<Self>,
+    ) {
+        let folder = staging_folder();
+        if let Err(error) = fs::create_dir_all(&folder) {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.note(format!("Could not make a folder to fetch into: {error}"));
+            }
+            cx.notify();
+            return;
+        }
+        let names: Vec<String> = paths
+            .iter()
+            .map(|path| remote_file_name(&path.to_string_lossy()).to_string())
+            .collect();
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.note(format!(
+                "Fetching {} from {}…",
+                names.join(", "),
+                remote.title
+            ));
+        }
+        cx.notify();
+
+        let link = remote.link;
+        cx.spawn(async move |this, cx| {
+            let mut local = Vec::with_capacity(paths.len());
+            let mut failure = None;
+            for path in &paths {
+                let on_host = path.to_string_lossy().into_owned();
+                let target = folder.join(remote_file_name(&on_host));
+                match link.read_file(&on_host).await {
+                    Ok(bytes) => {
+                        let written = {
+                            let target = target.clone();
+                            smol::unblock(move || fs::write(target, bytes)).await
+                        };
+                        if let Err(error) = written {
+                            failure = Some(format!("{}: {error}", target.display()));
+                            break;
+                        }
+                        local.push(target);
+                    }
+                    Err(error) => {
+                        failure = Some(format!("{on_host}: {error}"));
+                        break;
+                    }
+                }
+            }
+            let _ = this.update(cx, |this, cx| match failure {
+                Some(reason) => {
+                    let _ = fs::remove_dir_all(&folder);
+                    if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.note(format!("Could not fetch from the host: {reason}"));
+                    }
+                    cx.notify();
+                }
+                None => this.launch_transfer(
+                    tab_id,
+                    TransferJob::Send {
+                        protocol,
+                        paths: local,
+                    },
+                    Some(Staging::Fetched { folder }),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// A staged transfer is over: a fetched folder goes, and what landed
+    /// goes up to the host and is said in the log by the name it got there.
+    pub(crate) fn finish_staging(
+        &mut self,
+        tab_id: usize,
+        outcome: StagingOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        let StagingOutcome { staging, files } = outcome;
+        let (folder, destination, link) = match staging {
+            Staging::Fetched { folder } => {
+                thread::spawn(move || {
+                    let _ = fs::remove_dir_all(folder);
+                });
+                return;
+            }
+            Staging::Landing {
+                folder,
+                destination,
+                link,
+            } => (folder, destination, link),
+        };
+        if files.is_empty() {
+            thread::spawn(move || {
+                let _ = fs::remove_dir_all(folder);
+            });
+            return;
+        }
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.note(format!(
+                "Copying {} to {destination} on the host…",
+                if files.len() == 1 {
+                    "the file".to_string()
+                } else {
+                    format!("{} files", files.len())
+                }
+            ));
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let mut saved = Vec::new();
+            let mut failures = Vec::new();
+            for (name, _) in files {
+                let local = folder.join(&name);
+                let bytes = smol::unblock(move || fs::read(local)).await;
+                let outcome = match bytes {
+                    Ok(bytes) => {
+                        link.write_file(
+                            &remote_join(&destination, &name),
+                            &bytes,
+                            WriteOptions {
+                                append: false,
+                                mkdirs: true,
+                                unique: true,
+                            },
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error.to_string()),
+                };
+                match outcome {
+                    Ok(written) => saved.push(written.path),
+                    Err(error) => failures.push(format!("{name}: {error}")),
+                }
+            }
+            let _ = fs::remove_dir_all(&folder);
+            let _ = this.update(cx, |this, cx| {
+                if let Some(tab) = this.tab_mut(tab_id) {
+                    if !saved.is_empty() {
+                        tab.note(format!("Saved on the host: {}", saved.join(", ")));
+                    }
+                    for failure in failures {
+                        tab.note(format!("Could not save on the host: {failure}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The strip's `Cancel`: the transfer's thread is asked to stop, and
@@ -573,6 +877,9 @@ struct TransferEditor {
     paths: Vec<PathBuf>,
     /// Where a received file goes.
     folder: PathBuf,
+    /// The host the files are on, while the workbench is on one: the
+    /// picker is then the host's folders rather than the platform's.
+    remote: Option<RemoteContext>,
     /// The name a received file gets, under a protocol that carries none.
     name_input: Entity<InputState>,
     _name_subscription: Subscription,
@@ -586,6 +893,7 @@ impl TransferEditor {
         direction: Direction,
         protocol: Protocol,
         folder: PathBuf,
+        remote: Option<RemoteContext>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -606,6 +914,7 @@ impl TransferEditor {
             protocol,
             paths: Vec::new(),
             folder,
+            remote,
             name_input,
             _name_subscription: name_subscription,
             complaint: None,
@@ -618,9 +927,39 @@ impl TransferEditor {
         cx.notify();
     }
 
-    /// Asks the platform for the file, or files when the protocol takes
-    /// several. A cancelled pick keeps what was picked before.
-    fn choose_files(&mut self, cx: &mut Context<Self>) {
+    /// Asks for the file, or files when the protocol takes several: the
+    /// platform's picker here, the host's folders there. A cancelled pick
+    /// keeps what was picked before.
+    fn choose_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(remote) = self.remote.clone() {
+            let start = self
+                .paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(|parent| parent.to_string_lossy().into_owned())
+                .filter(|parent| !parent.is_empty())
+                .unwrap_or_else(|| remote.home.clone());
+            let editor = cx.weak_entity();
+            open_remote_browser(
+                remote.link,
+                Pick::Files {
+                    several: self.protocol.batches(),
+                },
+                start,
+                remote.home,
+                self.theme,
+                window,
+                cx,
+                move |paths, _, cx| {
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.paths = paths.into_iter().map(PathBuf::from).collect();
+                        editor.complaint = None;
+                        cx.notify();
+                    });
+                },
+            );
+            return;
+        }
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -643,8 +982,32 @@ impl TransferEditor {
         .detach();
     }
 
-    /// Asks the platform for the folder received files go to.
-    fn choose_folder(&mut self, cx: &mut Context<Self>) {
+    /// Asks for the folder received files go to: the platform's picker
+    /// here, the host's folders there.
+    fn choose_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(remote) = self.remote.clone() {
+            let start = self.folder.to_string_lossy().into_owned();
+            let editor = cx.weak_entity();
+            open_remote_browser(
+                remote.link,
+                Pick::Folder,
+                start,
+                remote.home,
+                self.theme,
+                window,
+                cx,
+                move |paths, _, cx| {
+                    let Some(folder) = paths.into_iter().next() else {
+                        return;
+                    };
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.folder = PathBuf::from(folder);
+                        cx.notify();
+                    });
+                },
+            );
+            return;
+        }
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -820,7 +1183,12 @@ impl TransferEditor {
                         .small()
                         .h(px(FIELD_HEIGHT))
                         .label("Choose…")
-                        .on_click(cx.listener(|editor, _, _, cx| editor.choose_files(cx))),
+                        .when(self.remote.is_some(), |button| {
+                            button.tooltip("Pick from the files on the host")
+                        })
+                        .on_click(cx.listener(|editor, _, window, cx| {
+                            editor.choose_files(window, cx)
+                        })),
                 ),
             hint,
         )
@@ -829,7 +1197,11 @@ impl TransferEditor {
     fn render_folder(&self, palette: WorkbenchPalette, cx: &mut Context<Self>) -> impl IntoElement {
         Self::section(
             palette,
-            "Save to",
+            if self.remote.is_some() {
+                "Save to, on the host"
+            } else {
+                "Save to"
+            },
             h_flex()
                 .items_center()
                 .gap_2()
@@ -845,7 +1217,12 @@ impl TransferEditor {
                         .small()
                         .h(px(FIELD_HEIGHT))
                         .label("Choose…")
-                        .on_click(cx.listener(|editor, _, _, cx| editor.choose_folder(cx))),
+                        .when(self.remote.is_some(), |button| {
+                            button.tooltip("Pick a folder on the host")
+                        })
+                        .on_click(cx.listener(|editor, _, window, cx| {
+                            editor.choose_folder(window, cx)
+                        })),
                 ),
             Ok(if self.protocol.carries_name() {
                 "The file is written under the name the device sends; a name that is taken gets a number after it.".to_string()

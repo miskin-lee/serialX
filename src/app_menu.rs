@@ -52,6 +52,8 @@ actions!(
         OpenRepository,
         ReportIssue,
         ShowAbout,
+        ConnectRemoteHost,
+        DisconnectRemoteHost,
         QuitApplication
     ]
 );
@@ -95,6 +97,9 @@ keystroke!(FIND_KEYSTROKE, "cmd-f", "ctrl-f");
 keystroke!(FIND_NEXT_KEYSTROKE, "cmd-g", "f3");
 keystroke!(FIND_PREVIOUS_KEYSTROKE, "cmd-shift-g", "shift-f3");
 keystroke!(SETTINGS_KEYSTROKE, "cmd-,", "ctrl-,");
+// Connecting to a host has a key of its own, since it is the first thing
+// done in a sitting that is about one.
+keystroke!(CONNECT_HOST_KEYSTROKE, "cmd-shift-r", "ctrl-shift-r");
 keystroke!(QUIT_KEYSTROKE, "cmd-q", "ctrl-q");
 // Select all and copy in the log, while it is in focus. On macOS they are
 // ⌘A and ⌘C, as everywhere. Elsewhere Ctrl+A and Ctrl+C belong to the
@@ -155,6 +160,12 @@ fn application_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Previous Session", PreviousTab),
             MenuItem::action("Next Session", NextTab),
+        ]),
+        // The host the workbench is on: the one thing that is not about a
+        // session or about how the log is shown.
+        Menu::new("Remote").items([
+            MenuItem::action("Connect to Host…", ConnectRemoteHost),
+            MenuItem::action("Disconnect from Host", DisconnectRemoteHost),
         ]),
         Menu::new("View").items([
             MenuItem::action("Find…", FindInOutput),
@@ -266,6 +277,7 @@ pub(crate) fn configure_application_menus(cx: &mut App) {
         KeyBinding::new("tab", SendTab, Some(TERMINAL_CONTEXT)),
         KeyBinding::new("shift-tab", SendBackTab, Some(TERMINAL_CONTEXT)),
         KeyBinding::new(SETTINGS_KEYSTROKE, OpenSettings, None),
+        KeyBinding::new(CONNECT_HOST_KEYSTROKE, ConnectRemoteHost, None),
         KeyBinding::new(QUIT_KEYSTROKE, QuitApplication, None),
     ]);
     // The other paste the platform's terminals take, beside Ctrl+Shift+V,
@@ -474,6 +486,20 @@ pub(crate) fn bind_window_actions(workspace: &Entity<SerialWorkspace>, cx: &mut 
     cx.on_action(move |_: &ShowAbout, cx| {
         defer_window_action(cx, view.clone(), |_, window, cx| {
             SerialWorkspace::show_about_dialog(window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &ConnectRemoteHost, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.open_remote_dialog(window, cx);
+        });
+    });
+
+    let view = workspace.downgrade();
+    cx.on_action(move |_: &DisconnectRemoteHost, cx| {
+        defer_window_action(cx, view.clone(), |view, window, cx| {
+            view.disconnect_remote(window, cx);
         });
     });
 

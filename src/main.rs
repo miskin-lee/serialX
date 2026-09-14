@@ -16,6 +16,7 @@ mod modem;
 mod panes;
 mod presets;
 mod recorder;
+mod remote;
 mod serial;
 mod settings;
 mod sidebar;
@@ -49,6 +50,10 @@ use gpui_kit::*;
 use icons::WorkbenchAssets;
 use panes::{Pane, SplitAxis};
 use presets::PresetStore;
+use recorder::{RecordingTarget, recordings_folder, remote_recordings_folder};
+use remote::{
+    HostBook, RemoteConnection, RemoteContext, RemoteEvent, RemoteHost, RemoteInfo, RemoteLink,
+};
 use serial::*;
 use sidebar::{
     ListSearch, SEND_PLACEHOLDER, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_WIDTH,
@@ -90,6 +95,25 @@ enum UpdateStatus {
     Failed,
 }
 
+/// The host the workbench is on, or is getting to: the connection, and what
+/// the host said of itself once it answered.
+struct Remote {
+    host: RemoteHost,
+    connection: RemoteConnection,
+    /// Filled when the agent's hello comes; until then the connection is
+    /// being made.
+    info: Option<RemoteInfo>,
+    /// Which attempt this is, so events of an earlier one are let go.
+    generation: usize,
+}
+
+/// What the title bar says of the host.
+pub(crate) enum RemoteStatus {
+    Local,
+    Connecting(String),
+    Connected(String),
+}
+
 pub struct SerialWorkspace {
     /// Every open session, in the order they were opened. Which pane shows
     /// which of them, and in what order, is the panes' business.
@@ -108,7 +132,19 @@ pub struct SerialWorkspace {
     /// whenever a pane is added or taken away, so a new split opens evenly.
     pane_layout: Entity<ResizableState>,
     interface_theme: InterfaceTheme,
+    /// The workspace in use: this machine's, or the host's while the
+    /// workbench is on one.
     presets: PresetStore,
+    /// This machine's workspace, kept aside while the host's is in use.
+    local_presets: Option<PresetStore>,
+    /// The hosts the workbench knows. This machine's, whichever is connected.
+    hosts: HostBook,
+    /// The host the workbench is on, or is getting to.
+    remote: Option<Remote>,
+    remote_generation: usize,
+    /// Bumped whenever the host's device list is read again, so a dialog
+    /// showing it knows to look.
+    pub(crate) ports_generation: usize,
     update_status: UpdateStatus,
     update_tx: Sender<UpdateEvent>,
     update_rx: Receiver<UpdateEvent>,
@@ -177,6 +213,11 @@ impl SerialWorkspace {
             pane_layout: cx.new(|_| ResizableState::default()),
             interface_theme,
             presets: PresetStore::load(),
+            local_presets: None,
+            hosts: HostBook::load(),
+            remote: None,
+            remote_generation: 0,
+            ports_generation: 0,
             update_status: UpdateStatus::Checking,
             update_tx,
             update_rx,
@@ -239,10 +280,12 @@ impl SerialWorkspace {
     }
 
     /// A tab with its two boxes wired — the title bar's filter and the
-    /// find bar's — keeping the scrollback the settings say.
+    /// find bar's — keeping the scrollback the settings say, offered the
+    /// devices attached wherever the workbench is.
     fn build_tab(
         id: usize,
         scrollback: usize,
+        ports: Vec<PortItem>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SerialTabState {
@@ -264,6 +307,7 @@ impl SerialWorkspace {
         let (find_input, find_subscription) = Self::build_find_input(id, window, cx);
         let mut tab = SerialTabState::new(
             id,
+            ports,
             filter_input,
             filter_subscription,
             find_input,
@@ -434,16 +478,43 @@ impl SerialWorkspace {
     }
 
     fn refresh_ports(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.connected || tab.connecting {
+            return;
+        }
+        // On a host the scan is the agent's, and comes back when it comes.
+        if let Some(link) = self.remote_link() {
+            cx.spawn(async move |this, cx| {
+                let outcome = link.list_ports().await;
+                let _ = this.update(cx, |this, cx| match outcome {
+                    Ok(ports) => this.adopt_host_ports(ports, cx),
+                    Err(error) => {
+                        if let Some(tab) = this.active_tab_mut() {
+                            tab.note(format!("Scan failed on the host: {error}"));
+                        }
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.adopt_ports(discover_ports(), cx);
+    }
+
+    /// Gives the session in front a fresh device list, keeping it bound to
+    /// its port: one that the scan no longer finds is kept on the list as
+    /// unavailable rather than silently swapped.
+    fn adopt_ports(&mut self, mut ports: Vec<PortItem>, cx: &mut Context<Self>) {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if tab.connected || tab.connecting {
             return;
         }
-        // The tab stays bound to its port: one that the scan no longer finds
-        // is kept on the list as unavailable rather than silently swapped.
         let current = tab.selected_port().clone();
-        let mut ports = discover_ports();
         let found = ports.len();
         if !ports.iter().any(|port| port.name == current.name) {
             ports.push(PortItem::unavailable(
@@ -460,7 +531,28 @@ impl SerialWorkspace {
         cx.notify();
     }
 
+    /// Takes a device list the host sent: the workbench's copy of it, then
+    /// the session in front.
+    pub(crate) fn adopt_host_ports(&mut self, ports: Vec<PortItem>, cx: &mut Context<Self>) {
+        if let Some(info) = self.remote.as_mut().and_then(|remote| remote.info.as_mut()) {
+            info.ports = ports.clone();
+            self.ports_generation += 1;
+        }
+        self.adopt_ports(ports, cx);
+        cx.notify();
+    }
+
+    /// The devices attached wherever the workbench is: scanned here, or
+    /// the host's list as it was last read.
+    pub(crate) fn discover_ports(&self) -> Vec<PortItem> {
+        match self.remote_info() {
+            Some(info) => info.ports.clone(),
+            None => discover_ports(),
+        }
+    }
+
     fn toggle_connection(&mut self, tab_id: usize, cx: &mut Context<Self>) {
+        let link = self.remote_link();
         let Some(index) = self.tab_index(tab_id) else {
             return;
         };
@@ -474,16 +566,29 @@ impl SerialWorkspace {
         }
 
         let selected = tab.selected_port().clone();
-        let (command_tx, command_rx) = mpsc::channel();
-        tab.command_tx = Some(command_tx);
         tab.connecting = true;
-        spawn_serial_worker(
-            selected.name,
-            tab.configuration,
-            command_rx,
-            tab.event_tx.clone(),
-            tab.tap.clone(),
-        );
+        // On a host the agent opens the port; here a thread of our own does.
+        match link {
+            Some(link) => {
+                tab.command_tx = Some(link.open_port(
+                    &selected.name,
+                    &tab.configuration,
+                    tab.event_tx.clone(),
+                    tab.tap.clone(),
+                ));
+            }
+            None => {
+                let (command_tx, command_rx) = mpsc::channel();
+                tab.command_tx = Some(command_tx);
+                spawn_serial_worker(
+                    selected.name,
+                    tab.configuration,
+                    command_rx,
+                    tab.event_tx.clone(),
+                    tab.tap.clone(),
+                );
+            }
+        }
         cx.notify();
     }
 
@@ -496,6 +601,247 @@ impl SerialWorkspace {
         if attached {
             self.toggle_connection(tab_id, cx);
         }
+    }
+
+    /// The link to the host, once the agent has answered.
+    fn remote_link(&self) -> Option<RemoteLink> {
+        self.remote
+            .as_ref()
+            .filter(|remote| remote.info.is_some())
+            .map(|remote| remote.connection.link().clone())
+    }
+
+    /// What the host said of itself, while the workbench is on one.
+    fn remote_info(&self) -> Option<&RemoteInfo> {
+        self.remote.as_ref().and_then(|remote| remote.info.as_ref())
+    }
+
+    /// The host's name, while the workbench is on one.
+    pub(crate) fn remote_title(&self) -> Option<String> {
+        self.remote
+            .as_ref()
+            .filter(|remote| remote.info.is_some())
+            .map(|remote| remote.host.title())
+    }
+
+    /// What a dialog needs of the host, while the workbench is on one.
+    pub(crate) fn remote_context(&self) -> Option<RemoteContext> {
+        let remote = self.remote.as_ref()?;
+        let info = remote.info.as_ref()?;
+        Some(RemoteContext {
+            link: remote.connection.link().clone(),
+            home: info.home.clone(),
+            title: remote.host.title(),
+        })
+    }
+
+    pub(crate) fn remote_status(&self) -> RemoteStatus {
+        match &self.remote {
+            None => RemoteStatus::Local,
+            Some(remote) if remote.info.is_some() => RemoteStatus::Connected(remote.host.title()),
+            Some(remote) => RemoteStatus::Connecting(remote.host.title()),
+        }
+    }
+
+    /// Where a session that records writes: on the host while the
+    /// workbench is on one, else on this machine.
+    fn recording_target(&self) -> Option<RecordingTarget> {
+        match (self.remote_link(), self.remote_info()) {
+            (Some(link), Some(info)) => {
+                let chosen = self
+                    .presets
+                    .settings
+                    .recording_root
+                    .as_ref()
+                    .map(|root| root.to_string_lossy().into_owned());
+                Some(RecordingTarget::Remote {
+                    link,
+                    folder: remote_recordings_folder(chosen.as_deref(), &info.documents),
+                })
+            }
+            _ => recordings_folder(self.presets.settings.recording_root())
+                .map(RecordingTarget::Local),
+        }
+    }
+
+    /// Moves the workbench to a host: the open sessions close, `ssh` is
+    /// started with the agent, and what comes of it arrives as events.
+    pub(crate) fn connect_remote(
+        &mut self,
+        host: RemoteHost,
+        password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.leave_remote(cx);
+        self.close_all_tabs(cx);
+        self.remote_generation += 1;
+        let generation = self.remote_generation;
+        match RemoteConnection::connect(host.clone(), password) {
+            Ok((connection, events)) => {
+                self.remote = Some(Remote {
+                    host,
+                    connection,
+                    info: None,
+                    generation,
+                });
+                cx.spawn(async move |this, cx| {
+                    while let Ok(event) = events.recv().await {
+                        if this
+                            .update(cx, |this, cx| this.remote_event(generation, event, cx))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(error) => {
+                let title = host.title();
+                self.defer_with_window(cx, move |_, window, cx| {
+                    Self::show_remote_error_dialog(
+                        &title,
+                        format!("ssh could not be started: {error}"),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// `Remote > Disconnect from Host`: back to this machine, its devices
+    /// and its workspace. The host's sessions close with the connection.
+    pub(crate) fn disconnect_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.remote.as_ref().map(|remote| remote.host.title()) else {
+            return;
+        };
+        self.close_all_tabs(cx);
+        self.leave_remote(cx);
+        window.push_notification(
+            Notification::info("Back to this machine's devices and workspace.")
+                .title(format!("Disconnected from {title}")),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Lets the host go, whatever state the connection is in, and puts
+    /// this machine's workspace back.
+    fn leave_remote(&mut self, cx: &mut Context<Self>) {
+        self.remote = None;
+        if let Some(local) = self.local_presets.take() {
+            self.presets = local;
+            self.selected_saved = None;
+            self.collapsed_groups.clear();
+            self.ports_generation += 1;
+        }
+        cx.notify();
+    }
+
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<usize> = self.tabs.iter().map(|tab| tab.id).collect();
+        for id in ids {
+            self.close_tab(id, cx);
+        }
+    }
+
+    /// What the connection reports. Events of an attempt that was given
+    /// up are let go.
+    fn remote_event(&mut self, generation: usize, event: RemoteEvent, cx: &mut Context<Self>) {
+        let Some(remote) = self
+            .remote
+            .as_mut()
+            .filter(|remote| remote.generation == generation)
+        else {
+            return;
+        };
+        let title = remote.host.title();
+        match event {
+            RemoteEvent::Ready(info) => {
+                let link = remote.connection.link().clone();
+                let store = PresetStore::from_remote(
+                    info.workspace.as_deref(),
+                    link,
+                    info.workspace_path.clone(),
+                );
+                let devices = info.ports.len();
+                let account = format!("{}@{}", info.user, info.hostname);
+                let platform = match info.platform.as_str() {
+                    "darwin" => "macOS".to_string(),
+                    "" => "unknown platform".to_string(),
+                    platform if platform.starts_with("linux") => "Linux".to_string(),
+                    platform => platform.to_string(),
+                };
+                remote.info = Some(info);
+                let local = std::mem::replace(&mut self.presets, store);
+                if self.local_presets.is_none() {
+                    self.local_presets = Some(local);
+                }
+                self.selected_saved = None;
+                self.collapsed_groups.clear();
+                self.ports_generation += 1;
+                let devices = match devices {
+                    1 => "1 serial device".to_string(),
+                    n => format!("{n} serial devices"),
+                };
+                self.defer_with_window(cx, move |_, window, cx| {
+                    window.push_notification(
+                        Notification::success(format!(
+                            "{account} · {platform} · {devices}. The saved sessions, commands and folders are the host's now."
+                        ))
+                        .title(format!("Connected to {title}")),
+                        cx,
+                    );
+                });
+            }
+            RemoteEvent::Failed(message) => {
+                self.leave_remote(cx);
+                self.defer_with_window(cx, move |_, window, cx| {
+                    Self::show_remote_error_dialog(&title, message, window, cx);
+                });
+            }
+            RemoteEvent::Closed(message) => {
+                // The host's ports have already told their tabs; the tabs
+                // stay, with their logs, until the workbench moves again.
+                self.leave_remote(cx);
+                self.defer_with_window(cx, move |_, window, cx| {
+                    window.push_notification(
+                        Notification::error(format!(
+                            "{message}\nConnect again from the Remote menu to reopen the host's sessions."
+                        ))
+                        .title(format!("Lost {title}")),
+                        cx,
+                    );
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Runs something that needs the window on the next turn of the loop,
+    /// from a place that has none — a port's listener, a connection's.
+    fn defer_with_window(
+        &self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let workspace = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = workspace.update_in(cx, action);
+        });
+    }
+
+    fn show_remote_error_dialog(title: &str, message: String, window: &mut Window, cx: &mut App) {
+        let heading = format!("Unable to Connect to {title}");
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .icon(Icon::new(IconName::CircleX).size_5())
+                .title(heading.clone())
+                .description(message.clone())
+                .button_props(DialogButtonProps::default().ok_text("Close"))
+        });
     }
 
     fn toggle_active_connection(&mut self, cx: &mut Context<Self>) {
@@ -947,10 +1293,10 @@ impl SerialWorkspace {
         // the folder is the workbench's, the file the session's. Only a
         // batch that opens the port needs it, which is not the batch a
         // streaming device arrives in.
-        let folder = events
+        let target = events
             .iter()
             .any(|event| matches!(event, SerialEvent::Connected))
-            .then(|| recorder::recordings_folder(self.presets.settings.recording_root()))
+            .then(|| self.recording_target())
             .flatten();
         let Some(tab) = self.tab_mut(tab_id) else {
             return false;
@@ -959,13 +1305,14 @@ impl SerialWorkspace {
             tab.flush();
         }
         let mut announced = None;
+        let mut staged = Vec::new();
         for event in events {
             match event {
                 SerialEvent::Connected => {
                     tab.connecting = false;
                     tab.connected = true;
                     tab.note("Serial port opened; receiving data.");
-                    tab.begin_recording(folder.as_deref());
+                    tab.begin_recording(target.clone());
                 }
                 SerialEvent::Data(bytes) => {
                     tab.count_received(bytes.len());
@@ -981,7 +1328,11 @@ impl SerialWorkspace {
                         tab.receive(&bytes);
                     }
                 }
-                SerialEvent::Transfer(event) => tab.transfer_event(event),
+                SerialEvent::Transfer(event) => {
+                    if let Some(outcome) = tab.transfer_event(event) {
+                        staged.push(outcome);
+                    }
+                }
                 SerialEvent::Error(message) => {
                     tab.disconnect();
                     tab.note(message);
@@ -994,6 +1345,9 @@ impl SerialWorkspace {
         }
         cx.notify();
         let holds = tab.holds();
+        for outcome in staged {
+            self.finish_staging(tab_id, outcome, cx);
+        }
         if let Some(direction) = announced {
             self.zmodem_announced(tab_id, direction, cx);
         }
@@ -1519,6 +1873,11 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 fn main() {
+    // Started by `ssh` to answer its password prompt: say the password
+    // and go, before anything of the workbench comes up.
+    if remote::is_askpass_mode() {
+        std::process::exit(remote::run_askpass());
+    }
     prepare_application_menus();
     let app = gpui_kit::application().with_assets(WorkbenchAssets);
     app.run(move |cx| {

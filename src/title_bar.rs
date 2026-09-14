@@ -28,19 +28,21 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants},
     h_flex,
     input::Input,
+    menu::{DropdownMenu, PopupMenuItem},
     tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app_menu::{
-    JoinSplit, NextTab, PreviousTab, SplitRight, ToggleConnection, ToggleSidePanel,
+    ConnectRemoteHost, DisconnectRemoteHost, JoinSplit, NextTab, PreviousTab, SplitRight,
+    ToggleConnection, ToggleSidePanel,
 };
 use crate::panes::{MAX_PANES, SplitAxis};
 use crate::filter::FilterMode;
 use crate::icons::Glyph;
 use crate::theme::{LABEL, MICRO, Typography, WorkbenchPalette, mix, tint};
-use crate::{SerialTabSnapshot, SerialWorkspace};
+use crate::{RemoteStatus, SerialTabSnapshot, SerialWorkspace};
 
 /// Height of the bar. Four more than the component default: a 26px pill needs
 /// six of air above and below it to read as floating rather than wedged.
@@ -127,13 +129,16 @@ impl SerialWorkspace {
         };
         let connect = self.render_connect_pill(active, cx);
         let traffic = Self::render_traffic(active, palette);
+        let remote = self.render_remote_plate(cx);
 
-        // Empty on macOS, where the traffic lights are all the left end holds.
+        // On macOS the traffic lights are all the left end holds before the
+        // host plate; elsewhere the application menu comes first.
         let left_column = h_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .items_center()
+            .gap_1p5()
             .overflow_hidden()
             .when(cfg!(not(target_os = "macos")), |column| {
                 column.min_w(px(MENU_BAR_WIDTH)).child(
@@ -142,7 +147,8 @@ impl SerialWorkspace {
                         .w(px(MENU_BAR_WIDTH))
                         .h(px(CONTROL_HEIGHT)),
                 )
-            });
+            })
+            .child(keeps_its_press(remote).flex_none().min_w_0());
 
         let center_column = h_flex()
             .flex_none()
@@ -322,6 +328,79 @@ impl SerialWorkspace {
                     this.toggle_connection(tab_id, cx);
                 }
             }))
+            .into_any_element()
+    }
+
+    /// The plate at the bar's left end that says where the workbench is:
+    /// this machine, or a host — the way an editor's corner names the
+    /// machine its folder is on. Faint while local, in the accent once on
+    /// a host. A click connects, or offers to move or disconnect.
+    fn render_remote_plate(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let palette = self.interface_theme.palette();
+        let status = self.remote_status();
+        let (label, tooltip, on_host): (SharedString, &'static str, bool) = match &status {
+            RemoteStatus::Local => ("Remote".into(), "Connect to a host over SSH", false),
+            RemoteStatus::Connecting(title) => (
+                format!("{title}…").into(),
+                "Connecting to the host",
+                true,
+            ),
+            RemoteStatus::Connected(title) => (
+                title.clone().into(),
+                "The workbench is on this host: its devices, its workspace, its folders",
+                true,
+            ),
+        };
+        let title = match &status {
+            RemoteStatus::Connecting(title) | RemoteStatus::Connected(title) => title.clone(),
+            RemoteStatus::Local => String::new(),
+        };
+        let workspace = cx.weak_entity();
+
+        let button = Button::new("remote-plate")
+            .small()
+            .compact()
+            .h(px(CONTROL_HEIGHT))
+            .rounded(px(CONTROL_HEIGHT / 2.))
+            .px_2p5()
+            .max_w(px(220.))
+            .icon(Glyph::Remote)
+            .label(label)
+            .tooltip_with_action(tooltip, &ConnectRemoteHost, None);
+        if !on_host {
+            return button
+                .ghost()
+                .text_color(rgb(palette.muted))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_remote_dialog(window, cx);
+                }))
+                .into_any_element();
+        }
+        button
+            .custom(Self::accent_pill(palette, cx))
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                let connect = workspace.clone();
+                let disconnect = workspace.clone();
+                menu.item(
+                    PopupMenuItem::new("Connect to Another Host…")
+                        .action(Box::new(ConnectRemoteHost))
+                        .on_click(move |_, window, cx| {
+                            let _ = connect.update(cx, |this, cx| {
+                                this.open_remote_dialog(window, cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    PopupMenuItem::new(format!("Disconnect from {title}"))
+                        .action(Box::new(DisconnectRemoteHost))
+                        .on_click(move |_, window, cx| {
+                            let _ = disconnect.update(cx, |this, cx| {
+                                this.disconnect_remote(window, cx);
+                            });
+                        }),
+                )
+            })
             .into_any_element()
     }
 

@@ -30,6 +30,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::remote::{RemoteLink, WriteOptions, remote_join};
+
 /// The folder the recordings make for themselves inside the one the
 /// settings name, so pointing the setting at the desktop leaves a single
 /// `serialX` folder there rather than a year of loose days.
@@ -86,46 +88,121 @@ fn default_root() -> Option<PathBuf> {
 
 /// The file one connection writes into, open for as long as the port is.
 pub(crate) struct Recorder {
-    path: PathBuf,
-    file: BufWriter<File>,
+    /// Where the file is, as it is said in the log: a path on this
+    /// machine, or on the host.
+    path: String,
+    sink: RecorderSink,
+}
+
+/// Where a recording's bytes go.
+enum RecorderSink {
+    File(BufWriter<File>),
+    /// A file on the host: what arrives is kept until the session flushes,
+    /// then goes up as one piece added to the end of the file.
+    Remote { link: RemoteLink, pending: Vec<u8> },
+}
+
+/// Where a session that records writes: the folder the recordings' tree
+/// is made in, on this machine or on the host.
+#[derive(Clone)]
+pub(crate) enum RecordingTarget {
+    Local(PathBuf),
+    Remote { link: RemoteLink, folder: String },
 }
 
 impl Recorder {
     /// Opens the file for a session connecting now: the day's folder under
-    /// `folder`, made if it is not there, and in it the session's name and
-    /// the time. Two connections within the same second write to the one
-    /// file, one after the other, rather than the second wiping the first.
-    pub(crate) fn start(folder: &Path, title: &str) -> io::Result<Self> {
+    /// the target, made if it is not there, and in it the session's name
+    /// and the time. Two connections within the same second write to the
+    /// one file, one after the other, rather than the second wiping the
+    /// first. On a host the folders are made and the file begun by the
+    /// first flush.
+    pub(crate) fn open(target: RecordingTarget, title: &str) -> io::Result<Self> {
         let now = chrono::Local::now();
-        let path = recording_path(
-            folder,
-            title,
-            &now.format(DAY_FORMAT).to_string(),
-            &now.format(TIME_FORMAT).to_string(),
-        );
+        let day = now.format(DAY_FORMAT).to_string();
+        let time = now.format(TIME_FORMAT).to_string();
+        match target {
+            RecordingTarget::Local(folder) => Self::start_in(&folder, title, &day, &time),
+            RecordingTarget::Remote { link, folder } => Ok(Self {
+                path: remote_recording_path(&folder, title, &day, &time),
+                sink: RecorderSink::Remote {
+                    link,
+                    pending: Vec::new(),
+                },
+            }),
+        }
+    }
+
+    /// The file on this machine, for `title` connecting at `day` `time`.
+    fn start_in(folder: &Path, title: &str, day: &str, time: &str) -> io::Result<Self> {
+        let path = recording_path(folder, title, day, time);
         if let Some(day) = path.parent() {
             fs::create_dir_all(day)?;
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
-            path,
-            file: BufWriter::new(file),
+            path: path.display().to_string(),
+            sink: RecorderSink::File(BufWriter::new(file)),
         })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    /// Where the recording is, as the log says it.
+    pub(crate) fn path(&self) -> &str {
         &self.path
     }
 
     /// Takes what the port read. Buffered, since a device streaming is
     /// read in small pieces; the session flushes once a batch is in.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes)
+        match &mut self.sink {
+            RecorderSink::File(file) => file.write_all(bytes),
+            RecorderSink::Remote { pending, .. } => {
+                pending.extend_from_slice(bytes);
+                Ok(())
+            }
+        }
     }
 
     pub(crate) fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        match &mut self.sink {
+            RecorderSink::File(file) => file.flush(),
+            RecorderSink::Remote { link, pending } => {
+                if !pending.is_empty() {
+                    if !link.is_alive() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "the connection to the host closed",
+                        ));
+                    }
+                    link.write_file_detached(
+                        &self.path,
+                        pending,
+                        WriteOptions {
+                            append: true,
+                            mkdirs: true,
+                            unique: false,
+                        },
+                    );
+                    pending.clear();
+                }
+                Ok(())
+            }
+        }
     }
+}
+
+/// Where the recordings go on a host, given what its settings say: the
+/// folder chosen there, or the account's documents on the host until one is.
+pub(crate) fn remote_recordings_folder(chosen: Option<&str>, documents: &str) -> String {
+    remote_join(chosen.unwrap_or(documents), RECORDINGS_FOLDER)
+}
+
+/// Where a recording of `title` made on `day` at `time` is written on a host.
+fn remote_recording_path(folder: &str, title: &str, day: &str, time: &str) -> String {
+    remote_join(
+        &remote_join(folder, day),
+        &format!("{}-{time}.log", file_name(title)),
+    )
 }
 
 /// Where a recording of `title` made on `day` at `time` is written.

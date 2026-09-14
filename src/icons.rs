@@ -18,7 +18,6 @@ use gpui_kit::{
 
 use crate::theme::tint;
 
-/// The app's own glyphs, usable anywhere `gpui-component` takes an icon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Glyph {
     Bolt,
@@ -35,6 +34,7 @@ pub(crate) enum Glyph {
     Port,
     Prompt,
     Refresh,
+    Remote,
     Send,
     ShowPanel,
     Split,
@@ -61,6 +61,7 @@ impl Glyph {
             Self::Port => "icons/ui/port.svg",
             Self::Prompt => "icons/ui/prompt.svg",
             Self::Refresh => "icons/ui/refresh.svg",
+            Self::Remote => "icons/ui/remote.svg",
             Self::Send => "icons/ui/send.svg",
             Self::ShowPanel => "icons/ui/show-panel.svg",
             Self::Split => "icons/ui/split.svg",
@@ -78,7 +79,6 @@ impl IconNamed for Glyph {
     }
 }
 
-/// Every glyph, embedded so the binary needs no asset directory beside it.
 const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/bolt.svg",
@@ -135,6 +135,10 @@ const GLYPHS: &[(&str, &[u8])] = &[
     (
         "icons/ui/refresh.svg",
         include_bytes!("../assets/icons/ui/refresh.svg"),
+    ),
+    (
+        "icons/ui/remote.svg",
+        include_bytes!("../assets/icons/ui/remote.svg"),
     ),
     (
         "icons/ui/send.svg",
@@ -244,6 +248,7 @@ mod tests {
         Glyph::Port,
         Glyph::Prompt,
         Glyph::Refresh,
+        Glyph::Remote,
         Glyph::Send,
         Glyph::ShowPanel,
         Glyph::Split,

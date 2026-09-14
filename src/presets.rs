@@ -9,6 +9,7 @@ use crate::SerialConfiguration;
 use crate::hex::LogView;
 use crate::modem::Protocol;
 use crate::serial::LineEnding;
+use crate::remote::{RemoteLink, WriteOptions};
 use crate::theme::TagColor;
 
 /// Which of the side panel's two libraries a thing belongs to: the saved
@@ -187,6 +188,18 @@ fn default_terminal_font_size() -> f32 {
     DEFAULT_TERMINAL_FONT_SIZE
 }
 
+/// Where the store is written when it changes: the workspace file on this
+/// machine, or the one on the host the workbench is connected to.
+#[derive(Clone, Default)]
+pub(crate) enum StoreSink {
+    #[default]
+    Local,
+    Remote {
+        link: RemoteLink,
+        path: String,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PresetStore {
     #[serde(default)]
@@ -200,6 +213,9 @@ pub(crate) struct PresetStore {
     /// Absent in files written before there was anything to set.
     #[serde(default)]
     pub(crate) settings: Settings,
+    /// Where a change is written down. Not part of the file.
+    #[serde(skip)]
+    sink: StoreSink,
 }
 
 impl Default for PresetStore {
@@ -210,6 +226,7 @@ impl Default for PresetStore {
             commands: Vec::new(),
             next_id: default_next_id(),
             settings: Settings::default(),
+            sink: StoreSink::Local,
         }
     }
 }
@@ -223,6 +240,22 @@ impl PresetStore {
             return Self::default();
         };
         let mut store: Self = serde_json::from_str(&content).unwrap_or_default();
+        if store.shed_seed_commands() {
+            store.persist();
+        }
+        store
+    }
+
+    /// The store a host keeps: what its workspace file said, if it had
+    /// one, written back to that file over the connection from now on. A
+    /// file that will not parse starts a fresh store rather than losing
+    /// the connection over it; the file is written over on the first
+    /// change, as a local one is.
+    pub(crate) fn from_remote(content: Option<&str>, link: RemoteLink, path: String) -> Self {
+        let mut store: Self = content
+            .and_then(|content| serde_json::from_str(content).ok())
+            .unwrap_or_default();
+        store.sink = StoreSink::Remote { link, path };
         if store.shed_seed_commands() {
             store.persist();
         }
@@ -511,15 +544,30 @@ impl PresetStore {
     }
 
     fn try_persist(&self) -> io::Result<()> {
-        let Some(path) = store_path() else {
-            return Ok(());
-        };
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
-        fs::create_dir_all(parent)?;
         let content = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        fs::write(path, content)
+        match &self.sink {
+            StoreSink::Remote { link, path } => {
+                link.write_file_detached(
+                    path,
+                    &content,
+                    WriteOptions {
+                        mkdirs: true,
+                        ..WriteOptions::default()
+                    },
+                );
+                Ok(())
+            }
+            StoreSink::Local => {
+                let Some(path) = store_path() else {
+                    return Ok(());
+                };
+                let Some(parent) = path.parent() else {
+                    return Ok(());
+                };
+                fs::create_dir_all(parent)?;
+                fs::write(path, content)
+            }
+        }
     }
 }
 
@@ -539,10 +587,14 @@ const SEED_COMMANDS: [(u64, &str, &str); 3] = [
     (3, "Reset", "AT+RST"),
 ];
 
-/// Where the workspace file lives, per platform. None under `cargo test`, so
-/// a test that saves a preset exercises the store without touching the file
-/// the developer's own workbench reads.
 fn store_path() -> Option<PathBuf> {
+    store_folder().map(|folder| folder.join("workspace.json"))
+}
+
+/// The folder the workbench keeps its files in, per platform. None under
+/// `cargo test`, so a test that saves a preset exercises the store without
+/// touching the file the developer's own workbench reads.
+pub(crate) fn store_folder() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
@@ -551,24 +603,24 @@ fn store_path() -> Option<PathBuf> {
     {
         env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|home| home.join("Library/Application Support/serialX/workspace.json"))
+            .map(|home| home.join("Library/Application Support/serialX"))
     }
 
     #[cfg(target_os = "windows")]
     {
         env::var_os("APPDATA")
             .map(PathBuf::from)
-            .map(|root| root.join("serialX/workspace.json"))
+            .map(|root| root.join("serialX"))
     }
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
-            return Some(PathBuf::from(root).join("serialX/workspace.json"));
+            return Some(PathBuf::from(root).join("serialX"));
         }
         env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|home| home.join(".config/serialX/workspace.json"))
+            .map(|home| home.join(".config/serialX"))
     }
 }
 

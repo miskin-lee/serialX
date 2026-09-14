@@ -344,7 +344,8 @@ impl SerialWorkspace {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let scrollback = self.presets.settings.scrollback_lines;
-        let mut tab = Self::build_tab(id, scrollback, window, cx);
+        let ports = self.discover_ports();
+        let mut tab = Self::build_tab(id, scrollback, ports, window, cx);
         tab.configuration = saved.configuration.sanitized();
         tab.color = saved.color;
         tab.alias = saved.alias.clone();

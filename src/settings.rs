@@ -34,7 +34,11 @@ use crate::icons::{Glyph, icon_chip};
 use crate::presets::{
     MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES, usable_font_size,
 };
-use crate::recorder::recordings_folder;
+use crate::recorder::{recordings_folder, remote_recordings_folder};
+use crate::remote::{
+    RemoteContext,
+    browser::{Pick, open_remote_browser},
+};
 use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
 
 /// Width of the dialog: a number, and a sentence about it.
@@ -99,12 +103,16 @@ struct SettingsEditor {
     /// The folder the recordings' own tree is made in, while one has been
     /// chosen; none leaves them in the account's documents.
     recording_root: Option<PathBuf>,
+    /// The host the settings are the host's, with its documents folder
+    /// — where the recordings go there until a folder is chosen.
+    remote: Option<(RemoteContext, String)>,
 }
 
 impl SettingsEditor {
     fn new(
         theme: InterfaceTheme,
         current: Settings,
+        remote: Option<(RemoteContext, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -133,6 +141,7 @@ impl SettingsEditor {
             // log is actually laid out at, so the list has a row ticked.
             font_size: usable_font_size(current.terminal_font_size),
             recording_root: current.recording_root,
+            remote,
         }
     }
 
@@ -157,11 +166,38 @@ impl SettingsEditor {
         cx.notify();
     }
 
-    /// Asks the platform for a folder to keep the recordings in. The
-    /// picker is the system's, so it opens where the user last was and can
-    /// make a folder on the spot; a cancelled pick leaves the setting
-    /// where it stood.
-    fn choose_recording_folder(&mut self, cx: &mut Context<Self>) {
+    /// Asks for a folder to keep the recordings in. The picker is the
+    /// system's, so it opens where the user last was and can make a folder
+    /// on the spot; on a host it is the host's folders. A cancelled pick
+    /// leaves the setting where it stood.
+    fn choose_recording_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((remote, documents)) = self.remote.clone() {
+            let start = self
+                .recording_root
+                .as_ref()
+                .map(|root| root.to_string_lossy().into_owned())
+                .unwrap_or(documents);
+            let editor = cx.weak_entity();
+            open_remote_browser(
+                remote.link,
+                Pick::Folder,
+                start,
+                remote.home,
+                self.theme,
+                window,
+                cx,
+                move |paths, _, cx| {
+                    let Some(folder) = paths.into_iter().next() else {
+                        return;
+                    };
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.recording_root = Some(PathBuf::from(folder));
+                        cx.notify();
+                    });
+                },
+            );
+            return;
+        }
         let chosen = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -198,10 +234,20 @@ impl SettingsEditor {
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let folder: SharedString = recordings_folder(self.recording_root.as_deref())
-            .map_or_else(|| NO_FOLDER.into(), |folder| folder.display().to_string())
-            .into();
+        let folder: SharedString = match &self.remote {
+            Some((_, documents)) => {
+                let chosen = self
+                    .recording_root
+                    .as_ref()
+                    .map(|root| root.to_string_lossy().into_owned());
+                remote_recordings_folder(chosen.as_deref(), documents).into()
+            }
+            None => recordings_folder(self.recording_root.as_deref())
+                .map_or_else(|| NO_FOLDER.into(), |folder| folder.display().to_string())
+                .into(),
+        };
         let chosen = self.recording_root.is_some();
+        let on_host = self.remote.is_some();
         let full = folder.clone();
 
         h_flex()
@@ -235,9 +281,13 @@ impl SettingsEditor {
                     .small()
                     .h(px(FIELD_HEIGHT))
                     .label("Choose…")
-                    .tooltip("Pick the folder the serialX recordings folder sits in")
-                    .on_click(cx.listener(|editor, _, _, cx| {
-                        editor.choose_recording_folder(cx);
+                    .tooltip(if on_host {
+                        "Pick the folder on the host the serialX recordings folder sits in"
+                    } else {
+                        "Pick the folder the serialX recordings folder sits in"
+                    })
+                    .on_click(cx.listener(|editor, _, window, cx| {
+                        editor.choose_recording_folder(window, cx);
                     })),
             )
             .when(chosen, |row| {
@@ -416,7 +466,12 @@ impl SerialWorkspace {
         // change, so it goes back as it was.
         let transfer_folder = current.transfer_folder.clone();
         let transfer_protocol = current.transfer_protocol;
-        let editor = cx.new(|cx| SettingsEditor::new(theme, current, window, cx));
+        // On a host the settings are the host's, and so are the folders.
+        let remote = self
+            .remote_context()
+            .zip(self.remote_info().map(|info| info.documents.clone()));
+        let on_host = remote.as_ref().map(|(remote, _)| remote.title.clone());
+        let editor = cx.new(|cx| SettingsEditor::new(theme, current, remote, window, cx));
         let field = editor.clone();
         let workspace = cx.weak_entity();
 
@@ -434,7 +489,10 @@ impl SerialWorkspace {
                         .text_color(rgb(palette.strong_foreground))
                         .child("Settings"),
                 )
-                .description("Kept with the workspace, for every session.")
+                .description(match &on_host {
+                    Some(host) => format!("Kept with the workspace on {host}, for every session there."),
+                    None => "Kept with the workspace, for every session.".to_string(),
+                })
                 .close_button(true)
                 .child(editor.clone())
                 .footer(dialog_footer(palette, "Save", Glyph::Bookmark, None))

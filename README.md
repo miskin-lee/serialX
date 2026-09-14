@@ -20,6 +20,7 @@ byte, and move files over XMODEM/YMODEM/ZMODEM.
 - **Sessions you keep.** Save a port with its parameters, a name, a tag colour and a group. Open it again with a double-click. Keep the commands you send often as quick-send buttons.
 - **A workbench, not a window.** Split the view right or down, drag tabs between panes, fold the side panel to a rail. Light and dark themes.
 - **Recording and file transfer.** Tick `Record` and every connection writes the raw bytes to a file. Send and receive files over XMODEM, XMODEM-1K, YMODEM or ZMODEM, and let `sz` / `rz` on the device start the transfer for you.
+- **Remote hosts over SSH.** Connect to a machine the way an editor opens a remote folder: its serial devices, its saved sessions and commands, its folders. Nothing is installed there.
 - **macOS, Windows and Linux.** One code base, native window on each, updates installed in place from GitHub Releases.
 
 ## Install
@@ -99,6 +100,14 @@ While a transfer runs, a strip along the top of the log shows the direction, the
 
 ZMODEM needs no dialog when the device starts it: `sz` at the device's shell begins a receive on its own, into the folder the receive dialog last used (`Downloads` until one is chosen), and `rz` opens the send dialog with ZMODEM selected. A received file keeps the name the sender gave, with a number added when that name is taken, and is always written inside the chosen folder.
 
+## Remote hosts
+
+`Remote > Connect to Host…` (`⌘⇧R` / `Ctrl+Shift+R`, or the plate at the left end of the title bar) moves the workbench to a machine reached over SSH, the way an editor opens a folder on one. Type what you would give `ssh` — a host from `~/.ssh/config`, or `user@host:port` — and `Save & Connect` keeps it in the list for next time. Keys, agents and jump hosts are used as they are; a password or key passphrase, when the host wants one, is typed into the dialog and kept nowhere.
+
+Connected, everything is the host's: the device list in the session dialog, the port a session opens, the saved sessions and quick-send commands (read from and written to the host's own workspace file), the folder recordings are written in, and the files a transfer sends or receives, picked from a browser of the host's folders. The plate in the title bar names the host; click it to move to another or to disconnect. Open sessions close when the workbench moves, and come back to this machine's devices and workspace on disconnect. If the connection drops, the host's sessions stay open to read until the workbench moves again.
+
+Nothing is installed on the host: the connection starts the platform's own `ssh` with a small Python agent in its command line, so any Linux, macOS or BSD host with `python3` and a serial port will do. The list of saved hosts stays on this machine.
+
 ## Settings
 
 `⌘,` / `Ctrl+,` opens Settings: the scrollback length, the terminal text size (8 to 32 pt; the gutter follows it), and the folder recordings go in. Settings apply to every session at once and are kept with the workspace.
@@ -127,6 +136,7 @@ serialX bundles no fonts. The terminal uses the platform's editor face (Menlo on
 | Side panel | `⌘B` | `Ctrl+B` |
 | Light / dark theme | `⌘⇧L` | `Ctrl+Shift+L` |
 | Settings | `⌘,` | `Ctrl+,` |
+| Connect to a host | `⌘⇧R` | `Ctrl+Shift+R` |
 | Send the composer's line | `Enter` | `Enter` |
 
 On Windows and Linux, `Ctrl+A` and `Ctrl+C` themselves go to the device, as they would in a terminal; `Ctrl+C` copies only while something is selected. `Esc` closes the find bar or clears the filter.

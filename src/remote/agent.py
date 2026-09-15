@@ -1,9 +1,10 @@
 # serialX remote agent.
 #
-# Runs on the host serialX is connected to over SSH, started from the
-# connection's command line with this file's source in its argument; nothing
-# is installed on the host. It talks frames on its stdin and stdout — the
-# SSH channel — and does on the host what serialX would do at home: lists
+# Runs on the host serialX is connected to over SSH. The host's `sh` starts
+# a loader in Python, and serialX sends this file's source down the channel
+# for it; nothing is installed on the host. It talks frames on its stdin and
+# stdout — the SSH channel — and does on the host what serialX would do at
+# home: lists
 # the serial devices, opens them and moves their bytes both ways, reads and
 # writes the files serialX keeps (the workspace, the recordings, the files
 # a transfer moves) and shows the folders those files live in.

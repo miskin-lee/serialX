@@ -7,9 +7,10 @@
 //! written to the host's own workspace file, recordings are written on the
 //! host and a file transfer sends the host's files and lands files on it.
 //! Nothing is installed there: the connection starts the platform's own
-//! `ssh` with a small Python agent in its command line, and the two ends
-//! talk frames over the channel. `agent.py` is the other end; the frame
-//! kinds below are the ones it answers to.
+//! `ssh`, which runs the host's `sh`, and sends a small Python agent down
+//! the channel for it to start; then the two ends talk frames over the
+//! channel. `agent.py` is the other end; the frame kinds below are the ones
+//! it answers to.
 //!
 //! The system `ssh` is used rather than an SSH library so that everything a
 //! user has already set up — `~/.ssh/config` host aliases, agents, jump
@@ -43,10 +44,30 @@ use crate::serial::{
     SerialConfiguration, SerialEvent,
 };
 
-/// The agent, carried in the connection's command line.
+/// The agent, sent down the channel once the host's Python asks for it.
 const AGENT_SOURCE: &str = include_str!("agent.py");
-/// Where the frames begin on the channel: whatever the login shell printed
-/// before the agent came up lies before it and is not the agent's.
+/// The whole remote command. Like VS Code's `ssh host bash`, the script
+/// comes on stdin, so the command line stays one word however large the
+/// agent grows and no login shell has anything to quote; `sh` rather than
+/// `bash` because a board's host may have only BusyBox.
+const REMOTE_SHELL: &str = "sh";
+/// What the host's `sh` reads first: it starts Python with a loader that
+/// prints `LOADER_MARK`, then reads the agent's source from the channel,
+/// a length line and the bytes. `python3` is on every host a serial device
+/// is likely to hang off; one without it says so in the connection's error.
+const BOOTSTRAP: &str = concat!(
+    "command -v python3 >/dev/null 2>&1 || {\n",
+    "    echo 'serialX needs python3 on this host, and none is on the PATH.' >&2\n",
+    "    exit 127\n",
+    "}\n",
+    "exec python3 -c 'import sys;i=sys.stdin.buffer;o=sys.stdout.buffer;",
+    "o.write(b\"\\0serialX-loader\\0\");o.flush();",
+    "exec(compile(i.read(int(i.readline())),\"serialx-agent\",\"exec\"))'\n",
+);
+/// Where the loader says it is ready for the agent: whatever the login
+/// shell printed lies before it and is not the agent's.
+const LOADER_MARK: &[u8] = b"\x00serialX-loader\x00";
+/// Where the frames begin on the channel, once the agent is running.
 const AGENT_MARK: &[u8] = b"\x00serialX-agent\x00";
 /// How much noise a login shell may print ahead of the mark before the
 /// connection is given up as one with no agent at the other end.
@@ -817,7 +838,7 @@ impl RemoteConnection {
         command
             .arg("--")
             .arg(host.destination())
-            .arg(bootstrap_command());
+            .arg(REMOTE_SHELL);
         let (connection, events) = Self::spawn(command, host, secret)?;
         Ok((connection, events))
     }
@@ -858,9 +879,25 @@ impl RemoteConnection {
         };
         let (events_tx, events_rx) = smol::channel::unbounded();
 
-        // The writer: frames go out as they are handed over.
+        // The writer: the bootstrap first and alone, the agent's source once
+        // the loader has said it is listening, then frames as they are
+        // handed over. The source cannot go with the script: a `sh` reading
+        // its script from a pipe may read ahead (`dash`, Debian's `sh`,
+        // does) and would swallow it as more script.
+        let (loader_ready_tx, loader_ready_rx) = mpsc::channel::<()>();
         thread::spawn(move || {
             let mut stdin = stdin;
+            if stdin.write_all(BOOTSTRAP.as_bytes()).is_err()
+                || stdin.flush().is_err()
+                || loader_ready_rx.recv().is_err()
+                || stdin
+                    .write_all(format!("{}\n", AGENT_SOURCE.len()).as_bytes())
+                    .is_err()
+                || stdin.write_all(AGENT_SOURCE.as_bytes()).is_err()
+                || stdin.flush().is_err()
+            {
+                return;
+            }
             for frame in frames_rx {
                 let mut header = [0_u8; 9];
                 header[0] = frame.kind;
@@ -900,8 +937,9 @@ impl RemoteConnection {
             }
         });
 
-        // The reader: frames come in and are dispatched; the end of the
-        // stream is the end of the connection.
+        // The reader: past the login shell's noise to the loader, which is
+        // sent the agent, then past the agent's mark; frames come in and are
+        // dispatched; the end of the stream is the end of the connection.
         let child = Arc::new(Mutex::new(child));
         let reader_link = link.clone();
         let reader_child = child.clone();
@@ -909,10 +947,14 @@ impl RemoteConnection {
         let reader_host = host.title();
         thread::spawn(move || {
             let mut stdout = BufReader::new(stdout);
-            let outcome = match skip_to_mark(&mut stdout) {
-                Ok(()) => read_frames(&mut stdout, &reader_link),
-                Err(error) => Err(error),
-            };
+            let outcome = skip_to_mark(&mut stdout, LOADER_MARK)
+                .and_then(|()| {
+                    let _ = loader_ready_tx.send(());
+                    skip_to_mark(&mut stdout, AGENT_MARK)
+                })
+                .and_then(|()| read_frames(&mut stdout, &reader_link));
+            // A loader that never came leaves the writer nothing to wait for.
+            drop(loader_ready_tx);
             let status = reader_child
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1005,8 +1047,8 @@ impl Drop for RemoteConnection {
     }
 }
 
-/// Reads past whatever the login shell printed, up to the agent's mark.
-fn skip_to_mark(reader: &mut impl BufRead) -> Result<(), String> {
+/// Reads past whatever the login shell printed, up to `mark`.
+fn skip_to_mark(reader: &mut impl BufRead, mark: &[u8]) -> Result<(), String> {
     let mut matched = 0;
     let mut noise = Vec::new();
     loop {
@@ -1025,9 +1067,9 @@ fn skip_to_mark(reader: &mut impl BufRead) -> Result<(), String> {
         }
         let byte = buffer[0];
         reader.consume(1);
-        if byte == AGENT_MARK[matched] {
+        if byte == mark[matched] {
             matched += 1;
-            if matched == AGENT_MARK.len() {
+            if matched == mark.len() {
                 if !noise.is_empty() {
                     eprintln!(
                         "serialX remote host: the login shell printed {} bytes before the agent",
@@ -1037,9 +1079,9 @@ fn skip_to_mark(reader: &mut impl BufRead) -> Result<(), String> {
                 return Ok(());
             }
         } else {
-            noise.extend_from_slice(&AGENT_MARK[..matched]);
+            noise.extend_from_slice(&mark[..matched]);
             noise.push(byte);
-            matched = usize::from(byte == AGENT_MARK[0]);
+            matched = usize::from(byte == mark[0]);
             if noise.len() > MAX_NOISE {
                 return Err(
                     "The agent did not start: the host keeps printing something else.".to_string(),
@@ -1114,47 +1156,6 @@ fn ssh_program() -> String {
         .ok()
         .filter(|program| !program.trim().is_empty())
         .unwrap_or_else(|| "ssh".to_string())
-}
-
-/// The command line that starts the agent on the host: Python, handed the
-/// agent's source in base64 so that no shell on the way has anything to
-/// quote. `python3` is on every host a serial device is likely to hang
-/// off; one without it says so in the connection's error.
-pub(crate) fn bootstrap_command() -> String {
-    format!(
-        "exec python3 -c 'import sys,base64;exec(compile(base64.b64decode(sys.argv[1]),\"serialx-agent\",\"exec\"))' {}",
-        base64(AGENT_SOURCE.as_bytes())
-    )
-}
-
-/// Standard base64 with padding; enough for one string, so no crate.
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let mut triple = [0_u8; 3];
-        triple[..chunk.len()].copy_from_slice(chunk);
-        let n = u32::from_be_bytes([0, triple[0], triple[1], triple[2]]);
-        let symbols = [
-            TABLE[(n >> 18) as usize & 63],
-            TABLE[(n >> 12) as usize & 63],
-            TABLE[(n >> 6) as usize & 63],
-            TABLE[n as usize & 63],
-        ];
-        out.push(symbols[0] as char);
-        out.push(symbols[1] as char);
-        out.push(if chunk.len() > 1 {
-            symbols[2] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            symbols[3] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Writes the password where the helper mode will find it: a file only
@@ -1238,16 +1239,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_matches_the_standard() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        assert_eq!(base64(&[0xff, 0xee, 0xdd]), "/+7d");
-    }
-
-    #[test]
     fn an_address_is_read_into_its_parts() {
         assert_eq!(
             RemoteHost::parse_address("pi@lab.local:2222"),
@@ -1304,19 +1295,19 @@ mod tests {
         let mut stream = io::Cursor::new(
             [
                 b"stty: not a tty\n\x00serial".as_slice(),
-                AGENT_MARK,
+                LOADER_MARK,
                 b"rest",
             ]
             .concat(),
         );
-        skip_to_mark(&mut stream).unwrap();
+        skip_to_mark(&mut stream, LOADER_MARK).unwrap();
         let mut rest = Vec::new();
         stream.read_to_end(&mut rest).unwrap();
         assert_eq!(rest, b"rest");
 
-        let mut silent = io::Cursor::new(b"bash: python3: command not found\n".to_vec());
-        let error = skip_to_mark(&mut silent).unwrap_err();
-        assert!(error.contains("python3: command not found"));
+        let mut silent = io::Cursor::new(b"sh: 1: python3: not found\n".to_vec());
+        let error = skip_to_mark(&mut silent, LOADER_MARK).unwrap_err();
+        assert!(error.contains("python3: not found"));
     }
 
     #[test]
@@ -1340,29 +1331,34 @@ mod tests {
         );
     }
 
-    /// Whether the machine running the tests can run the agent.
-    fn python3() -> bool {
-        Command::new("python3")
-            .arg("--version")
+    /// Whether `program` runs on the machine running the tests.
+    fn runs(program: &str, args: &[&str]) -> bool {
+        Command::new(program)
+            .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
     }
 
-    /// The agent, run on this machine through the same command line the
-    /// connection gives `ssh`, so the quoting and the framing are the ones
-    /// a host sees.
-    fn local_agent() -> Option<(RemoteConnection, smol::channel::Receiver<RemoteEvent>)> {
-        if !python3() {
+    /// The agent, started on this machine the way `ssh` starts it on a host:
+    /// a login shell that prints something first and runs `shell`, which
+    /// reads the bootstrap from the channel.
+    fn local_agent(shell: &str) -> Option<(RemoteConnection, smol::channel::Receiver<RemoteEvent>)> {
+        // The agent needs `termios` and `fcntl`, which Windows' Python has
+        // not got, and a host is POSIX anyway.
+        if !cfg!(unix) {
+            eprintln!("the agent runs on POSIX hosts only; the agent test is skipped");
+            return None;
+        }
+        if !runs("python3", &["--version"]) {
             eprintln!("python3 is not on this machine; the agent test is skipped");
             return None;
         }
         let mut command = Command::new("sh");
-        command.arg("-c").arg(format!(
-            "echo 'noise from a login shell'; {}",
-            bootstrap_command()
-        ));
+        command
+            .arg("-c")
+            .arg(format!("echo 'noise from a login shell'; exec {shell}"));
         let host = RemoteHost {
             id: 0,
             name: "here".into(),
@@ -1375,8 +1371,26 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_starts_under_a_shell_that_reads_ahead() {
+        // `dash` reads its script from a pipe a buffer at a time; had the
+        // agent's source gone with the script, it would have been read as
+        // more script and the loader would have found nothing.
+        if !runs("dash", &["-c", ":"]) {
+            eprintln!("dash is not on this machine; the test is skipped");
+            return;
+        }
+        let Some((_connection, events)) = local_agent("dash") else {
+            return;
+        };
+        match events.recv_blocking().expect("an event") {
+            RemoteEvent::Ready(info) => assert_eq!(info.version, PROTOCOL),
+            other => panic!("expected the agent's hello, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn the_agent_answers_over_the_channel() {
-        let Some((connection, events)) = local_agent() else {
+        let Some((connection, events)) = local_agent("sh") else {
             return;
         };
         let info = match events.recv_blocking().expect("an event") {

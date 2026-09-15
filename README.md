@@ -106,7 +106,7 @@ ZMODEM needs no dialog when the device starts it: `sz` at the device's shell beg
 
 Connected, everything is the host's: the device list in the session dialog, the port a session opens, the saved sessions and quick-send commands (read from and written to the host's own workspace file), the folder recordings are written in, and the files a transfer sends or receives, picked from a browser of the host's folders. The plate in the title bar names the host; click it to move to another or to disconnect. Open sessions close when the workbench moves, and come back to this machine's devices and workspace on disconnect. If the connection drops, the host's sessions stay open to read until the workbench moves again.
 
-Nothing is installed on the host: the connection starts the platform's own `ssh` with a small Python agent in its command line, so any Linux, macOS or BSD host with `python3` and a serial port will do. The list of saved hosts stays on this machine.
+Nothing is installed on the host: the connection starts the platform's own `ssh` and sends a small Python agent over it, so any Linux, macOS or BSD host with `python3` and a serial port will do. The list of saved hosts stays on this machine.
 
 ## Settings
 

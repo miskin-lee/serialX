@@ -1,8 +1,9 @@
 //! Settings: what is the workbench's to set rather than a session's.
 //!
-//! Three so far — how many lines a terminal keeps above its screen, typed as
+//! Four so far — how many lines a terminal keeps above its screen, typed as
 //! a number; the size its log is set in, picked from the list of sizes the
-//! setting offers; and the folder the sessions that record write into,
+//! setting offers; the folder the sessions that record write into; and the
+//! folder files received over XMODEM, YMODEM and ZMODEM land in, both
 //! chosen with the platform's own folder picker — opened from the
 //! application menu with ⌘, as every macOS application opens its own. What
 //! is set is written to the workspace file beside the presets, and takes
@@ -12,9 +13,11 @@
 //! inside the folder that is chosen, so the setting can name the desktop
 //! without a year of loose days landing on it. The field shows the folder
 //! the files will actually be written to, which is that tree's head; what
-//! the picker chooses is the folder it stands in.
+//! the picker chooses is the folder it stands in. Received files land in
+//! the folder itself, which is also where the receive dialog opens and
+//! where a ZMODEM the device starts puts its files.
 
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
@@ -40,6 +43,7 @@ use crate::remote::{
     browser::{Pick, open_remote_browser},
 };
 use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
+use crate::transfer::default_transfer_folder;
 
 /// Width of the dialog: a number, and a sentence about it.
 const DIALOG_WIDTH: f32 = 420.;
@@ -92,6 +96,25 @@ pub(crate) fn format_lines(lines: usize) -> String {
     out
 }
 
+/// The two folders the settings name, each chosen the same way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Folder {
+    /// The folder the recordings keep their tree in.
+    Recordings,
+    /// The folder received files land in.
+    Received,
+}
+
+/// The host the settings are the host's, with the folders it names as its
+/// own: its documents, where the recordings go there until a folder is
+/// chosen, and its downloads, where received files go.
+#[derive(Clone)]
+struct HostFolders {
+    context: RemoteContext,
+    documents: String,
+    downloads: String,
+}
+
 /// The settings as they are being set: the scrollback typed into a field, the
 /// type size picked from a list. Nothing here reaches the workspace until the
 /// dialog is confirmed.
@@ -103,16 +126,18 @@ struct SettingsEditor {
     /// The folder the recordings' own tree is made in, while one has been
     /// chosen; none leaves them in the account's documents.
     recording_root: Option<PathBuf>,
-    /// The host the settings are the host's, with its documents folder
-    /// — where the recordings go there until a folder is chosen.
-    remote: Option<(RemoteContext, String)>,
+    /// The folder received files land in, while one has been chosen; none
+    /// leaves them in the account's downloads.
+    transfer_folder: Option<PathBuf>,
+    /// The host the settings are the host's, with its folders.
+    remote: Option<HostFolders>,
 }
 
 impl SettingsEditor {
     fn new(
         theme: InterfaceTheme,
         current: Settings,
-        remote: Option<(RemoteContext, String)>,
+        remote: Option<HostFolders>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -141,6 +166,7 @@ impl SettingsEditor {
             // log is actually laid out at, so the list has a row ticked.
             font_size: usable_font_size(current.terminal_font_size),
             recording_root: current.recording_root,
+            transfer_folder: current.transfer_folder,
             remote,
         }
     }
@@ -166,33 +192,50 @@ impl SettingsEditor {
         cx.notify();
     }
 
-    /// Asks for a folder to keep the recordings in. The picker is the
-    /// system's, so it opens where the user last was and can make a folder
-    /// on the spot; on a host it is the host's folders. A cancelled pick
-    /// leaves the setting where it stood.
-    fn choose_recording_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((remote, documents)) = self.remote.clone() {
+    /// The folder chosen for `folder`, if one was.
+    fn chosen(&self, folder: Folder) -> Option<&PathBuf> {
+        match folder {
+            Folder::Recordings => self.recording_root.as_ref(),
+            Folder::Received => self.transfer_folder.as_ref(),
+        }
+    }
+
+    fn set_chosen(&mut self, folder: Folder, chosen: Option<PathBuf>, cx: &mut Context<Self>) {
+        match folder {
+            Folder::Recordings => self.recording_root = chosen,
+            Folder::Received => self.transfer_folder = chosen,
+        }
+        cx.notify();
+    }
+
+    /// Asks for a folder: to keep the recordings in, or to receive files
+    /// into. The picker is the system's, so it opens where the user last
+    /// was and can make a folder on the spot; on a host it is the host's
+    /// folders. A cancelled pick leaves the setting where it stood.
+    fn choose_folder(&mut self, folder: Folder, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(remote) = self.remote.clone() {
             let start = self
-                .recording_root
-                .as_ref()
-                .map(|root| root.to_string_lossy().into_owned())
-                .unwrap_or(documents);
+                .chosen(folder)
+                .map(|chosen| chosen.to_string_lossy().into_owned())
+                .unwrap_or(match folder {
+                    Folder::Recordings => remote.documents,
+                    Folder::Received => remote.downloads,
+                });
             let editor = cx.weak_entity();
             open_remote_browser(
-                remote.link,
+                remote.context.link,
                 Pick::Folder,
                 start,
-                remote.home,
+                remote.context.home,
                 self.theme,
                 window,
                 cx,
                 move |paths, _, cx| {
-                    let Some(folder) = paths.into_iter().next() else {
+                    let Some(path) = paths.into_iter().next() else {
                         return;
                     };
                     let _ = editor.update(cx, |editor, cx| {
-                        editor.recording_root = Some(PathBuf::from(folder));
-                        cx.notify();
+                        editor.set_chosen(folder, Some(PathBuf::from(path)), cx);
                     });
                 },
             );
@@ -208,54 +251,89 @@ impl SettingsEditor {
             let Ok(Ok(Some(paths))) = chosen.await else {
                 return;
             };
-            let Some(folder) = paths.into_iter().next() else {
+            let Some(path) = paths.into_iter().next() else {
                 return;
             };
             let _ = editor.update(cx, |editor, cx| {
-                editor.recording_root = Some(folder);
-                cx.notify();
+                editor.set_chosen(folder, Some(path), cx);
             });
         })
         .detach();
     }
 
-    /// Back to the folder the workbench picks itself.
-    fn use_default_recording_folder(&mut self, cx: &mut Context<Self>) {
-        self.recording_root = None;
-        cx.notify();
+    /// The path a folder field shows: for the recordings, the head of the
+    /// tree they will actually be written under; for received files, the
+    /// folder they land in.
+    fn shown_folder(&self, folder: Folder) -> SharedString {
+        let chosen = self.chosen(folder);
+        match (folder, &self.remote) {
+            (Folder::Recordings, Some(remote)) => {
+                let chosen = chosen.map(|root| root.to_string_lossy().into_owned());
+                remote_recordings_folder(chosen.as_deref(), &remote.documents).into()
+            }
+            (Folder::Recordings, None) => recordings_folder(chosen.map(PathBuf::as_path))
+                .map_or_else(|| NO_FOLDER.into(), |folder| folder.display().to_string())
+                .into(),
+            (Folder::Received, Some(remote)) => chosen
+                .map_or_else(
+                    || remote.downloads.clone(),
+                    |folder| folder.to_string_lossy().into_owned(),
+                )
+                .into(),
+            (Folder::Received, None) => chosen
+                .cloned()
+                .or_else(default_transfer_folder)
+                .unwrap_or_else(env::temp_dir)
+                .display()
+                .to_string()
+                .into(),
+        }
     }
 
-    /// The recordings' folder: the path they will actually be written
-    /// under, read whole in a tooltip when it is too long for the field,
-    /// then the picker, and the way back to the default while the folder
-    /// is not it.
-    fn render_recording_field(
+    /// A folder setting: the path it stands at, read whole in a tooltip
+    /// when it is too long for the field, then the picker, and the way back
+    /// to the default while the folder is not it.
+    fn render_folder_field(
         &mut self,
+        folder: Folder,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let folder: SharedString = match &self.remote {
-            Some((_, documents)) => {
-                let chosen = self
-                    .recording_root
-                    .as_ref()
-                    .map(|root| root.to_string_lossy().into_owned());
-                remote_recordings_folder(chosen.as_deref(), documents).into()
-            }
-            None => recordings_folder(self.recording_root.as_deref())
-                .map_or_else(|| NO_FOLDER.into(), |folder| folder.display().to_string())
-                .into(),
-        };
-        let chosen = self.recording_root.is_some();
+        let shown = self.shown_folder(folder);
+        let chosen = self.chosen(folder).is_some();
         let on_host = self.remote.is_some();
-        let full = folder.clone();
+        let full = shown.clone();
+        let (field_id, choose_id, default_id) = match folder {
+            Folder::Recordings => (
+                "settings-recording-folder",
+                "settings-recording-choose",
+                "settings-recording-default",
+            ),
+            Folder::Received => (
+                "settings-received-folder",
+                "settings-received-choose",
+                "settings-received-default",
+            ),
+        };
+        let choose_tooltip = match (folder, on_host) {
+            (Folder::Recordings, true) => {
+                "Pick the folder on the host the serialX recordings folder sits in"
+            }
+            (Folder::Recordings, false) => "Pick the folder the serialX recordings folder sits in",
+            (Folder::Received, true) => "Pick the folder on the host received files go to",
+            (Folder::Received, false) => "Pick the folder received files go to",
+        };
+        let default_tooltip = match folder {
+            Folder::Recordings => "Keep the recordings in the account's documents again",
+            Folder::Received => "Receive into the account's downloads again",
+        };
 
         h_flex()
             .items_center()
             .gap_2()
             .child(
                 h_flex()
-                    .id("settings-recording-folder")
+                    .id(field_id)
                     .flex_1()
                     .min_w_0()
                     .h(px(FIELD_HEIGHT))
@@ -271,35 +349,31 @@ impl SettingsEditor {
                             .truncate()
                             .ui_mono_token(LABEL)
                             .text_color(rgb(palette.strong_foreground))
-                            .child(folder),
+                            .child(shown),
                     )
                     .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)),
             )
             .child(
-                Button::new("settings-recording-choose")
+                Button::new(choose_id)
                     .outline()
                     .small()
                     .h(px(FIELD_HEIGHT))
                     .label("Choose…")
-                    .tooltip(if on_host {
-                        "Pick the folder on the host the serialX recordings folder sits in"
-                    } else {
-                        "Pick the folder the serialX recordings folder sits in"
-                    })
-                    .on_click(cx.listener(|editor, _, window, cx| {
-                        editor.choose_recording_folder(window, cx);
+                    .tooltip(choose_tooltip)
+                    .on_click(cx.listener(move |editor, _, window, cx| {
+                        editor.choose_folder(folder, window, cx);
                     })),
             )
             .when(chosen, |row| {
                 row.child(
-                    Button::new("settings-recording-default")
+                    Button::new(default_id)
                         .ghost()
                         .small()
                         .h(px(FIELD_HEIGHT))
                         .label("Default")
-                        .tooltip("Keep the recordings in the account's documents again")
-                        .on_click(cx.listener(|editor, _, _, cx| {
-                            editor.use_default_recording_folder(cx);
+                        .tooltip(default_tooltip)
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            editor.set_chosen(folder, None, cx);
                         })),
                 )
             })
@@ -408,7 +482,8 @@ impl Render for SettingsEditor {
             px(FIELD_HEIGHT),
         );
         let size = self.render_size_field(palette, cx);
-        let recording = self.render_recording_field(palette, cx);
+        let recording = self.render_folder_field(Folder::Recordings, palette, cx);
+        let received = self.render_folder_field(Folder::Received, palette, cx);
 
         v_flex()
             .gap(px(SECTION_GAP))
@@ -432,6 +507,12 @@ impl Render for SettingsEditor {
                 "Recordings",
                 recording,
                 Ok("Where a session with Record on writes what its device says: a file of its own for every connection, filed under the day. Choose a folder to keep this one somewhere else."),
+            ))
+            .child(setting_section(
+                palette,
+                "Received files",
+                received,
+                Ok("Where a file received over XMODEM, YMODEM or ZMODEM is written, and where sz at the device's shell sends one. The receive dialog opens on this folder, and a folder picked there is kept here."),
             ))
     }
 }
@@ -467,15 +548,19 @@ impl SerialWorkspace {
         let theme = self.interface_theme;
         let palette = theme.palette();
         let current = self.presets.settings.clone();
-        // What the transfer dialog keeps here is not this dialog's to
-        // change, so it goes back as it was.
-        let transfer_folder = current.transfer_folder.clone();
+        // The protocol the transfer dialog keeps here is not this dialog's
+        // to change, so it goes back as it was.
         let transfer_protocol = current.transfer_protocol;
         // On a host the settings are the host's, and so are the folders.
         let remote = self
             .remote_context()
-            .zip(self.remote_info().map(|info| info.documents.clone()));
-        let on_host = remote.as_ref().map(|(remote, _)| remote.title.clone());
+            .zip(self.remote_info())
+            .map(|(context, info)| HostFolders {
+                context,
+                documents: info.documents.clone(),
+                downloads: info.downloads.clone(),
+            });
+        let on_host = remote.as_ref().map(|remote| remote.context.title.clone());
         let editor = cx.new(|cx| SettingsEditor::new(theme, current, remote, window, cx));
         let field = editor.clone();
         let workspace = cx.weak_entity();
@@ -483,7 +568,6 @@ impl SerialWorkspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let workspace = workspace.clone();
             let editor = editor.clone();
-            let transfer_folder = transfer_folder.clone();
             alert
                 .width(px(DIALOG_WIDTH))
                 .p_5()
@@ -511,13 +595,14 @@ impl SerialWorkspace {
                     };
                     let terminal_font_size = editor.read(cx).font_size;
                     let recording_root = editor.read(cx).recording_root.clone();
+                    let transfer_folder = editor.read(cx).transfer_folder.clone();
                     let _ = workspace.update(cx, |workspace, cx| {
                         workspace.apply_settings(
                             Settings {
                                 scrollback_lines,
                                 terminal_font_size,
                                 recording_root,
-                                transfer_folder: transfer_folder.clone(),
+                                transfer_folder,
                                 transfer_protocol,
                             },
                             cx,

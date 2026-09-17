@@ -7,9 +7,10 @@
 //! means; then the file to send, or the folder to receive into — and,
 //! under XMODEM, which carries no name, the name the file is to get.
 //! The protocol and the folder chosen last are kept with the settings, so
-//! the second transfer opens on the first one's choices; until a folder
-//! is chosen, received files go to the account's downloads, and a name
-//! that is taken gets a number after it.
+//! the second transfer opens on the first one's choices, and the folder
+//! can be set in Settings as well; until a folder is chosen, received
+//! files go to the account's downloads, and a name that is taken gets a
+//! number after it.
 //!
 //! While a transfer runs a strip lies along the top of the log: which way
 //! the file is going and its name, the protocol, a bar of how far it has
@@ -287,7 +288,7 @@ impl SerialTabState {
 
 /// Where received files go when no folder has been chosen: the downloads
 /// folder the platform gives every account.
-fn default_transfer_folder() -> Option<PathBuf> {
+pub(crate) fn default_transfer_folder() -> Option<PathBuf> {
     #[cfg(windows)]
     let home = env::var_os("USERPROFILE");
     #[cfg(not(windows))]
@@ -412,24 +413,24 @@ impl SerialWorkspace {
         });
     }
 
-    /// Where received files go: the folder chosen last, or the account's
-    /// downloads, or — on a machine with neither — the temporary folder.
-    /// On a host, the folder chosen there, else the host's downloads.
+    /// Where received files go: the folder chosen in Settings or in the
+    /// last receive, else the default.
     fn transfer_folder(&self) -> PathBuf {
-        if let Some(info) = self.remote_info() {
-            return self
-                .presets
-                .settings
-                .transfer_folder
-                .clone()
-                .unwrap_or_else(|| PathBuf::from(&info.downloads));
-        }
         self.presets
             .settings
             .transfer_folder
             .clone()
-            .or_else(default_transfer_folder)
-            .unwrap_or_else(env::temp_dir)
+            .unwrap_or_else(|| self.default_receive_folder())
+    }
+
+    /// Where received files go when no folder has been chosen: the
+    /// account's downloads, or — on a machine with none — the temporary
+    /// folder. On a host, the host's downloads.
+    fn default_receive_folder(&self) -> PathBuf {
+        if let Some(info) = self.remote_info() {
+            return PathBuf::from(&info.downloads);
+        }
+        default_transfer_folder().unwrap_or_else(env::temp_dir)
     }
 
     /// Runs a job on a tab's port. The choices are kept with the settings,
@@ -439,8 +440,11 @@ impl SerialWorkspace {
     pub(crate) fn start_transfer(&mut self, tab_id: usize, job: TransferJob, cx: &mut Context<Self>) {
         let mut settings = self.presets.settings.clone();
         settings.transfer_protocol = Some(job.protocol());
+        // The default stays the default, so Settings does not show it as
+        // a folder someone chose.
         if let TransferJob::Receive { folder, .. } = &job {
-            settings.transfer_folder = Some(folder.clone());
+            settings.transfer_folder =
+                (*folder != self.default_receive_folder()).then(|| folder.clone());
         }
         self.presets.set_settings(settings);
 

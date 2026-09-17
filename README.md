@@ -94,11 +94,11 @@ The folder is chosen in Settings; the recordings keep their `serialX` tree insid
 
 ## File transfer
 
-`Session > Send File…` and `Session > Receive File…` open one dialog: pick the protocol (`XMODEM`, `XMODEM-1K`, `YMODEM` or `ZMODEM`, with a line under the switch saying what the choice means), then the file to send or the folder to receive into. XMODEM carries no file name, so a receive under it asks for one.
+`Session > Send File…` and `Session > Receive File…` open one dialog: pick the protocol (`XMODEM`, `XMODEM-1K`, `YMODEM` or `ZMODEM`, with a line under the switch saying what the choice means), then the file to send or the folder to receive into. The receive folder is the one set in Settings (`Downloads` until one is chosen), and a folder picked in the dialog becomes the new setting. XMODEM carries no file name, so a receive under it asks for one.
 
 While a transfer runs, a strip along the top of the log shows the direction, the file, the protocol, a progress bar with bytes and rate, and `Cancel`. The port belongs to the transfer until it ends, and the log then says how it went: the files with their sizes and times, or why it stopped.
 
-ZMODEM needs no dialog when the device starts it: `sz` at the device's shell begins a receive on its own, into the folder the receive dialog last used (`Downloads` until one is chosen), and `rz` opens the send dialog with ZMODEM selected. A received file keeps the name the sender gave, with a number added when that name is taken, and is always written inside the chosen folder.
+ZMODEM needs no dialog when the device starts it: `sz` at the device's shell begins a receive on its own, into the receive folder from Settings, and `rz` opens the send dialog with ZMODEM selected. A received file keeps the name the sender gave, with a number added when that name is taken, and is always written inside the chosen folder.
 
 ## Remote hosts
 
@@ -110,7 +110,7 @@ Nothing is installed on the host: the connection starts the platform's own `ssh`
 
 ## Settings
 
-`⌘,` / `Ctrl+,` opens Settings: the scrollback length, the terminal text size (8 to 32 pt; the gutter follows it), and the folder recordings go in. Settings apply to every session at once and are kept with the workspace.
+`⌘,` / `Ctrl+,` opens Settings: the scrollback length, the terminal text size (8 to 32 pt; the gutter follows it), the folder recordings go in, and the folder received files go in. Settings apply to every session at once and are kept with the workspace.
 
 serialX bundles no fonts. The terminal uses the platform's editor face (Menlo on macOS, Consolas on Windows, Droid Sans Mono on Linux), the interface uses the system UI font, and Chinese, Japanese and Korean text from a device falls back to the system's own CJK families, with your language first.
 

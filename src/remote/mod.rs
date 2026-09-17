@@ -16,13 +16,17 @@
 //! user has already set up — `~/.ssh/config` host aliases, agents, jump
 //! hosts, hardware keys — keeps working without serialX knowing about any of
 //! it. A password, when one is typed, reaches `ssh` the way it asks for one:
-//! through `SSH_ASKPASS`, pointed at this executable in its helper mode.
+//! through `SSH_ASKPASS`, pointed at this executable in its helper mode. A
+//! saved host can remember its password or key passphrase in the platform's
+//! credential store (`secrets`); the helper reads it from there when `ssh`
+//! asks, so a remembered secret never passes through a file.
 
 pub(crate) mod browser;
 pub(crate) mod dialog;
+pub(crate) mod secrets;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, BufRead, BufReader, Read, Write},
     path::PathBuf,
@@ -77,6 +81,9 @@ const PROTOCOL: u32 = 1;
 /// The helper mode's own variable: set, this executable prints the file's
 /// contents and exits, and is `ssh`'s askpass program for the moment.
 const ASKPASS_FILE_VARIABLE: &str = "SERIALX_ASKPASS_FILE";
+/// The helper mode's other variable: set, this executable prints the secret
+/// the credential store keeps for the saved host with this id.
+const ASKPASS_HOST_VARIABLE: &str = "SERIALX_ASKPASS_HOST";
 /// The `ssh` to run, when the platform's own is not the one wanted.
 const SSH_VARIABLE: &str = "SERIALX_SSH";
 
@@ -98,7 +105,8 @@ const PORT_CLOSED: u8 = b'c';
 const ERROR: u8 = b'e';
 
 /// A host the workbench can connect to, as kept in the host book: the
-/// address and how to reach it. The password is never written down.
+/// address and how to reach it. A password is never written down here; a
+/// remembered one is in the platform's credential store.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RemoteHost {
     pub(crate) id: u64,
@@ -113,6 +121,10 @@ pub(crate) struct RemoteHost {
     /// A private key file to offer, when the account's usual ones are not it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) identity: Option<String>,
+    /// Whether a password or key passphrase for the host is kept in the
+    /// credential store, under its id.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) secret_saved: bool,
 }
 
 impl RemoteHost {
@@ -205,7 +217,8 @@ impl RemoteHost {
 
 /// The hosts the workbench knows, kept in `remotes.json` beside the
 /// workspace file — on this machine always, whichever host is connected.
-#[derive(Default, Serialize, Deserialize)]
+/// Ids start at 1: 0 is a host the dialog has not saved yet.
+#[derive(Serialize, Deserialize)]
 pub(crate) struct HostBook {
     #[serde(default)]
     pub(crate) hosts: Vec<RemoteHost>,
@@ -215,6 +228,15 @@ pub(crate) struct HostBook {
 
 fn first_host_id() -> u64 {
     1
+}
+
+impl Default for HostBook {
+    fn default() -> Self {
+        Self {
+            hosts: Vec::new(),
+            next_id: first_host_id(),
+        }
+    }
 }
 
 fn host_book_path() -> Option<PathBuf> {
@@ -229,20 +251,39 @@ impl HostBook {
         let Ok(content) = fs::read_to_string(path) else {
             return Self::default();
         };
-        let mut book: Self = serde_json::from_str(&content).unwrap_or_default();
-        if book.next_id == 0 {
-            book.next_id = 1;
+        Self::parse(&content)
+    }
+
+    /// Reads a host book, giving every host an id of its own. A book from
+    /// before ids started at 1 holds its first host at 0, which the dialog
+    /// took for a host not yet saved, so every new host was saved over it.
+    fn parse(content: &str) -> Self {
+        let mut book: Self = serde_json::from_str(content).unwrap_or_default();
+        let highest = book.hosts.iter().map(|host| host.id).max().unwrap_or(0);
+        let mut next_id = book.next_id.max(highest + 1).max(first_host_id());
+        let mut seen = HashSet::new();
+        for host in &mut book.hosts {
+            if host.id == 0 || !seen.insert(host.id) {
+                host.id = next_id;
+                next_id += 1;
+                seen.insert(host.id);
+                // A secret kept under the old id is another host's.
+                host.secret_saved = false;
+            }
         }
+        book.next_id = next_id;
         book
     }
 
     /// Keeps a host: in place of the one with its id, or as a new one at
-    /// the end of the list. Returns the id it is kept under.
+    /// the end of the list when it has none yet. Returns the id it is kept
+    /// under.
     pub(crate) fn keep(&mut self, mut host: RemoteHost) -> u64 {
-        if let Some(existing) = self
-            .hosts
-            .iter_mut()
-            .find(|existing| existing.id == host.id)
+        if host.id != 0
+            && let Some(existing) = self
+                .hosts
+                .iter_mut()
+                .find(|existing| existing.id == host.id)
         {
             *existing = host.clone();
         } else {
@@ -258,6 +299,21 @@ impl HostBook {
         let before = self.hosts.len();
         self.hosts.retain(|host| host.id != id);
         if self.hosts.len() != before {
+            self.persist();
+        }
+    }
+
+    pub(crate) fn find(&self, id: u64) -> Option<&RemoteHost> {
+        self.hosts.iter().find(|host| host.id == id)
+    }
+
+    /// Notes whether the credential store keeps a secret for a host.
+    pub(crate) fn set_secret_saved(&mut self, id: u64, saved: bool) {
+        let Some(host) = self.hosts.iter_mut().find(|host| host.id == id) else {
+            return;
+        };
+        if host.secret_saved != saved {
+            host.secret_saved = saved;
             self.persist();
         }
     }
@@ -815,18 +871,28 @@ impl RemoteConnection {
                 .arg("-o")
                 .arg("IdentitiesOnly=yes");
         }
-        let secret = match password.filter(|password| !password.is_empty()) {
+        let typed = password.filter(|password| !password.is_empty());
+        let saved = typed.is_none() && host.secret_saved && host.id != 0;
+        if typed.is_some() || saved {
+            command
+                .env("SSH_ASKPASS", env::current_exe()?)
+                .env("SSH_ASKPASS_REQUIRE", "force");
+            // Older `ssh` runs its askpass program only for a display.
+            if env::var_os("DISPLAY").is_none() {
+                command.env("DISPLAY", ":0");
+            }
+        }
+        let secret = match typed {
             Some(password) => {
                 let path = write_secret(&password)?;
-                command
-                    .env("SSH_ASKPASS", env::current_exe()?)
-                    .env("SSH_ASKPASS_REQUIRE", "force")
-                    .env(ASKPASS_FILE_VARIABLE, &path);
-                // Older `ssh` runs its askpass program only for a display.
-                if env::var_os("DISPLAY").is_none() {
-                    command.env("DISPLAY", ":0");
-                }
+                command.env(ASKPASS_FILE_VARIABLE, &path);
                 Some(path)
+            }
+            // The helper reads it from the credential store, if the host
+            // asks at all.
+            None if saved => {
+                command.env(ASKPASS_HOST_VARIABLE, host.id.to_string());
+                None
             }
             None => {
                 // Nothing to answer a prompt with: better to fail at once
@@ -1190,30 +1256,48 @@ fn write_secret(password: &str) -> io::Result<PathBuf> {
 
 /// Whether this process was started by `ssh` as its askpass program.
 pub(crate) fn is_askpass_mode() -> bool {
-    env::var_os(ASKPASS_FILE_VARIABLE).is_some()
+    env::var_os(ASKPASS_FILE_VARIABLE).is_some() || env::var_os(ASKPASS_HOST_VARIABLE).is_some()
 }
 
 /// The helper mode: prints the password for a password prompt and says
 /// nothing to any other question, so a host-key prompt that slipped past
-/// the options gets no answer rather than the password. The exit code is
-/// the process's.
+/// the options gets no answer rather than the password. The password is the
+/// typed one's file, or the saved host's entry in the credential store. The
+/// exit code is the process's; what goes to stderr reaches the connection's
+/// report through `ssh`.
 pub(crate) fn run_askpass() -> i32 {
     let prompt = env::args().nth(1).unwrap_or_default().to_lowercase();
     if !(prompt.is_empty() || prompt.contains("password") || prompt.contains("passphrase")) {
         return 1;
     }
-    let Some(path) = env::var_os(ASKPASS_FILE_VARIABLE) else {
-        return 1;
+    let password = if let Some(path) = env::var_os(ASKPASS_FILE_VARIABLE) {
+        fs::read_to_string(path).ok()
+    } else {
+        let id = env::var(ASKPASS_HOST_VARIABLE)
+            .ok()
+            .and_then(|id| id.parse::<u64>().ok());
+        match id.map(secrets::load) {
+            Some(Ok(Some(password))) => Some(password),
+            Some(Ok(None)) => {
+                eprintln!("serialX has no saved password for this host any more.");
+                None
+            }
+            Some(Err(error)) => {
+                eprintln!("serialX could not read the saved password: {error}");
+                None
+            }
+            None => None,
+        }
     };
-    match fs::read_to_string(path) {
-        Ok(password) => {
+    match password {
+        Some(password) => {
             let mut stdout = io::stdout().lock();
             let _ = stdout.write_all(password.trim_end_matches(['\r', '\n']).as_bytes());
             let _ = stdout.write_all(b"\n");
             let _ = stdout.flush();
             0
         }
-        Err(_) => 1,
+        None => 1,
     }
 }
 
@@ -1271,6 +1355,7 @@ mod tests {
             user: Some("me".into()),
             port: Some(2200),
             identity: None,
+            secret_saved: false,
         };
         assert_eq!(host.address(), "me@[fe80::1]:2200");
         assert_eq!(host.title(), "me@[fe80::1]:2200");
@@ -1280,6 +1365,50 @@ mod tests {
             ..host
         };
         assert_eq!(named.title(), "Lab");
+    }
+
+    #[test]
+    fn every_host_in_the_book_has_an_id_of_its_own() {
+        // As the first save wrote it: the first host at 0.
+        let mut book = HostBook::parse(
+            r#"{"hosts":[{"id":0,"name":"sunrise","host":"10.0.0.5","user":"me"}],"next_id":1}"#,
+        );
+        assert_eq!(book.hosts[0].id, 1);
+        let fresh = |host: &str| RemoteHost {
+            id: 0,
+            name: String::new(),
+            host: host.into(),
+            user: None,
+            port: None,
+            identity: None,
+            secret_saved: false,
+        };
+        assert_eq!(book.keep(fresh("lab")), 2);
+        assert_eq!(book.keep(fresh("bench")), 3);
+        let titles: Vec<String> = book.hosts.iter().map(RemoteHost::title).collect();
+        assert_eq!(titles, ["sunrise", "lab", "bench"]);
+
+        let twice = HostBook::parse(
+            r#"{"hosts":[{"id":4,"host":"a","secret_saved":true},{"id":4,"host":"b","secret_saved":true}],"next_id":2}"#,
+        );
+        assert_eq!((twice.hosts[0].id, twice.hosts[1].id), (4, 5));
+        assert!(twice.hosts[0].secret_saved && !twice.hosts[1].secret_saved);
+        assert_eq!(twice.next_id, 6);
+        assert_eq!(HostBook::default().next_id, 1);
+    }
+
+    #[test]
+    fn a_host_book_notes_a_saved_password_but_never_holds_one() {
+        let older: RemoteHost = serde_json::from_str(r#"{"id":3,"host":"lab"}"#).unwrap();
+        assert!(!older.secret_saved);
+        let written = serde_json::to_string(&older).unwrap();
+        assert!(!written.contains("secret"), "{written}");
+        let saved = RemoteHost {
+            secret_saved: true,
+            ..older
+        };
+        let written = serde_json::to_string(&saved).unwrap();
+        assert!(written.contains(r#""secret_saved":true"#), "{written}");
     }
 
     #[test]
@@ -1366,6 +1495,7 @@ mod tests {
             user: None,
             port: None,
             identity: None,
+            secret_saved: false,
         };
         Some(RemoteConnection::spawn(command, host, None).expect("sh runs"))
     }

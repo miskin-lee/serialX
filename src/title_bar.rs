@@ -334,7 +334,9 @@ impl SerialWorkspace {
     /// The plate at the bar's left end that says where the workbench is:
     /// this machine, or a host — the way an editor's corner names the
     /// machine its folder is on. Faint while local, in the accent once on
-    /// a host. A click connects, or offers to move or disconnect.
+    /// a host. A click lists the saved hosts to connect to, with the dialog
+    /// under them, and on a host the way to disconnect; with no host saved
+    /// and none connected it opens the dialog straight away.
     fn render_remote_plate(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let palette = self.interface_theme.palette();
         let status = self.remote_status();
@@ -356,6 +358,15 @@ impl SerialWorkspace {
             RemoteStatus::Local => String::new(),
         };
         let workspace = cx.weak_entity();
+        // The saved hosts, less the one the workbench is on.
+        let current = self.remote.as_ref().map(|remote| remote.host.id);
+        let hosts: Vec<(u64, String, String)> = self
+            .hosts
+            .hosts
+            .iter()
+            .filter(|host| current != Some(host.id))
+            .map(|host| (host.id, host.title(), host.address()))
+            .collect();
 
         let button = Button::new("remote-plate")
             .small()
@@ -367,7 +378,7 @@ impl SerialWorkspace {
             .icon(Glyph::Remote)
             .label(label)
             .tooltip_with_action(tooltip, &ConnectRemoteHost, None);
-        if !on_host {
+        if !on_host && hosts.is_empty() {
             return button
                 .ghost()
                 .text_color(rgb(palette.muted))
@@ -376,22 +387,48 @@ impl SerialWorkspace {
                 }))
                 .into_any_element();
         }
+        let button = if on_host {
+            button.custom(Self::accent_pill(palette, cx))
+        } else {
+            button.ghost().text_color(rgb(palette.muted))
+        };
         button
-            .custom(Self::accent_pill(palette, cx))
-            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
+                if !hosts.is_empty() {
+                    menu = menu.label("Saved hosts");
+                    for (id, name, address) in hosts.iter().cloned() {
+                        let connect = workspace.clone();
+                        menu = menu.item(
+                            Self::saved_host_item(palette, name, address)
+                                .icon(Icon::new(Glyph::Remote))
+                                .on_click(move |_, _, cx| {
+                                    let _ = connect.update(cx, |this, cx| {
+                                        this.connect_saved_host(id, cx);
+                                    });
+                                }),
+                        );
+                    }
+                    menu = menu.separator();
+                }
                 let connect = workspace.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(if on_host {
+                        "Connect to Another Host…"
+                    } else {
+                        "Connect to Host…"
+                    })
+                    .action(Box::new(ConnectRemoteHost))
+                    .on_click(move |_, window, cx| {
+                        let _ = connect.update(cx, |this, cx| {
+                            this.open_remote_dialog(window, cx);
+                        });
+                    }),
+                );
+                if !on_host {
+                    return menu;
+                }
                 let disconnect = workspace.clone();
-                menu.item(
-                    PopupMenuItem::new("Connect to Another Host…")
-                        .action(Box::new(ConnectRemoteHost))
-                        .on_click(move |_, window, cx| {
-                            let _ = connect.update(cx, |this, cx| {
-                                this.open_remote_dialog(window, cx);
-                            });
-                        }),
-                )
-                .separator()
-                .item(
+                menu.separator().item(
                     PopupMenuItem::new(format!("Disconnect from {title}"))
                         .action(Box::new(DisconnectRemoteHost))
                         .on_click(move |_, window, cx| {
@@ -402,6 +439,28 @@ impl SerialWorkspace {
                 )
             })
             .into_any_element()
+    }
+
+    /// A saved host in the plate's menu: its name, and its address after it
+    /// in the muted ink when the name is not already the address.
+    fn saved_host_item(palette: WorkbenchPalette, name: String, address: String) -> PopupMenuItem {
+        PopupMenuItem::element(move |_, _| {
+            h_flex()
+                .min_w_0()
+                .gap_2()
+                .items_center()
+                .child(div().flex_none().child(name.clone()))
+                .when(address != name, |row| {
+                    row.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .ui_mono_token(MICRO)
+                            .text_color(rgb(palette.muted))
+                            .child(address.clone()),
+                    )
+                })
+        })
     }
 
     /// The counters at the connect pill's right: how many bytes this

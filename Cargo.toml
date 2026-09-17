@@ -13,6 +13,7 @@ license = "GPL-3.0-only"
 alacritty_terminal = "0.26"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui-kit = "0.6"
+keyring = "4"
 regex = "1"
 reqwest = { package = "gpui-pre-reqwest", version = "0.12.15", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 semver = "1"

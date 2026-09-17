@@ -1,14 +1,19 @@
 //! The connect dialog: the hosts the workbench knows in a list, the one to
 //! reach in a field, and how — a key file when the account's usual ones
 //! are not it, a password when the host asks for one. `Save & Connect`
-//! keeps the host in the list and connects; `Connect` only connects.
+//! keeps the host in the list and connects, and with `Remember` on keeps
+//! the password or key passphrase in the platform's credential store;
+//! `Connect` only connects. A double-click on a saved host connects to it
+//! as it is kept.
 
 use gpui_kit::base::Scrollbar;
 use gpui_kit::component::{
     Icon, IconName, Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
+    notification::Notification,
     scroll::ScrollableElement,
     v_flex,
 };
@@ -18,7 +23,10 @@ use gpui_kit::*;
 use crate::SerialWorkspace;
 use crate::controls::{SecondaryConfirm, dialog_footer, eyebrow, tag};
 use crate::icons::{Glyph, icon_chip};
-use crate::remote::RemoteHost;
+use crate::remote::{
+    RemoteHost,
+    secrets::{self, STORE_NAME},
+};
 use crate::theme::{
     CAPTION, InterfaceTheme, LABEL, MICRO, TITLE, Typography, WorkbenchPalette, tint,
 };
@@ -31,6 +39,16 @@ const SECTION_GAP: f32 = 14.;
 const COLUMN_GAP: f32 = 10.;
 const ROW_ACTION_SIZE: f32 = 22.;
 const ROW_ACTION_REST: f32 = 0.55;
+const PASSWORD_PLACEHOLDER: &str = "Password or key passphrase (optional)";
+
+/// The dialog's fields as confirmed.
+struct Typed {
+    host: RemoteHost,
+    /// The password or passphrase typed, if one was.
+    password: Option<String>,
+    /// Whether `Save & Connect` is to remember it.
+    remember: bool,
+}
 
 /// The connection as it is being set up. Nothing is tried until the
 /// dialog is confirmed.
@@ -47,6 +65,8 @@ struct RemoteEditor {
     name_input: Entity<InputState>,
     identity_input: Entity<InputState>,
     password_input: Entity<InputState>,
+    /// The `Remember` switch: whether the password or passphrase is kept.
+    remember: bool,
     _subscriptions: Vec<Subscription>,
     /// The host the workbench is on now, if any, to say so.
     connected: Option<String>,
@@ -73,7 +93,7 @@ impl RemoteEditor {
         });
         let password_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Password or key passphrase (optional)")
+                .placeholder(PASSWORD_PLACEHOLDER)
                 .masked(true)
         });
         let mut subscriptions = Vec::new();
@@ -103,6 +123,7 @@ impl RemoteEditor {
             name_input,
             identity_input,
             password_input,
+            remember: false,
             _subscriptions: subscriptions,
             connected,
             complaint: None,
@@ -115,13 +136,22 @@ impl RemoteEditor {
             .update(cx, |input, cx| input.focus(window, cx));
     }
 
-    /// Fills the fields from a saved host.
+    /// Whether the selected host has a password or passphrase remembered.
+    fn selected_secret_saved(&self) -> bool {
+        self.selected
+            .and_then(|id| self.hosts.iter().find(|host| host.id == id))
+            .is_some_and(|host| host.secret_saved)
+    }
+
+    /// Fills the fields from a saved host. A remembered password stays in
+    /// the store: the field says it is there and takes a new one.
     fn pick_host(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(host) = self.hosts.iter().find(|host| host.id == id).cloned() else {
             return;
         };
         self.selected = Some(id);
         self.complaint = None;
+        self.remember = host.secret_saved;
         let address = host.address();
         let name = host.name.clone();
         let identity = host.identity.clone().unwrap_or_default();
@@ -131,20 +161,63 @@ impl RemoteEditor {
             .update(cx, |input, cx| input.set_value(name, window, cx));
         self.identity_input
             .update(cx, |input, cx| input.set_value(identity, window, cx));
+        self.set_password_placeholder(window, cx);
         cx.notify();
     }
 
-    /// Takes a host out of the book, here and in the workbench.
-    fn forget_host(&mut self, id: u64, cx: &mut Context<Self>) {
+    /// Empties the fields for a host not in the list yet, so `Save &
+    /// Connect` adds one rather than saving over the host picked last.
+    fn new_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = None;
+        self.complaint = None;
+        self.remember = false;
+        for input in [&self.address_input, &self.name_input, &self.identity_input] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.set_password_placeholder(window, cx);
+        self.focus_address(window, cx);
+        cx.notify();
+    }
+
+    /// The password field clears, and says whether a password is kept.
+    fn set_password_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = if self.selected_secret_saved() {
+            format!("Saved in {STORE_NAME}; type to replace it")
+        } else {
+            PASSWORD_PLACEHOLDER.to_string()
+        };
+        self.password_input.update(cx, |input, cx| {
+            input.set_value("", window, cx);
+            input.set_placeholder(placeholder, window, cx);
+        });
+    }
+
+    fn set_remember(&mut self, remember: bool, cx: &mut Context<Self>) {
+        self.remember = remember;
+        cx.notify();
+    }
+
+    /// Takes a host out of the book, here and in the workbench, with the
+    /// password it remembered.
+    fn forget_host(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.hosts.retain(|host| host.id != id);
         if self.selected == Some(id) {
             self.selected = None;
+            self.remember = false;
+            self.set_password_placeholder(window, cx);
         }
         let _ = self.workspace.update(cx, |workspace, cx| {
-            workspace.hosts.remove(id);
-            cx.notify();
+            workspace.forget_saved_host(id, cx);
         });
         cx.notify();
+    }
+
+    /// Connects to a saved host as it is kept, and closes the dialog.
+    fn connect_saved(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        window.close_dialog(cx);
+        let _ = self.workspace.update(cx, |workspace, cx| {
+            workspace.connect_saved_host(id, cx);
+        });
     }
 
     /// Asks the platform for the key file.
@@ -174,7 +247,7 @@ impl RemoteEditor {
     }
 
     /// The host as typed, or a complaint left under the field.
-    fn host(&mut self, cx: &mut Context<Self>) -> Result<(RemoteHost, Option<String>), ()> {
+    fn typed(&mut self, cx: &mut Context<Self>) -> Result<Typed, ()> {
         let address = self.address_input.read(cx).value().to_string();
         let (user, host, port) = match RemoteHost::parse_address(&address) {
             Ok(parts) => parts,
@@ -187,17 +260,21 @@ impl RemoteEditor {
         let name = self.name_input.read(cx).value().trim().to_string();
         let identity = self.identity_input.read(cx).value().trim().to_string();
         let password = self.password_input.read(cx).value().to_string();
-        Ok((
-            RemoteHost {
+        Ok(Typed {
+            host: RemoteHost {
                 id: self.selected.unwrap_or(0),
                 name,
                 host,
                 user,
                 port,
                 identity: (!identity.is_empty()).then_some(identity),
+                // A connection from the fields uses the remembered password
+                // while the switch still says to.
+                secret_saved: self.remember && self.selected_secret_saved(),
             },
-            (!password.is_empty()).then_some(password),
-        ))
+            password: (!password.is_empty()).then_some(password),
+            remember: self.remember,
+        })
     }
 
     /// A text field at the dialog's field height. `Input::h` is the
@@ -254,7 +331,14 @@ impl RemoteEditor {
                 let id = host.id;
                 let selected = self.selected == Some(id);
                 let title = host.title();
-                let address = host.address();
+                // What the host is reached with rides after its address.
+                let mut address = host.address();
+                if host.identity.is_some() {
+                    address.push_str(" · key file");
+                }
+                if host.secret_saved {
+                    address.push_str(" · password saved");
+                }
                 let on_it = connected.as_deref() == Some(title.as_str());
                 h_flex()
                     .id(("remote-host", index))
@@ -271,8 +355,12 @@ impl RemoteEditor {
                     })
                     .when(selected, |row| row.bg(tint(palette.accent, 0.1)))
                     .when(!selected, |row| row.hover(|row| row.bg(rgb(palette.hover))))
-                    .on_click(cx.listener(move |editor, _, window, cx| {
-                        editor.pick_host(id, window, cx);
+                    .on_click(cx.listener(move |editor, event: &ClickEvent, window, cx| {
+                        if event.click_count() >= 2 {
+                            editor.connect_saved(id, window, cx);
+                        } else {
+                            editor.pick_host(id, window, cx);
+                        }
                     }))
                     .child(icon_chip(Glyph::Remote, palette.category_session, 26.))
                     .child(
@@ -308,9 +396,9 @@ impl RemoteEditor {
                                     .with_size(px(ROW_ACTION_SIZE))
                                     .icon(Glyph::Trash)
                                     .tooltip("Forget this host")
-                                    .on_click(cx.listener(move |editor, _, _, cx| {
+                                    .on_click(cx.listener(move |editor, _, window, cx| {
                                         cx.stop_propagation();
-                                        editor.forget_host(id, cx);
+                                        editor.forget_host(id, window, cx);
                                     })),
                             ),
                     )
@@ -359,13 +447,31 @@ impl RemoteEditor {
             );
         }
         let count = self.hosts.len();
-        let aside = div()
-            .text_token(CAPTION)
-            .text_color(rgb(palette.faint))
-            .child(if count == 1 {
-                "1 host".to_string()
-            } else {
-                format!("{count} hosts")
+        let aside = h_flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_token(CAPTION)
+                    .text_color(rgb(palette.faint))
+                    .child(if count == 1 {
+                        "1 host".to_string()
+                    } else {
+                        format!("{count} hosts")
+                    }),
+            )
+            .when(self.selected.is_some(), |aside| {
+                aside.child(
+                    Button::new("remote-host-new")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .label("New host")
+                        .tooltip("Empty the fields to add a host rather than change this one")
+                        .on_click(cx.listener(|editor, _, window, cx| {
+                            editor.new_host(window, cx);
+                        })),
+                )
             })
             .into_any_element();
 
@@ -385,7 +491,7 @@ impl RemoteEditor {
                         .overflow_y_scrollbar()
                         .children(rows),
                 ),
-            Ok("Click a host to fill the fields from it. The list is this machine's, whichever host is connected."),
+            Ok("Click a host to fill the fields from it, or double-click to connect. The list is this machine's, whichever host is connected."),
         )
         .into_any_element()
     }
@@ -406,6 +512,20 @@ impl Render for RemoteEditor {
             ),
         };
         let connected = self.connected.clone();
+        let remember = Checkbox::new("remote-remember")
+            .small()
+            .checked(self.remember)
+            .label("Remember password")
+            .tooltip(format!(
+                "Save & Connect keeps the password or key passphrase in {STORE_NAME}, so the host connects without asking"
+            ))
+            .on_click(cx.listener(|editor, checked: &bool, _, cx| {
+                editor.set_remember(*checked, cx);
+            }))
+            .into_any_element();
+        let auth_hint = format!(
+            "Keys, agents and jump hosts from ~/.ssh/config are used as they are. With Remember on, Save & Connect keeps the password or passphrase in {STORE_NAME}, never in a file; otherwise it is kept nowhere."
+        );
 
         v_flex()
             .gap(px(SECTION_GAP))
@@ -426,7 +546,7 @@ impl Render for RemoteEditor {
             .child(Self::section(
                 palette,
                 "Authentication",
-                None,
+                Some(remember),
                 v_flex()
                     .gap_2()
                     .child(
@@ -447,7 +567,7 @@ impl Render for RemoteEditor {
                             ),
                     )
                     .child(password),
-                Ok("Keys, agents and jump hosts from ~/.ssh/config are used as they are. A password is handed to ssh only when typed here, and is kept nowhere."),
+                Ok(&auth_hint),
             ))
     }
 }
@@ -497,18 +617,15 @@ impl SerialWorkspace {
                 .on_ok(move |_, _, cx| {
                     let connect_only =
                         editor.update(cx, |editor, _| std::mem::take(&mut editor.connect_only));
-                    let Ok((host, password)) = editor.update(cx, |editor, cx| editor.host(cx))
-                    else {
+                    let Ok(typed) = editor.update(cx, |editor, cx| editor.typed(cx)) else {
                         return false;
                     };
                     let _ = workspace.update(cx, |workspace, cx| {
-                        let host = if connect_only {
-                            host
+                        if connect_only {
+                            workspace.connect_remote(typed.host, typed.password, cx);
                         } else {
-                            let id = workspace.hosts.keep(host.clone());
-                            RemoteHost { id, ..host }
-                        };
-                        workspace.connect_remote(host, password, cx);
+                            workspace.save_and_connect(typed, cx);
+                        }
                     });
                     true
                 })
@@ -517,5 +634,76 @@ impl SerialWorkspace {
         cx.defer_in(window, move |_, window, cx| {
             field.update(cx, |editor, cx| editor.focus_address(window, cx));
         });
+    }
+
+    /// Connects to a saved host as it is kept, with the password it
+    /// remembers if it has one.
+    pub(crate) fn connect_saved_host(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(host) = self.hosts.find(id).cloned() else {
+            return;
+        };
+        self.connect_remote(host, None, cx);
+    }
+
+    /// `Save & Connect`: keeps the host, keeps or forgets its password as
+    /// the switch says, and connects. A password typed now is what the
+    /// connection uses, so it does not wait on the store.
+    fn save_and_connect(&mut self, typed: Typed, cx: &mut Context<Self>) {
+        let Typed {
+            mut host,
+            password,
+            remember,
+        } = typed;
+        let had_secret = self.hosts.find(host.id).is_some_and(|kept| kept.secret_saved);
+        host.secret_saved = remember && (password.is_some() || had_secret);
+        host.id = self.hosts.keep(host.clone());
+        match (remember, &password) {
+            (true, Some(secret)) => self.update_secret(host.id, Some(secret.clone()), cx),
+            (false, _) if had_secret => self.update_secret(host.id, None, cx),
+            _ => {}
+        }
+        self.connect_remote(host, password, cx);
+    }
+
+    /// Takes a host out of the book, and its password out of the store.
+    pub(crate) fn forget_saved_host(&mut self, id: u64, cx: &mut Context<Self>) {
+        let had_secret = self.hosts.find(id).is_some_and(|host| host.secret_saved);
+        self.hosts.remove(id);
+        if had_secret {
+            self.update_secret(id, None, cx);
+        }
+        cx.notify();
+    }
+
+    /// Stores a host's password, or forgets it, away from the window's
+    /// thread: the store may stop to ask the user. A password that could
+    /// not be stored is not noted as saved, and the notification says why.
+    fn update_secret(&mut self, id: u64, secret: Option<String>, cx: &mut Context<Self>) {
+        let storing = secret.is_some();
+        cx.spawn(async move |this, cx| {
+            let outcome = smol::unblock(move || match secret {
+                Some(secret) => secrets::store(id, &secret),
+                None => secrets::forget(id),
+            })
+            .await;
+            let Err(error) = outcome else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                if storing {
+                    this.hosts.set_secret_saved(id, false);
+                }
+                this.defer_with_window(cx, move |_, window, cx| {
+                    let title = if storing {
+                        "The password was not saved"
+                    } else {
+                        "The saved password was not removed"
+                    };
+                    window.push_notification(Notification::error(error).title(title), cx);
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 }

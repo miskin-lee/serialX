@@ -51,6 +51,15 @@ pub(crate) const TITLE_BAR_HEIGHT: f32 = 38.;
 const TRAFFIC_LIGHT_DIAMETER: f32 = 12.;
 /// Height of every pill and icon button in the bar.
 const CONTROL_HEIGHT: f32 = 26.;
+/// The glyph box of the bar's icon buttons: gpui-component draws a button's
+/// icon at three quarters of its size, and the host plate's glyph matches.
+const ICON_BOX: f32 = CONTROL_HEIGHT * 0.75;
+/// How far the host plate's name is lifted off the line the glyph centres
+/// on. The line box centres the capitals, and a name in lower case — most
+/// host names — then reads low beside the glyph; half the gap between the
+/// cap height's centre and the x-height's puts the word's weight level
+/// with it.
+const PLATE_LABEL_LIFT: f32 = 1.;
 /// Height of the filter box. Two more than the pills either side of it, so the
 /// thing you type into is the biggest thing in the bar.
 const FILTER_HEIGHT: f32 = 28.;
@@ -375,8 +384,22 @@ impl SerialWorkspace {
             .rounded(px(CONTROL_HEIGHT / 2.))
             .px_2p5()
             .max_w(px(220.))
-            .icon(Glyph::Remote)
-            .label(label)
+            // The glyph at the size of the switches at the bar's other end,
+            // which a button's own `icon` would draw at the Small size.
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(Icon::new(Glyph::Remote).with_size(px(ICON_BOX)))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .mb(px(PLATE_LABEL_LIFT * 2.))
+                            .child(label),
+                    ),
+            )
             .tooltip_with_action(tooltip, &ConnectRemoteHost, None);
         if !on_host && hosts.is_empty() {
             return button

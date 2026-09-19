@@ -9,6 +9,18 @@
 
 serialX 是一款跨平台串口工作台，使用 Rust、[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 和 [GPUI Component](https://github.com/longbridge/gpui-component) 构建，支持 macOS、Windows 和 Linux。
 
+## 应用截图
+
+**深色主题**：彩色日志与语法高亮、关键词查找、彩色会话分组和快捷命令。
+
+![serialX 深色主题：彩色设备日志、关键词查找与会话分组](docs/screenshots/dark-workspace.png)
+
+**浅色主题**：文本与十六进制分栏显示，搭配会话库、快捷发送和发送编辑框。
+
+![serialX 浅色主题：文本与十六进制分栏、已保存会话和快捷发送](docs/screenshots/light-split-view.png)
+
+*截图来自实际应用界面，使用演示数据。*
+
 ## 功能
 
 - **数据收发**：支持交互式终端、文本与十六进制视图，以及 UTF-8 / HEX 发送。

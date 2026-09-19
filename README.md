@@ -9,6 +9,18 @@
 
 serialX is a cross-platform serial port workspace built with Rust, [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) and [GPUI Component](https://github.com/longbridge/gpui-component), available on macOS, Windows and Linux.
 
+## Screenshots
+
+**Dark theme** — syntax-highlighted logs, search, colour-tagged sessions and quick-send commands.
+
+![serialX dark theme with colourful device logs, search and grouped sessions](docs/screenshots/dark-workspace.png)
+
+**Light theme** — text and hex views in split panes, with the session library and send composer alongside.
+
+![serialX light theme with split text and hex views, saved sessions and quick send](docs/screenshots/light-split-view.png)
+
+*App screenshots use demonstration data.*
+
 ## Features
 
 - **Send and receive**: Interactive terminal, text and hex views, and UTF-8 / HEX sending.

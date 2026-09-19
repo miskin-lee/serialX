@@ -31,7 +31,7 @@ serialX is a cross-platform serial port workspace built with Rust, [GPUI](https:
 - **Recording**: Save raw received bytes for each connection, automatically organised by date.
 - **File transfer**: XMODEM, XMODEM-1K, YMODEM and ZMODEM, with automatic responses to `sz` / `rz` on the device.
 - **Remote connections**: Access remote serial ports, sessions and files over SSH. The host needs `python3`; no agent preinstallation is required.
-- **Preferences**: Adjust scrollback length, terminal font size and file locations, and check for updates in the app.
+- **Preferences**: Set interface and terminal font sizes independently, adjust scrollback length and file locations, and check for updates in the app. Interface text also sizes dialogs and in-app menus; the macOS menu bar follows the system text size.
 
 ## Install
 

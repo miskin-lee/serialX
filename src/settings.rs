@@ -1,9 +1,10 @@
 //! Settings: what is the workbench's to set rather than a session's.
 //!
-//! Four so far — how many lines a terminal keeps above its screen, typed as
+//! How many lines a terminal keeps above its screen, typed as
 //! a number; the size its log is set in, picked from the list of sizes the
-//! setting offers; the folder the sessions that record write into; and the
-//! folder files received over XMODEM, YMODEM and ZMODEM land in, both
+//! setting offers; the interface text size; the folder the sessions that
+//! record write into; and the folder files received over XMODEM, YMODEM
+//! and ZMODEM land in, both
 //! chosen with the platform's own folder picker — opened from the
 //! application menu with ⌘, as every macOS application opens its own. What
 //! is set is written to the workspace file beside the presets, and takes
@@ -35,21 +36,24 @@ use crate::SerialWorkspace;
 use crate::controls::{dialog_footer, eyebrow};
 use crate::icons::{Glyph, icon_chip};
 use crate::presets::{
-    MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings, TERMINAL_FONT_SIZES, usable_font_size,
+    INTERFACE_FONT_SIZES, MAX_SCROLLBACK_LINES, MIN_SCROLLBACK_LINES, Settings,
+    TERMINAL_FONT_SIZES, usable_font_size, usable_interface_font_size,
 };
 use crate::recorder::{recordings_folder, remote_recordings_folder};
 use crate::remote::{
     RemoteContext,
     browser::{Pick, open_remote_browser},
 };
-use crate::theme::{CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette};
+use crate::theme::{
+    CAPTION, InterfaceTheme, LABEL, TITLE, Typography, WorkbenchPalette, apply_interface_font_size,
+};
 use crate::transfer::default_transfer_folder;
 
 /// Width of the dialog: a number, and a sentence about it.
 const DIALOG_WIDTH: f32 = 420.;
 /// Height of a field, the same as the session dialog's fields.
 const FIELD_HEIGHT: f32 = 32.;
-/// The gap between the two settings.
+/// The gap between settings.
 const SECTION_GAP: f32 = 14.;
 /// Width of the size field: a couple of digits, a `pt` and a caret. The list
 /// it opens is at least as wide as the field it hangs from.
@@ -105,6 +109,12 @@ enum Folder {
     Received,
 }
 
+#[derive(Clone, Copy)]
+enum TextSize {
+    Terminal,
+    Interface,
+}
+
 /// The host the settings are the host's, with the folders it names as its
 /// own: its documents, where the recordings go there until a folder is
 /// chosen, and its downloads, where received files go.
@@ -116,13 +126,14 @@ struct HostFolders {
 }
 
 /// The settings as they are being set: the scrollback typed into a field, the
-/// type size picked from a list. Nothing here reaches the workspace until the
+/// type sizes picked from lists. Nothing here reaches the workspace until the
 /// dialog is confirmed.
 struct SettingsEditor {
     theme: InterfaceTheme,
     lines_input: Entity<InputState>,
     _lines_subscription: Subscription,
     font_size: f32,
+    interface_font_size: f32,
     /// The folder the recordings' own tree is made in, while one has been
     /// chosen; none leaves them in the account's documents.
     recording_root: Option<PathBuf>,
@@ -165,6 +176,7 @@ impl SettingsEditor {
             // A file from before the sizes were whole opens on the size the
             // log is actually laid out at, so the list has a row ticked.
             font_size: usable_font_size(current.terminal_font_size),
+            interface_font_size: usable_interface_font_size(current.interface_font_size),
             recording_root: current.recording_root,
             transfer_folder: current.transfer_folder,
             remote,
@@ -187,8 +199,11 @@ impl SettingsEditor {
         });
     }
 
-    fn select_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
-        self.font_size = size;
+    fn select_font_size(&mut self, target: TextSize, size: f32, cx: &mut Context<Self>) {
+        match target {
+            TextSize::Terminal => self.font_size = size,
+            TextSize::Interface => self.interface_font_size = size,
+        }
         cx.notify();
     }
 
@@ -384,13 +399,23 @@ impl SettingsEditor {
     /// field is drawn, opening the list of sizes with the current one ticked.
     fn render_size_field(
         &mut self,
+        target: TextSize,
         palette: WorkbenchPalette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let current = self.font_size;
+        let (id, current, sizes, tooltip): (_, _, &[f32], _) = match target {
+            TextSize::Terminal => (
+                "settings-font-size", self.font_size, &TERMINAL_FONT_SIZES,
+                "The size the terminal's log is set in",
+            ),
+            TextSize::Interface => (
+                "settings-interface-font-size", self.interface_font_size, &INTERFACE_FONT_SIZES,
+                "The text size for the interface and in-app menus",
+            ),
+        };
         let editor = cx.weak_entity();
 
-        Button::new("settings-font-size")
+        Button::new(id)
             .ghost()
             .with_size(px(FIELD_HEIGHT))
             .w(px(SIZE_FIELD_WIDTH))
@@ -432,17 +457,17 @@ impl SettingsEditor {
                             .text_color(rgb(palette.muted)),
                     ),
             )
-            .tooltip("The size the terminal's log is set in")
+            .tooltip(tooltip)
             .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, _, _| {
                 menu = menu.min_w(px(SIZE_FIELD_WIDTH));
-                for size in TERMINAL_FONT_SIZES {
+                for &size in sizes {
                     let editor = editor.clone();
                     menu = menu.item(
                         PopupMenuItem::new(format_font_size(size))
                             .checked((current - size).abs() < f32::EPSILON)
                             .on_click(move |_, _, cx| {
                                 let _ = editor
-                                    .update(cx, |editor, cx| editor.select_font_size(size, cx));
+                                    .update(cx, |editor, cx| editor.select_font_size(target, size, cx));
                             }),
                     );
                 }
@@ -481,7 +506,8 @@ impl Render for SettingsEditor {
                 ),
             px(FIELD_HEIGHT),
         );
-        let size = self.render_size_field(palette, cx);
+        let size = self.render_size_field(TextSize::Terminal, palette, cx);
+        let interface_size = self.render_size_field(TextSize::Interface, palette, cx);
         let recording = self.render_folder_field(Folder::Recordings, palette, cx);
         let received = self.render_folder_field(Folder::Received, palette, cx);
 
@@ -501,6 +527,16 @@ impl Render for SettingsEditor {
                 "Terminal text",
                 size,
                 Ok("The size the log is set in, in every session. The line numbers, the timestamps and the line height follow it."),
+            ))
+            .child(setting_section(
+                palette,
+                "Interface text",
+                interface_size,
+                Ok(if cfg!(target_os = "macos") {
+                    "Text in pages, dialogs and in-app menus. The macOS menu bar uses the system text size."
+                } else {
+                    "Text in pages, dialogs and menus. Terminal text is set separately."
+                }),
             ))
             .child(setting_section(
                 palette,
@@ -594,6 +630,7 @@ impl SerialWorkspace {
                         return false;
                     };
                     let terminal_font_size = editor.read(cx).font_size;
+                    let interface_font_size = editor.read(cx).interface_font_size;
                     let recording_root = editor.read(cx).recording_root.clone();
                     let transfer_folder = editor.read(cx).transfer_folder.clone();
                     let _ = workspace.update(cx, |workspace, cx| {
@@ -601,6 +638,7 @@ impl SerialWorkspace {
                             Settings {
                                 scrollback_lines,
                                 terminal_font_size,
+                                interface_font_size,
                                 recording_root,
                                 transfer_folder,
                                 transfer_protocol,
@@ -620,10 +658,11 @@ impl SerialWorkspace {
         });
     }
 
-    /// Takes the settings as given: writes them down, and hands every open
-    /// terminal its new scrollback.
+    /// Writes the settings down, refreshes interface text and hands every
+    /// open terminal its new scrollback.
     pub(crate) fn apply_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         let scrollback_lines = settings.scrollback_lines;
+        apply_interface_font_size(settings.interface_font_size, cx);
         self.presets.set_settings(settings);
         for tab in &mut self.tabs {
             tab.terminal.set_scrollback(scrollback_lines);

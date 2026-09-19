@@ -60,7 +60,9 @@ use sidebar::{
     panel_divider,
 };
 use smol::Timer;
-use theme::{InterfaceTheme, Typography, apply_interface_theme, resolve_fonts};
+use theme::{
+    InterfaceTheme, Typography, apply_interface_font_size, apply_interface_theme, resolve_fonts,
+};
 use terminal::{GridCell, SelectionKind, key_bytes, paste_bytes};
 use title_bar::{FILTER_PLACEHOLDER, TITLE_BAR_HEIGHT, traffic_light_position};
 use workbench::TerminalMetrics;
@@ -186,6 +188,8 @@ pub struct SerialWorkspace {
 
 impl SerialWorkspace {
     fn new(interface_theme: InterfaceTheme, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let presets = PresetStore::load();
+        apply_interface_font_size(presets.settings.interface_font_size, cx);
         let (update_tx, update_rx) = mpsc::channel();
         let menu_bar = AppMenuBar::new(cx);
         let panel_layout = cx.new(|_| ResizableState::default());
@@ -212,7 +216,7 @@ impl SerialWorkspace {
             split_axis: SplitAxis::Across,
             pane_layout: cx.new(|_| ResizableState::default()),
             interface_theme,
-            presets: PresetStore::load(),
+            presets,
             local_presets: None,
             hosts: HostBook::load(),
             remote: None,
@@ -275,7 +279,7 @@ impl SerialWorkspace {
             return;
         }
         self.interface_theme = theme;
-        apply_interface_theme(theme, window, cx);
+        apply_interface_theme(theme, self.presets.settings.interface_font_size, window, cx);
         cx.notify();
     }
 
@@ -733,6 +737,7 @@ impl SerialWorkspace {
         self.remote = None;
         if let Some(local) = self.local_presets.take() {
             self.presets = local;
+            apply_interface_font_size(self.presets.settings.interface_font_size, cx);
             self.selected_saved = None;
             self.collapsed_groups.clear();
             self.ports_generation += 1;
@@ -776,6 +781,7 @@ impl SerialWorkspace {
                 };
                 remote.info = Some(info);
                 let local = std::mem::replace(&mut self.presets, store);
+                apply_interface_font_size(self.presets.settings.interface_font_size, cx);
                 if self.local_presets.is_none() {
                     self.local_presets = Some(local);
                 }
@@ -1911,7 +1917,9 @@ fn main() {
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
                 let interface_theme = InterfaceTheme::default();
-                apply_interface_theme(interface_theme, window, cx);
+                apply_interface_theme(
+                    interface_theme, presets::DEFAULT_INTERFACE_FONT_SIZE, window, cx,
+                );
                 let workspace = cx.new(|cx| SerialWorkspace::new(interface_theme, window, cx));
                 bind_window_actions(&workspace, cx);
                 cx.new(|cx| {

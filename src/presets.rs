@@ -136,6 +136,18 @@ pub(crate) fn usable_font_size(size: f32) -> f32 {
     }
 }
 
+/// Interface body size; the other text roles keep their proportions.
+pub(crate) const DEFAULT_INTERFACE_FONT_SIZE: f32 = 13.;
+pub(crate) const INTERFACE_FONT_SIZES: [f32; 8] = [11., 12., 13., 14., 15., 16., 17., 18.];
+
+pub(crate) fn usable_interface_font_size(size: f32) -> f32 {
+    if size.is_finite() {
+        size.round().clamp(11., 18.)
+    } else {
+        DEFAULT_INTERFACE_FONT_SIZE
+    }
+}
+
 /// What is the workbench's to set rather than a session's, kept in the
 /// same file as the presets.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -147,6 +159,9 @@ pub(crate) struct Settings {
     /// the gutters follow it, so the whole log grows together.
     #[serde(default = "default_terminal_font_size")]
     pub(crate) terminal_font_size: f32,
+    /// Body text size for the interface, independent of the terminal.
+    #[serde(default = "default_interface_font_size")]
+    pub(crate) interface_font_size: f32,
     /// The folder the recordings keep their tree in, when one has been
     /// chosen; nothing leaves them in the account's documents. Absent in
     /// files written before a session could record.
@@ -174,6 +189,7 @@ impl Default for Settings {
         Self {
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
             terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            interface_font_size: DEFAULT_INTERFACE_FONT_SIZE,
             recording_root: None,
             transfer_folder: None,
             transfer_protocol: None,
@@ -187,6 +203,10 @@ fn default_scrollback_lines() -> usize {
 
 fn default_terminal_font_size() -> f32 {
     DEFAULT_TERMINAL_FONT_SIZE
+}
+
+fn default_interface_font_size() -> f32 {
+    DEFAULT_INTERFACE_FONT_SIZE
 }
 
 /// Where the store is written when it changes: the workspace file on this
@@ -628,8 +648,9 @@ pub(crate) fn store_folder() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE, Library, LineEnding, LogView,
-        PresetStore, Settings, TagColor,
+        DEFAULT_INTERFACE_FONT_SIZE, DEFAULT_SCROLLBACK_LINES, DEFAULT_TERMINAL_FONT_SIZE,
+        INTERFACE_FONT_SIZES, Library, LineEnding, LogView, PresetStore, Settings, TagColor,
+        usable_interface_font_size,
     };
     use crate::SerialConfiguration;
     use std::path::{Path, PathBuf};
@@ -642,6 +663,13 @@ mod tests {
         let store: PresetStore = serde_json::from_str(old).unwrap();
         assert_eq!(store.settings.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
         assert_eq!(store.settings.terminal_font_size, DEFAULT_TERMINAL_FONT_SIZE);
+        assert_eq!(store.settings.interface_font_size, DEFAULT_INTERFACE_FONT_SIZE);
+
+        let old_settings: Settings = serde_json::from_str(
+            r#"{"scrollback_lines":1234,"terminal_font_size":16}"#,
+        ).unwrap();
+        assert_eq!(old_settings.interface_font_size, DEFAULT_INTERFACE_FONT_SIZE);
+        assert_eq!(old_settings.terminal_font_size, 16.);
 
         assert_eq!(store.settings.recording_root(), None);
 
@@ -649,6 +677,7 @@ mod tests {
         store.set_settings(Settings {
             scrollback_lines: 1_234,
             terminal_font_size: 16.,
+            interface_font_size: 18.,
             recording_root: Some(PathBuf::from("/Users/someone/Desktop")),
             transfer_folder: None,
             transfer_protocol: None,
@@ -657,10 +686,24 @@ mod tests {
         let restored: PresetStore = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.settings.scrollback_lines, 1_234);
         assert_eq!(restored.settings.terminal_font_size, 16.);
+        assert_eq!(restored.settings.interface_font_size, 18.);
         assert_eq!(
             restored.settings.recording_root(),
             Some(Path::new("/Users/someone/Desktop"))
         );
+    }
+
+    #[test]
+    fn interface_font_size_stays_within_readable_bounds() {
+        for size in INTERFACE_FONT_SIZES {
+            assert_eq!(usable_interface_font_size(size), size);
+        }
+        assert_eq!(usable_interface_font_size(14.5), 15.);
+        assert_eq!(usable_interface_font_size(-1.), 11.);
+        assert_eq!(usable_interface_font_size(100.), 18.);
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(usable_interface_font_size(invalid), DEFAULT_INTERFACE_FONT_SIZE);
+        }
     }
 
     /// A session saved before there was recording does not record, and one

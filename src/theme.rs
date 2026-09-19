@@ -11,9 +11,11 @@ use std::sync::OnceLock;
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 use gpui_kit::{
     App, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Rgba, SharedString, Styled,
-    Window, WindowAppearance, px, rgb,
+    Window, WindowAppearance, px, rems, rgb,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::presets::usable_interface_font_size;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InterfaceTheme {
@@ -767,8 +769,10 @@ pub(crate) const MONO_SMALL: TextToken = TextToken::new(11., 16., FontWeight::NO
 /// Applies the type scale to any styled element.
 pub(crate) trait Typography: Styled + Sized {
     fn text_token(self, token: TextToken) -> Self {
-        self.text_size(px(token.size))
-            .line_height(px(token.line_height))
+        // Root sets one rem to the interface body size, including overlays.
+        // Terminal glyphs are painted separately at their own pixel size.
+        self.text_size(rems(token.size / BODY.size))
+            .line_height(rems(token.line_height / BODY.size))
             .font_weight(token.weight)
     }
 
@@ -942,10 +946,24 @@ fn workbench_theme_config(theme: InterfaceTheme) -> ThemeConfig {
     }
 }
 
-pub(crate) fn apply_interface_theme(theme: InterfaceTheme, window: &mut Window, cx: &mut App) {
+pub(crate) fn apply_interface_font_size(size: f32, cx: &mut App) {
+    let size = usable_interface_font_size(size);
+    let theme = Theme::global_mut(cx);
+    theme.font_size = px(size);
+    theme.mono_font_size = px(MONO.size * size / BODY.size);
+    Theme::sync_base(cx);
+    cx.refresh_windows();
+}
+
+pub(crate) fn apply_interface_theme(
+    theme: InterfaceTheme,
+    font_size: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let config = Rc::new(workbench_theme_config(theme));
     Theme::global_mut(cx).apply_config(&config);
-    Theme::sync_base(cx);
+    apply_interface_font_size(font_size, cx);
     cx.set_window_appearance(Some(theme.window_appearance()));
     window.refresh();
 }

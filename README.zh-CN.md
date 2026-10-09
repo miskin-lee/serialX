@@ -1,13 +1,16 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg?v=3">
-    <img src="docs/logo.svg?v=3" alt="serialX" width="380">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img src="docs/logo.png" alt="serialX" width="380">
   </picture>
 </p>
 
 <p align="center"><a href="README.md">English</a> · 简体中文</p>
 
 serialX 是一款跨平台串口工作台，使用 Rust、[GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) 和 [GPUI Component](https://github.com/longbridge/gpui-component) 构建，支持 macOS、Windows 和 Linux。
+
+> [!TIP]
+> <a href="https://github.com/miskin-lee/EdgeTerm"><img src="https://raw.githubusercontent.com/miskin-lee/EdgeTerm/main/docs/icon.png" alt="EdgeTerm" width="20" height="20" align="top"></a> 还需要通过 SSH、Telnet、SFTP 或 FTP 管理服务器和网络设备？推荐使用同一作者的 **[EdgeTerm](https://github.com/miskin-lee/EdgeTerm)**，一款小巧快速的终端与远程连接工具。
 
 ## 应用截图
 

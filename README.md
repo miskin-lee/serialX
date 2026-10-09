@@ -1,13 +1,16 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg?v=3">
-    <img src="docs/logo.svg?v=3" alt="serialX" width="380">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <img src="docs/logo.png" alt="serialX" width="380">
   </picture>
 </p>
 
 <p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
 
 serialX is a cross-platform serial port workspace built with Rust, [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui) and [GPUI Component](https://github.com/longbridge/gpui-component), available on macOS, Windows and Linux.
+
+> [!TIP]
+> <a href="https://github.com/miskin-lee/EdgeTerm"><img src="https://raw.githubusercontent.com/miskin-lee/EdgeTerm/main/docs/icon.png" alt="EdgeTerm" width="20" height="20" align="top"></a> Also managing servers and network gear over SSH, Telnet, SFTP or FTP? Try **[EdgeTerm](https://github.com/miskin-lee/EdgeTerm)** from the same author, a small, fast terminal and remote access client.
 
 ## Screenshots
 
